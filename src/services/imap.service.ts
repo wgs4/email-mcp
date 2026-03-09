@@ -1017,17 +1017,15 @@ export default class ImapService {
     const mailboxes = Array.isArray(mailboxesRaw) ? mailboxesRaw : [...mailboxesRaw];
 
     // Try SPECIAL-USE attribute first
-    const specialUse = mailboxes.find(
-      (mb) => typeof mb === 'object' && mb !== null && 'specialUse' in mb && mb.specialUse === '\\Sent',
-    );
-    if (
-      specialUse &&
-      typeof specialUse === 'object' &&
-      'path' in specialUse &&
-      typeof specialUse.path === 'string'
-    ) {
-      return specialUse.path;
+    function isSent(mb: unknown): mb is { specialUse: string; path: string } {
+      if (typeof mb !== 'object' || mb === null) return false;
+      if (!('specialUse' in mb) || !('path' in mb)) return false;
+      const r = mb as { specialUse: unknown; path: unknown };
+      return r.specialUse === '\\Sent' && typeof r.path === 'string';
     }
+
+    const specialUse = mailboxes.find(isSent);
+    if (specialUse) return specialUse.path;
 
     // Fall back to common names
     const commonNames = [
@@ -1039,16 +1037,14 @@ export default class ImapService {
       'INBOX.Sent Items',
       'INBOX.Sent Messages',
     ];
-    const paths = new Set(
-      mailboxes
-        .filter(
-          (mb) => typeof mb === 'object' &&
-            mb !== null &&
-            'path' in mb &&
-            typeof (mb as unknown as Record<string, unknown>).path === 'string',
-        )
-        .map((mb) => (mb as unknown as Record<string, unknown>).path as string),
-    );
+
+    function hasPath(mb: unknown): mb is { path: string } {
+      if (typeof mb !== 'object' || mb === null) return false;
+      if (!('path' in mb)) return false;
+      return typeof (mb as { path: unknown }).path === 'string';
+    }
+
+    const paths = new Set(mailboxes.filter(hasPath).map((mb) => mb.path));
     const match = commonNames.find((name) => paths.has(name));
     if (!match) {
       throw new Error(
