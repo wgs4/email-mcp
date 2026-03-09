@@ -1001,6 +1001,44 @@ export default class ImapService {
   }
 
   // -------------------------------------------------------------------------
+  // Sent folder helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve the Sent folder path for an account.
+   * Uses account config override, then SPECIAL-USE attribute, then common names.
+   */
+  async resolveSentFolder(accountName: string): Promise<string> {
+    const account = this.connections.getAccount(accountName);
+    if (account.sentFolder) return account.sentFolder;
+
+    const client = await this.connections.getImapClient(accountName);
+    const mailboxes = await client.list();
+
+    // Try SPECIAL-USE attribute first
+    const specialUse = mailboxes.find((mb: { specialUse?: string }) => mb.specialUse === '\\Sent');
+    if (specialUse) return (specialUse as { path: string }).path;
+
+    // Fall back to common names
+    const commonNames = ['Sent', 'Sent Items', 'Sent Mail', '[Gmail]/Sent Mail', 'INBOX.Sent'];
+    const paths = new Set(mailboxes.map((mb: { path: string }) => mb.path));
+    return commonNames.find((name) => paths.has(name)) ?? 'Sent';
+  }
+
+  /**
+   * Append a raw RFC 822 message to the Sent folder.
+   */
+  async appendToSent(
+    accountName: string,
+    rawMessage: Buffer | string,
+    flags?: string[],
+  ): Promise<void> {
+    const sentFolder = await this.resolveSentFolder(accountName);
+    const client = await this.connections.getImapClient(accountName);
+    await client.append(sentFolder, Buffer.from(rawMessage), flags ?? ['\\Seen']);
+  }
+
+  // -------------------------------------------------------------------------
   // Draft management
   // -------------------------------------------------------------------------
 

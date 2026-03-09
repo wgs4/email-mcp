@@ -52,6 +52,9 @@ export const AccountConfigSchema = z
     oauth2: OAuth2ConfigSchema.optional(),
     imap: ImapConfigSchema,
     smtp: SmtpConfigSchema,
+    sent_folder: z.string().optional(),
+    save_to_sent: z.boolean().optional(),
+    gmail_auto_save: z.boolean().optional(),
   })
   .refine((data) => data.password ?? data.oauth2, {
     message: 'Either password or oauth2 config is required',

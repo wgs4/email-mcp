@@ -68,6 +68,9 @@ export interface AccountConfig {
   oauth2?: OAuth2Config;
   imap: ImapConfig;
   smtp: SmtpConfig;
+  sentFolder?: string;
+  saveToSent?: boolean;
+  gmailAutoSave?: boolean;
 }
 
 export interface WatcherConfig {
