@@ -211,12 +211,12 @@ describe('ImapService', () => {
       expect(result).toBe('Sent Items');
     });
 
-    it('returns "Sent" as last resort when no match found', async () => {
+    it('throws when no Sent folder can be resolved', async () => {
       client.list.mockResolvedValue([{ name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' }]);
 
-      const result = await service.resolveSentFolder('test');
-
-      expect(result).toBe('Sent');
+      await expect(service.resolveSentFolder('test')).rejects.toThrow(
+        'Cannot resolve Sent folder for "test"',
+      );
     });
   });
 
@@ -244,6 +244,19 @@ describe('ImapService', () => {
         '\\Seen',
         '\\Flagged',
       ]);
+    });
+
+    it('retries append after creating mailbox on TRYCREATE error', async () => {
+      client.list.mockResolvedValue([{ name: 'Sent', path: 'Sent', specialUse: '\\Sent' }]);
+      client.append
+        .mockRejectedValueOnce(new Error('[TRYCREATE] Mailbox does not exist'))
+        .mockResolvedValueOnce({ uid: 42 });
+      (client as Record<string, unknown>).mailboxCreate = vi.fn().mockResolvedValue({});
+
+      await service.appendToSent('test', 'raw msg');
+
+      expect((client as Record<string, unknown>).mailboxCreate).toHaveBeenCalledWith('Sent');
+      expect(client.append).toHaveBeenCalledTimes(2);
     });
   });
 });

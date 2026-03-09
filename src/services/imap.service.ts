@@ -1013,16 +1013,50 @@ export default class ImapService {
     if (account.sentFolder) return account.sentFolder;
 
     const client = await this.connections.getImapClient(accountName);
-    const mailboxes = await client.list();
+    const mailboxesRaw = await client.list();
+    const mailboxes = Array.isArray(mailboxesRaw) ? mailboxesRaw : [...mailboxesRaw];
 
     // Try SPECIAL-USE attribute first
-    const specialUse = mailboxes.find((mb: { specialUse?: string }) => mb.specialUse === '\\Sent');
-    if (specialUse) return (specialUse as { path: string }).path;
+    const specialUse = mailboxes.find(
+      (mb) => typeof mb === 'object' && mb !== null && 'specialUse' in mb && mb.specialUse === '\\Sent',
+    );
+    if (
+      specialUse &&
+      typeof specialUse === 'object' &&
+      'path' in specialUse &&
+      typeof specialUse.path === 'string'
+    ) {
+      return specialUse.path;
+    }
 
     // Fall back to common names
-    const commonNames = ['Sent', 'Sent Items', 'Sent Mail', '[Gmail]/Sent Mail', 'INBOX.Sent'];
-    const paths = new Set(mailboxes.map((mb: { path: string }) => mb.path));
-    return commonNames.find((name) => paths.has(name)) ?? 'Sent';
+    const commonNames = [
+      'INBOX.Sent',
+      'Sent',
+      'Sent Items',
+      'Sent Mail',
+      '[Gmail]/Sent Mail',
+      'INBOX.Sent Items',
+      'INBOX.Sent Messages',
+    ];
+    const paths = new Set(
+      mailboxes
+        .filter(
+          (mb) => typeof mb === 'object' &&
+            mb !== null &&
+            'path' in mb &&
+            typeof (mb as unknown as Record<string, unknown>).path === 'string',
+        )
+        .map((mb) => (mb as unknown as Record<string, unknown>).path as string),
+    );
+    const match = commonNames.find((name) => paths.has(name));
+    if (!match) {
+      throw new Error(
+        `Cannot resolve Sent folder for "${accountName}". ` +
+          `Available mailboxes: ${[...paths].join(', ')}`,
+      );
+    }
+    return match;
   }
 
   /**
@@ -1035,7 +1069,28 @@ export default class ImapService {
   ): Promise<void> {
     const sentFolder = await this.resolveSentFolder(accountName);
     const client = await this.connections.getImapClient(accountName);
-    await client.append(sentFolder, Buffer.from(rawMessage), flags ?? ['\\Seen']);
+
+    try {
+      const lock = await client.getMailboxLock(sentFolder);
+      try {
+        await client.append(sentFolder, Buffer.from(rawMessage), flags ?? ['\\Seen']);
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      // If mailbox doesn't exist, create it and retry once
+      if (err instanceof Error && /TRYCREATE|no such mailbox|not found/i.test(err.message)) {
+        await client.mailboxCreate(sentFolder);
+        const lock = await client.getMailboxLock(sentFolder);
+        try {
+          await client.append(sentFolder, Buffer.from(rawMessage), flags ?? ['\\Seen']);
+        } finally {
+          lock.release();
+        }
+        return;
+      }
+      throw err;
+    }
   }
 
   // -------------------------------------------------------------------------
