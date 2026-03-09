@@ -4,6 +4,8 @@
  * No MCP dependency — fully unit-testable.
  */
 
+import { randomUUID } from 'node:crypto';
+
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
 import type { AccountConfig, SendResult } from '../types/index.js';
@@ -15,6 +17,11 @@ import type ImapService from './imap.service.js';
 
 function isGmailAccount(account: AccountConfig): boolean {
   return account.imap.host.includes('gmail.com') || account.smtp.host.includes('gmail.com');
+}
+
+function encodeRfc2047(value: string): string {
+  if (/^[\x20-\x7E]*$/.test(value)) return value;
+  return `=?UTF-8?B?${Buffer.from(value, 'utf-8').toString('base64')}?=`;
 }
 
 function buildRawMessage(options: {
@@ -32,16 +39,19 @@ function buildRawMessage(options: {
   lines.push(`From: ${options.from}`);
   lines.push(`To: ${options.to}`);
   if (options.cc) lines.push(`Cc: ${options.cc}`);
-  lines.push(`Subject: ${options.subject}`);
+  lines.push(`Subject: ${encodeRfc2047(options.subject)}`);
   lines.push(`Date: ${new Date().toUTCString()}`);
-  lines.push(`Message-ID: ${options.messageId}`);
+  const mid = options.messageId || `<${randomUUID()}@email-mcp.local>`;
+  lines.push(`Message-ID: ${mid}`);
   lines.push('MIME-Version: 1.0');
   if (options.inReplyTo) lines.push(`In-Reply-To: ${options.inReplyTo}`);
   if (options.references) lines.push(`References: ${options.references}`);
   const contentType = options.html ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8';
   lines.push(`Content-Type: ${contentType}`);
+  lines.push('Content-Transfer-Encoding: 8bit');
   lines.push('');
-  lines.push(options.body);
+  const normalizedBody = options.body.replace(/\r?\n/g, '\r\n');
+  lines.push(normalizedBody);
   return lines.join('\r\n');
 }
 

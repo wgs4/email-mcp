@@ -268,7 +268,7 @@ describe('SmtpService', () => {
   });
 
   describe('sendDraft', () => {
-    it('appends to Sent before deleting draft', async () => {
+    function createDraftMocks() {
       const mockDraft = {
         email: {
           id: '1',
@@ -301,6 +301,11 @@ describe('SmtpService', () => {
         deleteDraft: vi.fn().mockResolvedValue(undefined),
       } as unknown as ImapService;
 
+      return { mockDraft, imapServiceWithDraft };
+    }
+
+    it('appends to Sent before deleting draft', async () => {
+      const { imapServiceWithDraft } = createDraftMocks();
       service = new SmtpService(connections, rateLimiter, imapServiceWithDraft);
 
       await service.sendDraft('test', 1);
@@ -309,6 +314,31 @@ describe('SmtpService', () => {
       const appendCall = vi.mocked(imapServiceWithDraft.appendToSent).mock.invocationCallOrder[0];
       const deleteCall = vi.mocked(imapServiceWithDraft.deleteDraft).mock.invocationCallOrder[0];
       expect(appendCall).toBeLessThan(deleteCall);
+    });
+
+    it('calls appendToSent with draft content', async () => {
+      const { imapServiceWithDraft } = createDraftMocks();
+      service = new SmtpService(connections, rateLimiter, imapServiceWithDraft);
+
+      await service.sendDraft('test', 1);
+
+      expect(imapServiceWithDraft.appendToSent).toHaveBeenCalledWith(
+        'test',
+        expect.stringContaining('Subject: Draft Subject'),
+      );
+    });
+
+    it('still deletes draft when appendToSent fails', async () => {
+      const { imapServiceWithDraft } = createDraftMocks();
+      vi.mocked(imapServiceWithDraft.appendToSent).mockRejectedValue(new Error('IMAP error'));
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      service = new SmtpService(connections, rateLimiter, imapServiceWithDraft);
+
+      await service.sendDraft('test', 1);
+
+      // appendToSentFolder swallows errors, so deleteDraft should still be called
+      expect(imapServiceWithDraft.deleteDraft).toHaveBeenCalledWith('test', 1, 'Drafts');
+      warnSpy.mockRestore();
     });
   });
 });
