@@ -1,0 +1,108 @@
+# email-mcp example configuration
+# Copy to ~/.config/email-mcp/config.toml and fill in your credentials.
+# Lock down permissions after editing: chmod 600 ~/.config/email-mcp/config.toml
+
+[settings]
+rate_limit = 10
+
+# ============================================================
+# cPanel / Dovecot HOSTED ACCOUNTS
+#
+# IMPORTANT — sent_folder override:
+# cPanel servers typically maintain two "Sent" folders:
+#
+#   INBOX.Sent          — has the IMAP SPECIAL-USE \Sent attribute
+#   INBOX.Sent Messages — the folder Mac Mail maps to its sent mailbox
+#                         (paper airplane icon in the sidebar)
+#
+# email-mcp auto-detection correctly picks INBOX.Sent via RFC 6154
+# SPECIAL-USE, but Mac Mail uses INBOX.Sent Messages. Without the
+# override below, sent copies land in a folder Mac Mail displays as
+# a plain folder, not the paper airplane one.
+#
+# Fix: always set sent_folder = "INBOX.Sent Messages" for cPanel accounts.
+# See docs/troubleshooting-sent-folder.md for full details.
+# ============================================================
+
+[[accounts]]
+name = "account-one"
+email = "example@sample.com"
+full_name = "Your Name"
+password = "________"
+sent_folder = "INBOX.Sent Messages"
+
+[accounts.imap]
+host = "your-cpanel-server.com"
+port = 993
+tls = true
+
+[accounts.smtp]
+host = "your-cpanel-server.com"
+port = 465
+tls = true
+
+[[accounts]]
+name = "account-two"
+email = "example2@sample.com"
+full_name = "Your Name"
+password = "________"
+sent_folder = "INBOX.Sent Messages"
+
+[accounts.imap]
+host = "your-cpanel-server.com"
+port = 993
+tls = true
+
+[accounts.smtp]
+host = "your-cpanel-server.com"
+port = 465
+tls = true
+
+# ============================================================
+# GMAIL ACCOUNTS
+# Must use a Gmail App Password — not your regular password.
+# Generate one at: https://myaccount.google.com/apppasswords
+#
+# No sent_folder override needed — Gmail auto-saves sent mail
+# server-side via SMTP. email-mcp skips the IMAP append for Gmail.
+# ============================================================
+
+[[accounts]]
+name = "gmail"
+email = "example@gmail.com"
+full_name = "Your Name"
+password = "________"
+
+[accounts.imap]
+host = "imap.gmail.com"
+port = 993
+tls = true
+
+[accounts.smtp]
+host = "smtp.gmail.com"
+port = 465
+tls = true
+
+# ============================================================
+# iCLOUD ACCOUNTS
+# Must use an Apple App-Specific Password — not your Apple ID password.
+# Generate one at: https://appleid.apple.com -> Sign-In and Security
+#                  -> App-Specific Passwords
+# ============================================================
+
+# [[accounts]]
+# name = "icloud"
+# email = "example@icloud.com"
+# full_name = "Your Name"
+# password = "________"
+#
+# [accounts.imap]
+# host = "imap.mail.me.com"
+# port = 993
+# tls = true
+#
+# [accounts.smtp]
+# host = "smtp.mail.me.com"
+# port = 587
+# tls = false
+# starttls = true
