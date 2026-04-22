@@ -25,6 +25,8 @@ import type {
 } from '../types/index.js';
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
+import type { MailboxRef } from './mailbox-resolver.js';
+import { resolveMailboxForAccount } from './mailbox-resolver.js';
 import type { SearchParams } from './search-criteria.js';
 import { buildSearchCriteria, chunkUids } from './search-criteria.js';
 
@@ -356,7 +358,84 @@ export default class ImapService {
 
   private labelStrategyPending = new Map<string, Promise<LabelStrategy>>();
 
+  /**
+   * Per-account mailbox-list cache keyed by account name. Populated lazily
+   * during `searchAcrossAccounts` fan-out to avoid issuing a `LIST` on every
+   * cross-account call. TTL'd at `MAILBOX_CACHE_TTL_MS`.
+   */
+  private mailboxListCache = new Map<string, { list: MailboxRef[]; expiresAt: number }>();
+
+  private static readonly MAILBOX_CACHE_TTL_MS = 5 * 60 * 1000;
+
+  /**
+   * Structural LIST-response flags we must NOT interpret as SPECIAL-USE.
+   * These describe the mailbox's hierarchy position, not its semantic role.
+   */
+  private static readonly STRUCTURAL_FLAGS = new Set([
+    '\\HasChildren',
+    '\\HasNoChildren',
+    '\\Noselect',
+    '\\Noinferiors',
+    '\\Marked',
+    '\\Unmarked',
+  ]);
+
+  /**
+   * Extract a SPECIAL-USE flag (e.g. `\All`, `\Sent`) from a LIST response's
+   * `flags` field — used as a fallback when the server does not populate
+   * `specialUse` directly (Gmail XLIST, some legacy Dovecot builds).
+   */
+  private static extractSpecialUseFromFlags(flagsRaw: unknown): string | undefined {
+    let candidates: unknown[] = [];
+    if (flagsRaw instanceof Set) {
+      candidates = Array.from(flagsRaw as Set<unknown>);
+    } else if (Array.isArray(flagsRaw)) {
+      candidates = flagsRaw;
+    }
+    const found = candidates.find((f) => {
+      if (typeof f !== 'string') return false;
+      if (!f.startsWith('\\')) return false;
+      return !ImapService.STRUCTURAL_FLAGS.has(f);
+    });
+    return typeof found === 'string' ? found : undefined;
+  }
+
   constructor(private connections: IConnectionManager) {}
+
+  /**
+   * Fetch (and cache) the lightweight mailbox reference list for an account.
+   * Used by `searchAcrossAccounts` to resolve mailbox aliases via SPECIAL-USE
+   * flags without issuing `LIST` on every fan-out call.
+   *
+   * imapflow's `client.list()` exposes `specialUse` as a string when present;
+   * Gmail accounts using XLIST can occasionally surface the flag in `flags`
+   * rather than `specialUse`, so we fall back to scanning `flags` for any
+   * value starting with `\` when `specialUse` is missing.
+   */
+  private async getMailboxList(accountName: string): Promise<MailboxRef[]> {
+    const cached = this.mailboxListCache.get(accountName);
+    if (cached && cached.expiresAt > Date.now()) return cached.list;
+
+    const client = await this.connections.getImapClient(accountName);
+    const raw = await client.list();
+    const list: MailboxRef[] = raw.map((m) => {
+      const rawRecord = m as unknown as Record<string, unknown>;
+      if (typeof rawRecord.specialUse === 'string') {
+        return { path: m.path, specialUse: rawRecord.specialUse };
+      }
+      // Fall back to scanning `flags` for a backslash-prefixed SPECIAL-USE
+      // flag — covers Gmail XLIST and a few older servers that report the
+      // flag in `flags` rather than `specialUse`.
+      const specialUse = ImapService.extractSpecialUseFromFlags(rawRecord.flags);
+      return { path: m.path, specialUse };
+    });
+
+    this.mailboxListCache.set(accountName, {
+      list,
+      expiresAt: Date.now() + ImapService.MAILBOX_CACHE_TTL_MS,
+    });
+    return list;
+  }
 
   private async getLabelStrategy(accountName: string): Promise<LabelStrategy> {
     const cached = this.labelStrategies.get(accountName);
@@ -905,16 +984,91 @@ export default class ImapService {
     // mailbox scans, but always fetch enough to feed the merged pagination.
     const perAccountPageSize = Math.min(pageSize * 10, CROSS_ACCOUNT_MAX_PER_ACCOUNT);
 
-    const searchOptionsPerAccount: SearchOptions = {
-      ...options,
-      page: 1,
-      pageSize: perAccountPageSize,
-    };
+    const requestedMailbox = options.mailbox;
+    // INBOX is universal across providers — skip the remap preflight entirely.
+    const needsRemapCheck =
+      typeof requestedMailbox === 'string' &&
+      requestedMailbox.length > 0 &&
+      requestedMailbox.toUpperCase() !== 'INBOX';
+
+    // Pre-flight each account: either resolve a real mailbox path or record a
+    // warning and skip. We collect `remapNotices` separately so they surface
+    // as informational (ℹ️) entries in the warnings array while hard skips
+    // land as ⚠️ entries.
+    const warnings: { account: string; error: string }[] = [];
+    const remapNotices: { account: string; error: string }[] = [];
+    // Name of each account that actually participates in the fan-out, paired
+    // with the per-account search options (remapped mailbox if applicable).
+    const participants: { name: string; options: SearchOptions }[] = [];
+
+    if (needsRemapCheck && typeof requestedMailbox === 'string') {
+      // Resolve sequentially per account; each underlying LIST is cached so
+      // repeat calls within the TTL are free. We do this sequentially to keep
+      // the cache warm deterministically and to bound concurrency on LIST.
+      // eslint-disable-next-line no-restricted-syntax
+      for (const name of accountNames) {
+        // eslint-disable-next-line no-await-in-loop
+        const list = await this.getMailboxList(name).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          warnings.push({
+            account: name,
+            error: `Could not list mailboxes to resolve "${requestedMailbox}": ${msg}`,
+          });
+          return null;
+        });
+
+        if (list !== null) {
+          const resolved = resolveMailboxForAccount(requestedMailbox, list);
+          if (resolved.resolved === null) {
+            warnings.push({
+              account: name,
+              error: `Mailbox "${requestedMailbox}" not found on this account and no equivalent folder by SPECIAL-USE flag; skipped.`,
+            });
+          } else {
+            if (resolved.remapped) {
+              remapNotices.push({
+                account: name,
+                error: `ℹ️ Remapped "${requestedMailbox}" → "${resolved.resolved}" via ${resolved.specialUse ?? '(special-use)'} flag.`,
+              });
+            }
+            participants.push({
+              name,
+              options: {
+                ...options,
+                mailbox: resolved.resolved,
+                page: 1,
+                pageSize: perAccountPageSize,
+              },
+            });
+          }
+        }
+      }
+    } else {
+      // No remap needed — every account participates as-is.
+      accountNames.forEach((name) => {
+        participants.push({
+          name,
+          options: {
+            ...options,
+            page: 1,
+            pageSize: perAccountPageSize,
+          },
+        });
+      });
+    }
+
+    // If the preflight skipped every account (none had a literal match AND
+    // none had a SPECIAL-USE equivalent AND no LIST succeeded), surface a
+    // summary error — mirrors the "all accounts failed" path below.
+    if (participants.length === 0) {
+      const summary = warnings.map((w) => `${w.account}: ${w.error}`).join('; ');
+      throw new Error(`All ${accountNames.length} accounts failed: ${summary}`);
+    }
+
     const settled = await Promise.allSettled(
-      accountNames.map(async (name) => this.searchEmails(name, query, searchOptionsPerAccount)),
+      participants.map(async (p) => this.searchEmails(p.name, query, p.options)),
     );
 
-    const warnings: { account: string; error: string }[] = [];
     const perAccountWarnings: string[] = [];
     let totalAcross = 0;
     let totalApprox = false;
@@ -930,7 +1084,7 @@ export default class ImapService {
     const collectedItems: EmailMeta[] = [];
 
     settled.forEach((outcome, idx) => {
-      const name = accountNames[idx];
+      const { name } = participants[idx];
       if (outcome.status === 'rejected') {
         const err = outcome.reason as unknown;
         warnings.push({
@@ -975,8 +1129,9 @@ export default class ImapService {
       }
     });
 
-    // If every account failed, surface a summary error — callers expect a
-    // throw rather than an empty page for total failure.
+    // If every account failed (preflight skip + hard search failure combined),
+    // surface a summary error — callers expect a throw rather than an empty
+    // page for total failure. Remap notices don't count as failures here.
     if (warnings.length === accountNames.length) {
       const summary = warnings.map((w) => `${w.account}: ${w.error}`).join('; ');
       throw new Error(`All ${accountNames.length} accounts failed: ${summary}`);
@@ -1006,6 +1161,11 @@ export default class ImapService {
       if (anyMailbox) facetsPresent.mailbox = facetMailbox;
     }
 
+    // Merge remap notices (ℹ️) and hard warnings (⚠️-prefixed by convention)
+    // into a single warnings[] for backward compatibility. Remap notices carry
+    // the ℹ️ prefix in their `error` field; the tool layer splits on that.
+    const mergedWarnings = [...warnings, ...remapNotices];
+
     return {
       items,
       total: totalAcross,
@@ -1015,7 +1175,7 @@ export default class ImapService {
       ...(warning ? { warning } : {}),
       ...(totalApprox ? { totalApprox } : {}),
       ...(facetsPresent ? { facets: facetsPresent } : {}),
-      ...(warnings.length > 0 ? { warnings } : {}),
+      ...(mergedWarnings.length > 0 ? { warnings: mergedWarnings } : {}),
     };
   }
 
