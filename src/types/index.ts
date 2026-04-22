@@ -145,6 +145,55 @@ export interface AppConfig {
     hooks: HooksConfig;
   };
   accounts: AccountConfig[];
+  /** Saved-search presets from `[[searches]]` in config.toml. Empty when none. */
+  searches: SearchPreset[];
+}
+
+// ---------------------------------------------------------------------------
+// Saved-search presets
+// ---------------------------------------------------------------------------
+
+/**
+ * Camel-cased view of a `[[searches]]` entry from config.toml. Bundles a
+ * named filter combination that can be executed via `run_preset`.
+ *
+ * Every search parameter mirrors the `SearchParams` shape. Either `account`
+ * (single-account) or `accounts` (cross-account) may be set — not both.
+ */
+export interface SearchPreset {
+  name: string;
+  description?: string;
+  account?: string;
+  accounts?: string[];
+  mailbox?: string;
+  query?: string;
+  to?: string;
+  from?: string;
+  subject?: string;
+  cc?: string;
+  bcc?: string;
+  text?: string;
+  body?: string;
+  since?: string;
+  before?: string;
+  on?: string;
+  sentSince?: string;
+  sentBefore?: string;
+  seen?: boolean;
+  flagged?: boolean;
+  answered?: boolean;
+  draft?: boolean;
+  deleted?: boolean;
+  keyword?: string | string[];
+  notKeyword?: string | string[];
+  header?: Record<string, string>;
+  largerThan?: number;
+  smallerThan?: number;
+  hasAttachment?: boolean;
+  attachmentFilename?: string;
+  attachmentMimetype?: string;
+  facets?: ('sender' | 'year' | 'mailbox')[];
+  gmailRaw?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +230,12 @@ export interface EmailMeta {
    * message was inspected and has no attachments.
    */
   attachments?: AttachmentMeta[];
+  /**
+   * Account name — populated only by cross-account search
+   * (`ImapService.searchAcrossAccounts`). Single-account callers leave this
+   * undefined.
+   */
+  account?: string;
 }
 
 export interface AttachmentMeta {

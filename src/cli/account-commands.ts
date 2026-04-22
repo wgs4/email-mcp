@@ -525,6 +525,7 @@ async function addAccount(): Promise<void> {
           },
         },
         accounts: [newAccount],
+        searches: [],
       };
 
   AppConfigFileSchema.parse(config);
