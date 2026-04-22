@@ -423,5 +423,166 @@ describe('ImapService', () => {
         /at least one account/,
       );
     });
+
+    // -------------------------------------------------------------------------
+    // Auto-remap via SPECIAL-USE (Phase 3 follow-on)
+    // -------------------------------------------------------------------------
+
+    it('auto-remaps mailbox per account via SPECIAL-USE flags and emits ℹ️ notice', async () => {
+      // Account A has INBOX.Archive literally; account B only has
+      // [Gmail]/All Mail with the \All flag. Fan-out with mailbox=INBOX.Archive
+      // should search both: A on INBOX.Archive, B on [Gmail]/All Mail, with a
+      // remap notice for B.
+      const clientA = createMockImapClient();
+      const clientB = createMockImapClient();
+      clientA.list.mockResolvedValue([
+        { name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' },
+        { name: 'Archive', path: 'INBOX.Archive', specialUse: '\\Archive' },
+      ]);
+      clientB.list.mockResolvedValue([
+        { name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' },
+        { name: 'All Mail', path: '[Gmail]/All Mail', specialUse: '\\All' },
+      ]);
+
+      clientA.search.mockResolvedValue([10]);
+      clientB.search.mockResolvedValue([20]);
+      clientA.fetch.mockReturnValueOnce(
+        makeAsyncGen([makeMessage(10, 'A archive hit', '2024-05-01T00:00:00Z', 'a@example.com')]),
+      );
+      clientB.fetch.mockReturnValueOnce(
+        makeAsyncGen([makeMessage(20, 'B all-mail hit', '2024-06-01T00:00:00Z', 'b@example.com')]),
+      );
+
+      const localConnections = {
+        getAccount: vi.fn().mockImplementation((name: string) => ({
+          name,
+          email: `${name}@example.com`,
+          username: name,
+          imap: {
+            host: 'imap.example.com',
+            port: 993,
+            tls: true,
+            starttls: false,
+            verifySsl: true,
+          },
+          smtp: {
+            host: 'smtp.example.com',
+            port: 465,
+            tls: true,
+            starttls: false,
+            verifySsl: true,
+          },
+        })),
+        getAccountNames: vi.fn().mockReturnValue(['account-a', 'account-b']),
+        getImapClient: vi.fn().mockImplementation(async (name: string) => {
+          if (name === 'account-a') return clientA;
+          if (name === 'account-b') return clientB;
+          throw new Error(`unknown account ${name}`);
+        }),
+        getSmtpTransport: vi.fn(),
+        closeAll: vi.fn(),
+      } satisfies IConnectionManager;
+
+      const localService = new ImapService(localConnections);
+      const result = await localService.searchAcrossAccounts(['account-a', 'account-b'], '', {
+        mailbox: 'INBOX.Archive',
+        pageSize: 10,
+      });
+
+      // Both accounts participated; their items merged (B sorts ahead of A by date).
+      expect(result.items).toHaveLength(2);
+      expect(result.items.map((i) => i.account)).toEqual(['account-b', 'account-a']);
+
+      // Remap notice surfaces on the ℹ️-prefixed channel inside warnings[].
+      expect(result.warnings).toBeDefined();
+      const notice = result.warnings?.find((w) => w.account === 'account-b');
+      expect(notice).toBeDefined();
+      expect(notice?.error).toMatch(/^ℹ️/);
+      expect(notice?.error).toMatch(/Remapped "INBOX\.Archive" → "\[Gmail\]\/All Mail"/);
+      expect(notice?.error).toMatch(/\\All/);
+
+      // Account A was a literal match — no notice for it.
+      expect(result.warnings?.find((w) => w.account === 'account-a')).toBeUndefined();
+    });
+
+    it('skips accounts with no literal match AND no SPECIAL-USE equivalent', async () => {
+      // Account A: no match at all (has only INBOX). Account B: real \All match.
+      const clientA = createMockImapClient();
+      const clientB = createMockImapClient();
+      clientA.list.mockResolvedValue([{ name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' }]);
+      clientB.list.mockResolvedValue([
+        { name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' },
+        { name: 'All Mail', path: '[Gmail]/All Mail', specialUse: '\\All' },
+      ]);
+
+      clientB.search.mockResolvedValue([7]);
+      clientB.fetch.mockReturnValueOnce(
+        makeAsyncGen([makeMessage(7, 'B hit', '2024-07-01T00:00:00Z', 'b@example.com')]),
+      );
+
+      const localConnections = {
+        getAccount: vi.fn().mockImplementation((name: string) => ({
+          name,
+          email: `${name}@example.com`,
+          username: name,
+          imap: {
+            host: 'imap.example.com',
+            port: 993,
+            tls: true,
+            starttls: false,
+            verifySsl: true,
+          },
+          smtp: {
+            host: 'smtp.example.com',
+            port: 465,
+            tls: true,
+            starttls: false,
+            verifySsl: true,
+          },
+        })),
+        getAccountNames: vi.fn().mockReturnValue(['account-a', 'account-b']),
+        getImapClient: vi.fn().mockImplementation(async (name: string) => {
+          if (name === 'account-a') return clientA;
+          if (name === 'account-b') return clientB;
+          throw new Error(`unknown account ${name}`);
+        }),
+        getSmtpTransport: vi.fn(),
+        closeAll: vi.fn(),
+      } satisfies IConnectionManager;
+
+      const localService = new ImapService(localConnections);
+      const result = await localService.searchAcrossAccounts(['account-a', 'account-b'], '', {
+        mailbox: 'INBOX.Archive',
+        pageSize: 10,
+      });
+
+      // Only account B's item surfaces.
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].account).toBe('account-b');
+
+      // Account A appears in warnings[] with a hard-skip message (no ℹ️ prefix).
+      expect(result.warnings).toBeDefined();
+      const skip = result.warnings?.find((w) => w.account === 'account-a');
+      expect(skip).toBeDefined();
+      expect(skip?.error).not.toMatch(/^ℹ️/);
+      expect(skip?.error).toMatch(/not found on this account/);
+    });
+
+    it('skips remap preflight entirely when mailbox is INBOX', async () => {
+      // With mailbox=INBOX, the preflight is short-circuited — client.list()
+      // should not be called as part of remap resolution. (searchEmails'
+      // own internal paths may list; the key signal is that no remap notice
+      // appears and no preflight warning leaks through.)
+      client.search.mockResolvedValue([1]);
+      client.fetch.mockReturnValueOnce(
+        makeAsyncGen([makeMessage(1, 'x', '2024-01-01T00:00:00Z', 'x@example.com')]),
+      );
+      const result = await service.searchAcrossAccounts(['account-a'], '', {
+        mailbox: 'INBOX',
+        pageSize: 10,
+      });
+      // No ℹ️-prefixed remap notices should exist — the preflight never ran.
+      expect(result.warnings?.some((w) => w.error.startsWith('ℹ️')) ?? false).toBe(false);
+    });
   });
 });

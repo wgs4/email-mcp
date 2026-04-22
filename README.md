@@ -775,6 +775,18 @@ Facets are computed via a single envelope-only IMAP fetch in 500-UID chunks. Whe
 
 Each result in the rendered output is prefixed with `[account-name]` so you can see the source, and the response appends a `⚠️ Warnings` block whenever one or more accounts failed.
 
+#### Automatic mailbox aliasing
+
+Different providers expose different folder structures. Gmail's archive is
+`[Gmail]/All Mail`; cPanel Dovecot uses `INBOX.Archive`; Exchange uses yet
+another path. When you call `search_all_accounts(mailbox="INBOX.Archive")`,
+each account's mailbox list is checked, and if the literal folder doesn't
+exist, the server's SPECIAL-USE flags (`\All`, `\Archive`, `\Sent`, `\Trash`,
+`\Drafts`, `\Junk`) are used to find the equivalent folder automatically.
+Remappings are surfaced in the response as `ℹ️` notices so you can see what
+was actually searched. Mailbox lists are cached per-account for 5 minutes to
+avoid re-LISTing on every call.
+
 ### Saved searches
 
 Define reusable named filter combinations in `config.toml` under `[[searches]]`. Each preset bundles the same parameter set as `search_emails` and can target a single account (`account = "..."`) or fan out across multiple (`accounts = ["a", "b"]`). Run them via `run_preset`.

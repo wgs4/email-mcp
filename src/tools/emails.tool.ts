@@ -98,11 +98,32 @@ export function formatSearchResult(
 
   let accountWarningsBlock = '';
   if (result.warnings && result.warnings.length > 0) {
-    const lines = ['', '⚠️ Warnings'];
-    result.warnings.forEach((w) => {
-      lines.push(`  - ${w.account}: ${w.error}`);
-    });
-    accountWarningsBlock = `\n${lines.join('\n')}`;
+    // Split warnings into "informational remaps" (ℹ️-prefixed message) vs
+    // hard errors/skips. Both live in the same warnings[] array for backward
+    // compat; we classify here purely for rendering.
+    const infos = result.warnings.filter((w) => w.error.startsWith('ℹ️'));
+    const hard = result.warnings.filter((w) => !w.error.startsWith('ℹ️'));
+    const blocks: string[] = [];
+    if (hard.length > 0) {
+      const lines = [`⚠️ Warnings (${hard.length} account${hard.length === 1 ? '' : 's'})`];
+      hard.forEach((w) => {
+        lines.push(`  - ${w.account}: ${w.error}`);
+      });
+      blocks.push(lines.join('\n'));
+    }
+    if (infos.length > 0) {
+      const lines = [`ℹ️ Remapped (${infos.length} account${infos.length === 1 ? '' : 's'})`];
+      infos.forEach((w) => {
+        // Strip the leading emoji + space since the section header already
+        // carries one — avoid double-ℹ️ in rendered output.
+        const msg = w.error.replace(/^ℹ️\s*/, '');
+        lines.push(`  - ${w.account}: ${msg}`);
+      });
+      blocks.push(lines.join('\n'));
+    }
+    if (blocks.length > 0) {
+      accountWarningsBlock = `\n\n${blocks.join('\n\n')}`;
+    }
   }
 
   return `${warningPrefix}${header}\n${emails}${facetsBlock}${accountWarningsBlock}`;
