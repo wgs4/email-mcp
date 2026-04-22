@@ -175,6 +175,12 @@ export interface EmailMeta {
   hasAttachments: boolean;
   labels: string[];
   preview?: string;
+  /**
+   * Attachment metadata, populated when bodyStructure is fetched. Undefined
+   * means "unknown" (e.g. envelope-only fetches); an empty array means the
+   * message was inspected and has no attachments.
+   */
+  attachments?: AttachmentMeta[];
 }
 
 export interface AttachmentMeta {
@@ -217,6 +223,17 @@ export interface PaginatedResult<T> {
    * returned more UIDs than the cap and results were truncated before counting.
    */
   totalApprox?: boolean;
+  /** Optional bucketed counts across the full match set (capped). */
+  facets?: FacetResult;
+}
+
+export interface FacetResult {
+  /** Map of sender address (lowercased) → count. */
+  sender?: Record<string, number>;
+  /** Map of year (stringified) → count. */
+  year?: Record<string, number>;
+  /** Map of mailbox path → count. Reserved for cross-account search. */
+  mailbox?: Record<string, number>;
 }
 
 // ---------------------------------------------------------------------------
