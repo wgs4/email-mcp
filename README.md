@@ -640,6 +640,78 @@ Features:
 - **Graceful degradation** — Falls back to notify mode if client doesn't support sampling
 - **Resource subscriptions** — Pushes `notifications/resources/updated` for unread counts
 
+## Power Search
+
+`list_emails` and `search_emails` support a rich set of server-side filters translated to native IMAP search criteria. All filters combine with AND; `query` matches as OR across `subject`/`from`/`body`. Snake_case at the tool layer, camelCase in the service layer.
+
+### Supported filters
+
+| Tool param        | Service option  | Type             | IMAP term / behavior                                                                                  |
+|-------------------|-----------------|------------------|-------------------------------------------------------------------------------------------------------|
+| `query`           | `query`         | string           | OR across `SUBJECT` / `FROM` / `BODY`                                                                 |
+| `from`            | `from`          | string           | `FROM` substring                                                                                      |
+| `to`              | `to`            | string           | `TO` substring                                                                                        |
+| `cc`              | `cc`            | string           | `CC` substring                                                                                        |
+| `bcc`             | `bcc`           | string           | `BCC` substring                                                                                       |
+| `subject`         | `subject`       | string           | `SUBJECT` substring                                                                                   |
+| `body`            | `body`          | string           | `BODY` substring                                                                                      |
+| `text`            | `text`          | string           | `TEXT` (headers + body) substring                                                                     |
+| `since`           | `since`         | string           | `SINCE` — delivery date on/after. Accepts ISO 8601, `YYYY-MM-DD`, or relative (`7d`, `2w`, `1m`, `yesterday`, `today`) |
+| `before`          | `before`        | string           | `BEFORE` — delivery date strictly before                                                              |
+| `on`              | `on`            | string           | `ON` — delivery date equals                                                                            |
+| `sent_since`      | `sentSince`     | string           | `SENTSINCE` — header `Date` on/after                                                                  |
+| `sent_before`     | `sentBefore`    | string           | `SENTBEFORE` — header `Date` before                                                                   |
+| `seen`            | `seen`          | boolean          | `SEEN` / `UNSEEN`                                                                                     |
+| `flagged`         | `flagged`       | boolean          | `FLAGGED` / `UNFLAGGED`                                                                               |
+| `answered`        | `answered`      | boolean          | `ANSWERED` / `UNANSWERED`                                                                             |
+| `draft`           | `draft`         | boolean          | `DRAFT` / `UNDRAFT`                                                                                   |
+| `deleted`         | `deleted`       | boolean          | `DELETED` / `UNDELETED`                                                                               |
+| `keyword`         | `keyword`       | string or array  | `KEYWORD` (custom IMAP flag / label)                                                                  |
+| `not_keyword`     | `notKeyword`    | string or array  | `UNKEYWORD`                                                                                           |
+| `header`          | `header`        | object           | `HEADER name value` per entry (e.g. `{ "X-Custom": "foo" }`)                                          |
+| `uids`            | `uids`          | number[] or string | `UID` — filter to a UID set or IMAP range string (`"1:100"`)                                         |
+| `larger_than`     | `largerThan`    | number (KB)      | `LARGER` (converted to bytes)                                                                          |
+| `smaller_than`    | `smallerThan`   | number (KB)      | `SMALLER`                                                                                              |
+| `has_attachment`  | `hasAttachment` | boolean          | Post-pagination filter (IMAP has no native attachment search — applied to current page only)           |
+| `gmail_raw`       | `gmailRaw`      | string           | Gmail only — passes through to `X-GM-RAW` (Gmail native search syntax). Other filters ignored when set. |
+
+### Example — "Pines Rd" invoice search
+
+```jsonc
+// search_emails tool call
+{
+  "account":        "primary",
+  "subject":        "Pines Rd",
+  "body":           "invoice",
+  "since":          "2024-01-01",
+  "before":         "2024-12-31",
+  "has_attachment": true
+}
+```
+
+### Gmail Fast Path
+
+When the account's `imap.host === "imap.gmail.com"`, pass `gmail_raw` for native Gmail search syntax executed entirely server-side. Dramatically faster than client-side filtering for large mailboxes.
+
+```jsonc
+// search_emails on a Gmail account
+{
+  "account":   "gmail",
+  "gmail_raw": "from:alice@example.com has:attachment older_than:30d"
+}
+```
+
+Notes:
+- When `gmail_raw` is provided, other filters are ignored and a warning lists them.
+- On non-Gmail accounts, `gmail_raw` raises an error explaining the restriction.
+- Full Gmail syntax reference: <https://support.google.com/mail/answer/7190>.
+
+### Performance Notes
+
+- **UID cap**: large result sets are capped at **5000 UIDs** before pagination. When truncation happens the response includes a `warning` and the rendered count is prefixed with `~` to indicate `totalApprox`. Narrow the query with more filters (dates, sender, subject) to drop below the cap.
+- **`has_attachment` is post-pagination**: because IMAP has no native attachment search, the filter is now applied only to the current page's body-structure fetches — so a 78k-message folder no longer triggers a full-folder body-structure scan upfront. The trade-off: if the filter trims items on a page, the page serves fewer results and `totalApprox` is set; narrow the query instead of relying on `has_attachment` alone.
+- **Relative date tokens** (`7d`, `2w`, `1m`, `yesterday`, `today`) are evaluated in UTC at call time.
+
 ## API
 
 ### Tools (47)

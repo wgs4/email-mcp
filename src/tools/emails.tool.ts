@@ -115,8 +115,11 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
   // ---------------------------------------------------------------------------
   server.tool(
     'list_emails',
-    'List emails in a mailbox with optional filters. Returns paginated results with metadata ' +
-      '(read/unread 🔵, flagged ⭐, replied ↩️, attachments 📎, labels 🏷️). ' +
+    'List emails with optional server-side filters. Supports date ranges (since/before/on, ' +
+      'including relative tokens like "7d", "yesterday"), subject/from/to/cc/bcc/body/text search, ' +
+      'read/flag/answered state, keywords/labels, header matches, and UID ranges. ' +
+      'On Gmail accounts, pass gmail_raw for native Gmail search syntax (dramatically faster). ' +
+      'Returns paginated metadata (read/unread 🔵, flagged ⭐, replied ↩️, attachments 📎, labels 🏷️). ' +
       'Use get_email to fetch full body content. ' +
       'ProtonMail note: labels are represented as IMAP folders — use list_labels to discover them, ' +
       'then list_emails with mailbox="Labels/X" to find labeled emails.',
@@ -125,17 +128,58 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
       mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
       page: z.number().int().min(1).default(1).describe('Page number'),
       pageSize: z.number().int().min(1).max(100).default(20).describe('Results per page'),
-      since: z.string().optional().describe('Show emails after this date (ISO 8601)'),
-      before: z.string().optional().describe('Show emails before this date (ISO 8601)'),
+      since: z
+        .string()
+        .optional()
+        .describe(
+          'Date filter: received on/after. Accepts ISO 8601, YYYY-MM-DD, or relative like "7d" / "yesterday"',
+        ),
+      before: z.string().optional().describe('Date filter: received strictly before'),
+      on: z.string().optional().describe('Date filter: received on specific date'),
+      sent_since: z
+        .string()
+        .optional()
+        .describe(
+          'Date header: sent on/after (differs from since which uses internal delivery date)',
+        ),
+      sent_before: z.string().optional().describe('Date header: sent before'),
       from: z.string().optional().describe('Filter by sender address or name'),
-      subject: z.string().optional().describe('Filter by subject keyword'),
-      seen: z.boolean().optional().describe('Filter: true=read only, false=unread only'),
-      flagged: z.boolean().optional().describe('Filter: true=flagged only, false=unflagged only'),
+      subject: z.string().optional().describe('Substring in Subject'),
+      to: z.string().optional().describe('Substring in To'),
+      cc: z.string().optional().describe('Substring in Cc'),
+      bcc: z.string().optional().describe('Substring in Bcc'),
+      text: z.string().optional().describe('Any text field (headers + body)'),
+      body: z.string().optional().describe('Body only'),
+      seen: z.boolean().optional().describe('true = read only; false = unread only'),
+      flagged: z.boolean().optional().describe('true = flagged; false = unflagged'),
       has_attachment: z
         .boolean()
         .optional()
         .describe('Filter: true=has attachments, false=no attachments'),
       answered: z.boolean().optional().describe('Filter: true=replied, false=not yet replied'),
+      draft: z.boolean().optional(),
+      deleted: z.boolean().optional(),
+      keyword: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe('IMAP keyword/label (AND when array)'),
+      not_keyword: z.union([z.string(), z.array(z.string())]).optional(),
+      header: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe('Arbitrary header name/value match, e.g. {"X-Custom": "value"}'),
+      uids: z
+        .union([z.array(z.number()), z.string()])
+        .optional()
+        .describe('Specific UID ranges (array of numbers or IMAP sequence string like "1:100")'),
+      larger_than: z.number().optional().describe('Minimum email size in KB'),
+      smaller_than: z.number().optional().describe('Maximum email size in KB'),
+      gmail_raw: z
+        .string()
+        .optional()
+        .describe(
+          "Gmail accounts ONLY: pass Gmail search syntax (e.g. 'from:foo has:attachment') for dramatically faster server-side search. Other filters ignored when set.",
+        ),
     },
     { readOnlyHint: true, destructiveHint: false },
     async (params) => {
@@ -146,28 +190,58 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
           pageSize: params.pageSize,
           since: params.since,
           before: params.before,
+          on: params.on,
+          sentSince: params.sent_since,
+          sentBefore: params.sent_before,
           from: params.from,
           subject: params.subject,
+          to: params.to,
+          cc: params.cc,
+          bcc: params.bcc,
+          text: params.text,
+          body: params.body,
           seen: params.seen,
           flagged: params.flagged,
           hasAttachment: params.has_attachment,
           answered: params.answered,
+          draft: params.draft,
+          deleted: params.deleted,
+          keyword: params.keyword,
+          notKeyword: params.not_keyword,
+          header: params.header,
+          uids: params.uids,
+          largerThan: params.larger_than,
+          smallerThan: params.smaller_than,
+          gmailRaw: params.gmail_raw,
         });
+
+        const warningPrefix = result.warning ? `⚠️ ${result.warning}\n` : '';
 
         if (result.items.length === 0) {
           return {
-            content: [{ type: 'text' as const, text: 'No emails found matching the criteria.' }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `${warningPrefix}No emails found matching the criteria.`,
+              },
+            ],
           };
         }
 
+        const totalDisplay = result.totalApprox ? `~${result.total}` : `${result.total}`;
         const header =
-          `📬 [${params.mailbox}] ${result.total} emails ` +
+          `📬 [${params.mailbox}] ${totalDisplay} emails ` +
           `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})` +
           `${result.hasMore ? ' — more pages available' : ''}\n`;
         const emails = result.items.map(formatEmailMeta).join('\n\n');
 
         return {
-          content: [{ type: 'text' as const, text: `${header}\n${emails}` }],
+          content: [
+            {
+              type: 'text' as const,
+              text: `${warningPrefix}${header}\n${emails}`,
+            },
+          ],
         };
       } catch (err) {
         return {
@@ -419,21 +493,45 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
   // ---------------------------------------------------------------------------
   server.tool(
     'search_emails',
-    'Search emails by keyword across subject, sender, and body. ' +
-      'Omit query (or pass an empty string) to use it as a pure filter — e.g. find all emails ' +
-      'with attachments from a specific recipient without a keyword. ' +
-      'Supports additional filters for recipient, attachments, size, and reply status.',
+    'Search emails with server-side filters. Omit query (or pass an empty string) to use pure filters. ' +
+      'Supports date ranges (since/before/on, including "7d" / "yesterday"), subject/from/to/cc/bcc/body/text ' +
+      'filters, read/flag/answered state, keywords/labels, header matches, UID ranges, size limits, and attachments. ' +
+      "On Gmail accounts, pass gmail_raw (e.g. 'from:foo has:attachment older_than:30d') for a dramatically " +
+      'faster native Gmail search. Results are paginated; large result sets are capped at 5000 UIDs with a warning.',
     {
       account: z.string().describe('Account name from list_accounts'),
       query: z
         .string()
         .optional()
         .default('')
-        .describe('Search keyword (omit or leave empty to use filters only)'),
+        .describe('Search keyword across subject/from/body (omit to use filters only)'),
       mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
       page: z.number().int().min(1).default(1).describe('Page number'),
       pageSize: z.number().int().min(1).max(100).default(20).describe('Results per page'),
       to: z.string().optional().describe('Filter by recipient address'),
+      from: z.string().optional().describe('Filter by sender address or name'),
+      subject: z.string().optional().describe('Substring in Subject'),
+      cc: z.string().optional().describe('Substring in Cc'),
+      bcc: z.string().optional().describe('Substring in Bcc'),
+      text: z.string().optional().describe('Any text field (headers + body)'),
+      body: z.string().optional().describe('Body only'),
+      since: z
+        .string()
+        .optional()
+        .describe(
+          'Date filter: received on/after. Accepts ISO 8601, YYYY-MM-DD, or relative like "7d" / "yesterday"',
+        ),
+      before: z.string().optional().describe('Date filter: received strictly before'),
+      on: z.string().optional().describe('Date filter: received on specific date'),
+      sent_since: z
+        .string()
+        .optional()
+        .describe(
+          'Date header: sent on/after (differs from since which uses internal delivery date)',
+        ),
+      sent_before: z.string().optional().describe('Date header: sent before'),
+      seen: z.boolean().optional().describe('true = read only; false = unread only'),
+      flagged: z.boolean().optional().describe('true = flagged; false = unflagged'),
       has_attachment: z
         .boolean()
         .optional()
@@ -441,6 +539,27 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
       larger_than: z.number().optional().describe('Minimum email size in KB'),
       smaller_than: z.number().optional().describe('Maximum email size in KB'),
       answered: z.boolean().optional().describe('Filter: true=replied, false=not replied'),
+      draft: z.boolean().optional(),
+      deleted: z.boolean().optional(),
+      keyword: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe('IMAP keyword/label (AND when array)'),
+      not_keyword: z.union([z.string(), z.array(z.string())]).optional(),
+      header: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe('Arbitrary header name/value match, e.g. {"X-Custom": "value"}'),
+      uids: z
+        .union([z.array(z.number()), z.string()])
+        .optional()
+        .describe('Specific UID ranges (array of numbers or IMAP sequence string like "1:100")'),
+      gmail_raw: z
+        .string()
+        .optional()
+        .describe(
+          "Gmail accounts ONLY: pass Gmail search syntax (e.g. 'from:foo has:attachment') for dramatically faster server-side search. Other filters ignored when set.",
+        ),
     },
     { readOnlyHint: true, destructiveHint: false },
     async (params) => {
@@ -450,33 +569,63 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
           page: params.page,
           pageSize: params.pageSize,
           to: params.to,
+          from: params.from,
+          subject: params.subject,
+          cc: params.cc,
+          bcc: params.bcc,
+          text: params.text,
+          body: params.body,
+          since: params.since,
+          before: params.before,
+          on: params.on,
+          sentSince: params.sent_since,
+          sentBefore: params.sent_before,
+          seen: params.seen,
+          flagged: params.flagged,
           hasAttachment: params.has_attachment,
           largerThan: params.larger_than,
           smallerThan: params.smaller_than,
           answered: params.answered,
+          draft: params.draft,
+          deleted: params.deleted,
+          keyword: params.keyword,
+          notKeyword: params.not_keyword,
+          header: params.header,
+          uids: params.uids,
+          gmailRaw: params.gmail_raw,
         });
+
+        const warningPrefix = result.warning ? `⚠️ ${result.warning}\n` : '';
 
         if (result.items.length === 0) {
           return {
             content: [
               {
                 type: 'text' as const,
-                text: params.query
-                  ? `No emails found matching "${params.query}".`
-                  : 'No emails found matching the specified filters.',
+                text:
+                  warningPrefix +
+                  (params.query
+                    ? `No emails found matching "${params.query}".`
+                    : 'No emails found matching the specified filters.'),
               },
             ],
           };
         }
 
+        const totalDisplay = result.totalApprox ? `~${result.total}` : `${result.total}`;
         const queryLabel = params.query ? `"${params.query}"` : 'filters';
         const header =
-          `🔍 [${params.mailbox}] ${result.total} result(s) for ${queryLabel} ` +
+          `🔍 [${params.mailbox}] ${totalDisplay} result(s) for ${queryLabel} ` +
           `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})\n`;
         const emails = result.items.map(formatEmailMeta).join('\n\n');
 
         return {
-          content: [{ type: 'text' as const, text: `${header}\n${emails}` }],
+          content: [
+            {
+              type: 'text' as const,
+              text: `${warningPrefix}${header}\n${emails}`,
+            },
+          ],
         };
       } catch (err) {
         return {
