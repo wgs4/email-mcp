@@ -454,3 +454,28 @@ export interface ScheduledEmail {
   sentAt?: string;
   sentMessageId?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Export & Attachment Save — PR 4
+// ---------------------------------------------------------------------------
+
+export interface ExportResult {
+  path: string;
+  rows_written: number;
+  truncated: boolean;
+  format: 'csv' | 'ndjson';
+}
+
+export interface AttachmentSaveResult {
+  path: string;
+  size: number;
+  mimeType: string;
+}
+
+export interface BatchAttachmentResult {
+  folder: string;
+  files_saved: number;
+  total_size: number;
+  skipped: number;
+  errors: { emailId: string; filename: string; error: string }[];
+}
