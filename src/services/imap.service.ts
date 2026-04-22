@@ -16,6 +16,7 @@ import type {
   EmailAddress,
   EmailMeta,
   EmailStats,
+  FacetResult,
   LabelInfo,
   Mailbox,
   PaginatedResult,
@@ -25,7 +26,7 @@ import type {
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
 import type { SearchParams } from './search-criteria.js';
-import { buildSearchCriteria } from './search-criteria.js';
+import { buildSearchCriteria, chunkUids } from './search-criteria.js';
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -33,6 +34,9 @@ import { buildSearchCriteria } from './search-criteria.js';
 
 /** Maximum UIDs retained after the server SEARCH before pagination. */
 const MAX_SEARCH_UIDS = 5000;
+
+/** Maximum match-set size for which we'll envelope-fetch to compute facets. */
+const MAX_FACET_UIDS = 10000;
 
 // ---------------------------------------------------------------------------
 // Helpers (must be defined before ImapService)
@@ -50,14 +54,86 @@ function parseAddresses(addrs: { name?: string; address?: string }[] | undefined
   return addrs.map(parseAddress);
 }
 
+/**
+ * Walk a bodyStructure tree and collect attachment metadata.
+ *
+ * Rules (all case-insensitive; imapflow emits lowercase type/subtype strings):
+ * - A part with `disposition === 'attachment'` is always an attachment.
+ * - A part with `disposition === 'inline'` AND a Content-ID (`id` field) is
+ *   treated as an embedded inline resource (e.g. HTML image) and skipped.
+ * - A non-multipart, non-text/plain part that carries a filename/name
+ *   parameter but no disposition is also treated as an attachment (some mailers
+ *   omit Content-Disposition for PDFs etc).
+ *
+ * The helper is tolerant to missing fields — imapflow's parsed shape uses
+ * `type` as the combined `type/subtype` string (e.g. `"application/pdf"`),
+ * `dispositionParameters` and `parameters` for filename/name.
+ */
+export function extractAttachmentMeta(bodyStructure: unknown): AttachmentMeta[] {
+  const out: AttachmentMeta[] = [];
+
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return;
+    const n = node as Record<string, unknown>;
+
+    const rawType = typeof n.type === 'string' ? n.type : '';
+    const lowerType = rawType.toLowerCase();
+    const isMultipart = lowerType.startsWith('multipart/');
+
+    // Recurse first so we cover every branch.
+    if (Array.isArray(n.childNodes)) {
+      n.childNodes.forEach((child) => {
+        walk(child);
+      });
+    }
+
+    if (isMultipart) return;
+
+    const disposition = typeof n.disposition === 'string' ? n.disposition.toLowerCase() : undefined;
+    const dispParams = (n.dispositionParameters ?? {}) as Record<string, string>;
+    const typeParams = (n.parameters ?? {}) as Record<string, string>;
+    const filename = dispParams.filename ?? dispParams.name ?? typeParams.name ?? undefined;
+    const contentId = typeof n.id === 'string' ? n.id : undefined;
+
+    // Skip inline resources that have a Content-ID (embedded HTML images).
+    if (disposition === 'inline' && contentId) return;
+
+    let isAttachment = false;
+    if (disposition === 'attachment') {
+      isAttachment = true;
+    } else if (filename) {
+      // No explicit disposition but a filename is present — treat as attachment
+      // unless it's a plain text body.
+      if (lowerType !== 'text/plain' && lowerType !== 'text/html') {
+        isAttachment = true;
+      }
+    }
+
+    if (!isAttachment) return;
+
+    // mimeType — imapflow's `type` is already `"maintype/subtype"`. Fall back
+    // gracefully if only `subtype` is set (older shapes).
+    let mimeType = lowerType;
+    if (!mimeType) {
+      const sub = typeof n.subtype === 'string' ? n.subtype.toLowerCase() : '';
+      mimeType = sub ? `application/${sub}` : 'application/octet-stream';
+    }
+
+    out.push({
+      filename: filename ?? 'unnamed',
+      mimeType,
+      size: typeof n.size === 'number' ? n.size : 0,
+    });
+  };
+
+  walk(bodyStructure);
+  return out;
+}
+
 function hasAttachments(bodyStructure: unknown): boolean {
-  if (!bodyStructure || typeof bodyStructure !== 'object') return false;
-  const bs = bodyStructure as Record<string, unknown>;
-  if (bs.disposition === 'attachment') return true;
-  if (Array.isArray(bs.childNodes)) {
-    return bs.childNodes.some((child: unknown) => hasAttachments(child));
-  }
-  return false;
+  // Delegate to the richer helper so legacy callers (e.g. getEmailStats) use
+  // the same semantics as extractAttachmentMeta / EmailMeta.hasAttachments.
+  return extractAttachmentMeta(bodyStructure).length > 0;
 }
 
 function extractAttachments(bodyStructure: unknown): AttachmentMeta[] {
@@ -134,6 +210,12 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
     }
   }
 
+  // Only populate attachments when bodyStructure was actually fetched. An
+  // undefined value signals "unknown" to downstream callers (e.g. post-filters
+  // should not treat an envelope-only message as definitively attachment-free).
+  const attachments =
+    msg.bodyStructure !== undefined ? extractAttachmentMeta(msg.bodyStructure) : undefined;
+
   return {
     id: String(msg.uid ?? msg.seq),
     subject: (envelope.subject as string) ?? '(no subject)',
@@ -145,9 +227,10 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
     seen: flags.has('\\Seen'),
     flagged: flags.has('\\Flagged'),
     answered: flags.has('\\Answered'),
-    hasAttachments: hasAttachments(msg.bodyStructure),
+    hasAttachments: (attachments?.length ?? 0) > 0,
     labels,
     preview,
+    ...(attachments !== undefined ? { attachments } : {}),
   };
 }
 
@@ -327,6 +410,9 @@ export default class ImapService {
       largerThan?: number;
       smallerThan?: number;
       gmailRaw?: string;
+      // PR 2 phase E additions:
+      attachmentFilename?: string;
+      attachmentMimetype?: string;
     } = {},
   ): Promise<PaginatedResult<EmailMeta>> {
     const client = await this.connections.getImapClient(accountName);
@@ -418,6 +504,31 @@ export default class ImapService {
         if (items.length !== pageUids.length) {
           totalApprox = true;
         }
+      }
+
+      // PR 2 Phase E — attachment filename / mimetype post-filters.
+      if (postFilters.attachmentFilename) {
+        const needle = postFilters.attachmentFilename.toLowerCase();
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => a.filename.toLowerCase().includes(needle));
+        });
+        if (items.length !== pageUids.length) totalApprox = true;
+      }
+      if (postFilters.attachmentMimetype) {
+        let re: RegExp;
+        try {
+          re = new RegExp(postFilters.attachmentMimetype, 'i');
+        } catch (err) {
+          throw new Error(
+            `Invalid attachment_mimetype pattern: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => re.test(a.mimeType));
+        });
+        if (items.length !== pageUids.length) totalApprox = true;
       }
 
       // Sort by date descending
@@ -567,6 +678,11 @@ export default class ImapService {
       header?: Record<string, string>;
       uids?: number[] | string;
       gmailRaw?: string;
+      // PR 2 phase E additions:
+      attachmentFilename?: string;
+      attachmentMimetype?: string;
+      // PR 2 phase G additions:
+      facets?: ('sender' | 'year' | 'mailbox')[];
     } = {},
   ): Promise<PaginatedResult<EmailMeta>> {
     const client = await this.connections.getImapClient(accountName);
@@ -613,6 +729,19 @@ export default class ImapService {
       const start = (page - 1) * pageSize;
       const pageUids = uids.slice(start, start + pageSize);
 
+      // PR 2 Phase G — faceted counts across the full (post-cap) UID set.
+      // Skip when the match set is too large to envelope-fetch efficiently.
+      let facets: FacetResult | undefined;
+      if (postFilters.facets && postFilters.facets.length > 0) {
+        if (uids.length > MAX_FACET_UIDS) {
+          warnings.push(
+            `Facets skipped — match set (${uids.length}) exceeds ${MAX_FACET_UIDS}. Add more filters to enable facets.`,
+          );
+        } else {
+          facets = await ImapService.computeFacets(client, uids, postFilters.facets, mailbox);
+        }
+      }
+
       if (pageUids.length === 0) {
         const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
         return {
@@ -623,6 +752,7 @@ export default class ImapService {
           hasMore: false,
           ...(warning ? { warning } : {}),
           ...(totalApprox ? { totalApprox } : {}),
+          ...(facets ? { facets } : {}),
         };
       }
 
@@ -654,6 +784,31 @@ export default class ImapService {
         }
       }
 
+      // PR 2 Phase E — attachment filename / mimetype post-filters.
+      if (postFilters.attachmentFilename) {
+        const needle = postFilters.attachmentFilename.toLowerCase();
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => a.filename.toLowerCase().includes(needle));
+        });
+        if (items.length !== pageUids.length) totalApprox = true;
+      }
+      if (postFilters.attachmentMimetype) {
+        let re: RegExp;
+        try {
+          re = new RegExp(postFilters.attachmentMimetype, 'i');
+        } catch (err) {
+          throw new Error(
+            `Invalid attachment_mimetype pattern: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => re.test(a.mimeType));
+        });
+        if (items.length !== pageUids.length) totalApprox = true;
+      }
+
       items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
       const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
@@ -665,10 +820,58 @@ export default class ImapService {
         hasMore: start + pageSize < total,
         ...(warning ? { warning } : {}),
         ...(totalApprox ? { totalApprox } : {}),
+        ...(facets ? { facets } : {}),
       };
     } finally {
       lock.release();
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Faceted counts — envelope-only chunk fetch used by searchEmails
+  // -------------------------------------------------------------------------
+
+  private static async computeFacets(
+    client: ImapFlow,
+    uids: number[],
+    wanted: ('sender' | 'year' | 'mailbox')[],
+    mailbox: string,
+  ): Promise<FacetResult> {
+    const result: FacetResult = {};
+    if (wanted.includes('sender')) result.sender = {};
+    if (wanted.includes('year')) result.year = {};
+    if (wanted.includes('mailbox')) result.mailbox = { [mailbox]: uids.length };
+
+    // No envelope scan required if only mailbox was requested.
+    if (!wanted.includes('sender') && !wanted.includes('year')) return result;
+
+    const CHUNK = 500;
+    const chunks = chunkUids(uids, CHUNK);
+    // eslint-disable-next-line no-restricted-syntax
+    for (const chunk of chunks) {
+      const range = chunk.join(',');
+      // eslint-disable-next-line no-restricted-syntax, no-await-in-loop
+      for await (const msg of client.fetch(range, { uid: true, envelope: true }, { uid: true })) {
+        const raw = msg as unknown as Record<string, unknown>;
+        const env = (raw.envelope ?? {}) as Record<string, unknown>;
+        if (result.sender) {
+          const fromEntry = (env.from as Record<string, string>[] | undefined)?.[0];
+          if (fromEntry?.address) {
+            const key = fromEntry.address.toLowerCase();
+            result.sender[key] = (result.sender[key] ?? 0) + 1;
+          }
+        }
+        if (result.year && env.date) {
+          const yr = new Date(env.date as string).getFullYear();
+          if (!Number.isNaN(yr)) {
+            const k = String(yr);
+            result.year[k] = (result.year[k] ?? 0) + 1;
+          }
+        }
+      }
+    }
+
+    return result;
   }
 
   // -------------------------------------------------------------------------
