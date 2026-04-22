@@ -31,7 +31,15 @@ function formatEmailMeta(email: EmailMeta): string {
   const from = email.from.name ? `${email.from.name} <${email.from.address}>` : email.from.address;
   const labelStr = email.labels.length > 0 ? `\n  🏷️ ${email.labels.join(', ')}` : '';
 
-  return `[${email.id}] ${flags} ${email.subject}\n  From: ${from} | ${email.date}${labelStr}${email.preview ? `\n  ${email.preview}` : ''}`;
+  let attachLine = '';
+  if (email.attachments && email.attachments.length > 0) {
+    const names = email.attachments.map((a) => a.filename);
+    const shown = names.slice(0, 3).join(', ');
+    const extra = names.length > 3 ? ` (+${names.length - 3} more)` : '';
+    attachLine = `\n  📎 Attachments: ${shown}${extra}`;
+  }
+
+  return `[${email.id}] ${flags} ${email.subject}\n  From: ${from} | ${email.date}${labelStr}${attachLine}${email.preview ? `\n  ${email.preview}` : ''}`;
 }
 
 /** Strips HTML markup and decodes common entities to produce readable plain text. */
@@ -174,6 +182,18 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
         .describe('Specific UID ranges (array of numbers or IMAP sequence string like "1:100")'),
       larger_than: z.number().optional().describe('Minimum email size in KB'),
       smaller_than: z.number().optional().describe('Maximum email size in KB'),
+      attachment_filename: z
+        .string()
+        .optional()
+        .describe(
+          'Filter by attachment filename substring (case-insensitive). Example: "lease" matches "signed_lease_v7.pdf".',
+        ),
+      attachment_mimetype: z
+        .string()
+        .optional()
+        .describe(
+          'Filter by MIME type regex (case-insensitive). Examples: "application/pdf", "image/.*".',
+        ),
       gmail_raw: z
         .string()
         .optional()
@@ -212,6 +232,8 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
           uids: params.uids,
           largerThan: params.larger_than,
           smallerThan: params.smaller_than,
+          attachmentFilename: params.attachment_filename,
+          attachmentMimetype: params.attachment_mimetype,
           gmailRaw: params.gmail_raw,
         });
 
@@ -554,6 +576,25 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
         .union([z.array(z.number()), z.string()])
         .optional()
         .describe('Specific UID ranges (array of numbers or IMAP sequence string like "1:100")'),
+      attachment_filename: z
+        .string()
+        .optional()
+        .describe(
+          'Filter by attachment filename substring (case-insensitive). Example: "lease" matches "signed_lease_v7.pdf".',
+        ),
+      attachment_mimetype: z
+        .string()
+        .optional()
+        .describe(
+          'Filter by MIME type regex (case-insensitive). Examples: "application/pdf", "image/.*".',
+        ),
+      facets: z
+        .array(z.enum(['sender', 'year', 'mailbox']))
+        .optional()
+        .describe(
+          'Return bucketed counts by sender/year/mailbox alongside the paginated results. ' +
+            'Useful for understanding large result sets. Skipped if match set exceeds 10000 UIDs.',
+        ),
       gmail_raw: z
         .string()
         .optional()
@@ -592,6 +633,9 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
           notKeyword: params.not_keyword,
           header: params.header,
           uids: params.uids,
+          attachmentFilename: params.attachment_filename,
+          attachmentMimetype: params.attachment_mimetype,
+          facets: params.facets,
           gmailRaw: params.gmail_raw,
         });
 
@@ -619,11 +663,38 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
           `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})\n`;
         const emails = result.items.map(formatEmailMeta).join('\n\n');
 
+        let facetsBlock = '';
+        if (result.facets) {
+          const lines: string[] = ['', '📊 Facets'];
+          if (result.facets.sender) {
+            const top = Object.entries(result.facets.sender)
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 10)
+              .map(([k, v]) => `${k} (${v})`)
+              .join(', ');
+            lines.push(`  By sender: ${top || '(none)'}`);
+          }
+          if (result.facets.year) {
+            const all = Object.entries(result.facets.year)
+              .sort((a, b) => b[0].localeCompare(a[0]))
+              .map(([k, v]) => `${k} (${v})`)
+              .join(', ');
+            lines.push(`  By year:   ${all || '(none)'}`);
+          }
+          if (result.facets.mailbox) {
+            const all = Object.entries(result.facets.mailbox)
+              .map(([k, v]) => `${k} (${v})`)
+              .join(', ');
+            lines.push(`  By mailbox: ${all || '(none)'}`);
+          }
+          facetsBlock = `\n${lines.join('\n')}`;
+        }
+
         return {
           content: [
             {
               type: 'text' as const,
-              text: `${warningPrefix}${header}\n${emails}`,
+              text: `${warningPrefix}${header}\n${emails}${facetsBlock}`,
             },
           ],
         };

@@ -36,6 +36,12 @@ export interface SearchParams {
   smallerThan?: number;
   // Post-pagination filters (not part of IMAP search — applied client-side):
   hasAttachment?: boolean;
+  /** Substring match (case-insensitive) against any attachment filename. */
+  attachmentFilename?: string;
+  /** Regex (case-insensitive) applied to `${type}/${subtype}` of each attachment. */
+  attachmentMimetype?: string;
+  /** Faceted counts to return alongside the paginated result. */
+  facets?: ('sender' | 'year' | 'mailbox')[];
   gmailRaw?: string;
 }
 
@@ -43,6 +49,9 @@ export interface BuildResult {
   criteria: Record<string, unknown>;
   postFilters: {
     hasAttachment?: boolean;
+    attachmentFilename?: string;
+    attachmentMimetype?: string;
+    facets?: ('sender' | 'year' | 'mailbox')[];
   };
   gmailRawUsed: boolean;
   warnings: string[];
@@ -157,7 +166,12 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
 
   return {
     criteria,
-    postFilters: { hasAttachment: params.hasAttachment },
+    postFilters: {
+      hasAttachment: params.hasAttachment,
+      attachmentFilename: params.attachmentFilename,
+      attachmentMimetype: params.attachmentMimetype,
+      facets: params.facets,
+    },
     gmailRawUsed: false,
     warnings,
   };

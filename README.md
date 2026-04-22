@@ -673,6 +673,9 @@ Features:
 | `larger_than`     | `largerThan`    | number (KB)      | `LARGER` (converted to bytes)                                                                          |
 | `smaller_than`    | `smallerThan`   | number (KB)      | `SMALLER`                                                                                              |
 | `has_attachment`  | `hasAttachment` | boolean          | Post-pagination filter (IMAP has no native attachment search — applied to current page only)           |
+| `attachment_filename` | `attachmentFilename` | string    | Substring match (case-insensitive) against any attachment filename on the current page                 |
+| `attachment_mimetype` | `attachmentMimetype` | string    | Regex (case-insensitive) applied to each attachment's `type/subtype` on the current page               |
+| `facets`          | `facets`        | string[]         | `search_emails` only — returns bucketed counts by `sender` / `year` / `mailbox`                        |
 | `gmail_raw`       | `gmailRaw`      | string           | Gmail only — passes through to `X-GM-RAW` (Gmail native search syntax). Other filters ignored when set. |
 
 ### Example — "Pines Rd" invoice search
@@ -705,6 +708,50 @@ Notes:
 - When `gmail_raw` is provided, other filters are ignored and a warning lists them.
 - On non-Gmail accounts, `gmail_raw` raises an error explaining the restriction.
 - Full Gmail syntax reference: <https://support.google.com/mail/answer/7190>.
+
+### Attachment filters
+
+When `has_attachment: true` alone returns too much noise, narrow by filename substring or MIME type regex. Both are applied post-pagination on the current page's body-structure fetches (same trade-off as `has_attachment`: if the filter trims the page, fewer items are served and `totalApprox` is set).
+
+```jsonc
+// Narrow a noisy Pines Rd thread to signed PDFs only
+{
+  "account":             "primary",
+  "subject":             "Pines Rd",
+  "attachment_filename": "lease",             // matches "signed_lease_v7.pdf"
+  "attachment_mimetype": "application/pdf"    // regex, case-insensitive
+}
+```
+
+Regex examples:
+
+- `"application/pdf"` — exact MIME
+- `"image/.*"` — any image attachment
+- `"^application/(pdf|zip)$"` — PDFs or zips
+
+Invalid regex patterns raise a `Invalid attachment_mimetype pattern: …` tool error.
+
+### Facets
+
+`search_emails` (only — not `list_emails`) accepts a `facets` array to return bucketed counts across the **full match set** (up to the 5000-UID cap) alongside the paginated page:
+
+```jsonc
+{
+  "account": "primary",
+  "since":   "90d",
+  "facets":  ["sender", "year"]
+}
+```
+
+The response appends a `📊 Facets` block with the top 10 senders and year buckets:
+
+```
+📊 Facets
+  By sender: alice@example.com (42), bob@example.com (15), ...
+  By year:   2025 (52), 2024 (20)
+```
+
+Facets are computed via a single envelope-only IMAP fetch in 500-UID chunks. When the match set exceeds **10000 UIDs** facets are skipped with a warning — narrow the query (date range, sender, subject) to unlock them. `"mailbox"` is a reserved single-entry bucket for the current mailbox; cross-account search is coming in a later PR.
 
 ### Performance Notes
 

@@ -6,7 +6,12 @@ describe('buildSearchCriteria', () => {
       const result = buildSearchCriteria({}, { isGmail: false });
       expect(result).toEqual({
         criteria: {},
-        postFilters: { hasAttachment: undefined },
+        postFilters: {
+          hasAttachment: undefined,
+          attachmentFilename: undefined,
+          attachmentMimetype: undefined,
+          facets: undefined,
+        },
         gmailRawUsed: false,
         warnings: [],
       });
@@ -166,6 +171,48 @@ describe('buildSearchCriteria', () => {
       expect(() => buildSearchCriteria({ gmailRaw: 'from:x' }, { isGmail: false })).toThrow(
         /only valid on Gmail accounts/,
       );
+    });
+  });
+});
+
+describe('buildSearchCriteria — PR 2 post-filter extensions', () => {
+  it('attachmentFilename flows into postFilters (not into criteria)', () => {
+    const result = buildSearchCriteria({ attachmentFilename: 'lease' }, { isGmail: false });
+    expect(result.criteria).toEqual({});
+    expect(result.postFilters.attachmentFilename).toBe('lease');
+  });
+
+  it('attachmentMimetype flows into postFilters (not into criteria)', () => {
+    const result = buildSearchCriteria(
+      { attachmentMimetype: 'application/pdf' },
+      { isGmail: false },
+    );
+    expect(result.criteria).toEqual({});
+    expect(result.postFilters.attachmentMimetype).toBe('application/pdf');
+  });
+
+  it('facets flows into postFilters (not into criteria)', () => {
+    const result = buildSearchCriteria({ facets: ['sender', 'year'] }, { isGmail: false });
+    expect(result.criteria).toEqual({});
+    expect(result.postFilters.facets).toEqual(['sender', 'year']);
+  });
+
+  it('combining regular filters + new post-filters keeps them in their correct buckets', () => {
+    const result = buildSearchCriteria(
+      {
+        from: 'alice@x',
+        attachmentFilename: 'lease',
+        attachmentMimetype: 'application/pdf',
+        facets: ['sender'],
+      },
+      { isGmail: false },
+    );
+    expect(result.criteria).toEqual({ from: 'alice@x' });
+    expect(result.postFilters).toEqual({
+      hasAttachment: undefined,
+      attachmentFilename: 'lease',
+      attachmentMimetype: 'application/pdf',
+      facets: ['sender'],
     });
   });
 });
