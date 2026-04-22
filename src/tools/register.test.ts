@@ -10,6 +10,7 @@ vi.mock('./calendar.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./contacts.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./drafts.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./emails.tool.js', () => ({ default: vi.fn() }));
+vi.mock('./export.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./folders.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./health.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./label.tool.js', () => ({ default: vi.fn() }));

@@ -1,3 +1,4 @@
+/* eslint-disable n/no-sync -- tests use sync fs helpers for setup/teardown */
 import type { IConnectionManager } from '../connections/types.js';
 import ImapService from './imap.service.js';
 
@@ -583,6 +584,140 @@ describe('ImapService', () => {
       });
       // No ℹ️-prefixed remap notices should exist — the preflight never ran.
       expect(result.warnings?.some((w) => w.error.startsWith('ℹ️')) ?? false).toBe(false);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // saveAttachmentToDisk — direct-to-disk, no base64 hop (PR 4)
+  // -----------------------------------------------------------------------
+
+  describe('saveAttachmentToDisk', () => {
+    // Minimal bodyStructure with one attachment part — mirrors the shape
+    // imapflow produces.
+    const attachmentBodyStructure = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { type: 'text/plain', size: 50 },
+        {
+          type: 'application/pdf',
+          size: 2048,
+          part: '2',
+          disposition: 'attachment',
+          dispositionParameters: { filename: 'lease.pdf' },
+        },
+      ],
+    };
+
+    async function* asyncFrom(chunks: Buffer[]): AsyncGenerator<Buffer> {
+      for (const c of chunks) yield c;
+    }
+
+    // Set up the client mock used by every case below.
+    function primeClientForDownload(
+      tmpClient: ReturnType<typeof createMockImapClient>,
+      payload = Buffer.from('PDF-BYTES'),
+    ) {
+      const withMethods = tmpClient as unknown as {
+        fetchOne: ReturnType<typeof vi.fn>;
+        download: ReturnType<typeof vi.fn>;
+      };
+      withMethods.fetchOne = vi.fn().mockResolvedValue({
+        uid: 42,
+        bodyStructure: attachmentBodyStructure,
+      });
+      withMethods.download = vi.fn().mockResolvedValue({
+        content: asyncFrom([payload]),
+      });
+    }
+
+    it('writes an attachment to a tmp-dir path and returns {path, size, mimeType}', async () => {
+      const { mkdtempSync, rmSync, readFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const tmp = mkdtempSync(join(tmpdir(), 'save-att-'));
+      try {
+        primeClientForDownload(client, Buffer.from('PDF-PAYLOAD'));
+
+        const result = await service.saveAttachmentToDisk(
+          'test',
+          '42',
+          'INBOX',
+          'lease.pdf',
+          tmp, // directory — filename is appended
+        );
+
+        expect(result.path).toBe(join(tmp, 'lease.pdf'));
+        expect(result.mimeType).toBe('application/pdf');
+        expect(result.size).toBe('PDF-PAYLOAD'.length);
+        expect(readFileSync(result.path, 'utf-8')).toBe('PDF-PAYLOAD');
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('auto-suffixes when target exists and overwrite=false', async () => {
+      const { mkdtempSync, rmSync, writeFileSync, readFileSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const tmp = mkdtempSync(join(tmpdir(), 'save-att-'));
+      try {
+        // Pre-seed a conflict
+        writeFileSync(join(tmp, 'lease.pdf'), 'EXISTING');
+        primeClientForDownload(client, Buffer.from('NEW-BYTES'));
+
+        const result = await service.saveAttachmentToDisk('test', '42', 'INBOX', 'lease.pdf', tmp);
+
+        expect(result.path).toBe(join(tmp, 'lease-1.pdf'));
+        expect(readFileSync(join(tmp, 'lease.pdf'), 'utf-8')).toBe('EXISTING');
+        expect(readFileSync(result.path, 'utf-8')).toBe('NEW-BYTES');
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects /etc/passwd-style destinations outside $HOME and /tmp', async () => {
+      primeClientForDownload(client);
+      await expect(
+        service.saveAttachmentToDisk('test', '42', 'INBOX', 'lease.pdf', '/etc/passwd'),
+      ).rejects.toThrow(/outside the user's home directory/);
+    });
+
+    it('rejects destinations containing `..` traversal', async () => {
+      primeClientForDownload(client);
+      // Literal `..` segment kept in the string (not normalized by path.join).
+      // Even when the resolved path would end up inside a safe dir, we reject
+      // on the raw `..` segment first.
+      await expect(
+        service.saveAttachmentToDisk(
+          'test',
+          '42',
+          'INBOX',
+          'lease.pdf',
+          '/Users/someone/Downloads/../../../etc/evil.pdf',
+        ),
+      ).rejects.toThrow(/must not contain ".." traversal segments/);
+    });
+
+    it('rejects non-absolute paths', async () => {
+      primeClientForDownload(client);
+      await expect(
+        service.saveAttachmentToDisk('test', '42', 'INBOX', 'lease.pdf', 'relative/path.pdf'),
+      ).rejects.toThrow(/absolute path/);
+    });
+
+    it('throws when the attachment filename is not found on the email', async () => {
+      const { mkdtempSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const tmp = mkdtempSync(join(tmpdir(), 'save-att-'));
+      try {
+        primeClientForDownload(client);
+        await expect(
+          service.saveAttachmentToDisk('test', '42', 'INBOX', 'not-there.pdf', tmp),
+        ).rejects.toThrow(/Attachment "not-there.pdf" not found/);
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
     });
   });
 });

@@ -817,11 +817,96 @@ seen    = false
 
 `list_presets` appends a `📋 Saved searches (from config.toml)` section so the available names are discoverable at runtime.
 
+## Export & Attachment Save
+
+Three tools that write directly to disk under `~/Downloads/` (or a caller-supplied path under `$HOME` / `/tmp`). Every path is validated — attempts to write to `/etc`, `/System`, `/usr/bin`, etc. are rejected, and `..` traversal is stripped.
+
+### `export_search`
+
+Run any `search_emails` / `search_all_accounts` query and stream the result set to a **CSV** or **NDJSON** file. The MCP response carries only a tiny summary (path + row count + truncation flag); the bulk of the data lives on disk, so this bypasses the ~25k-token response cap.
+
+```jsonc
+// Export every Pines Rd message across two accounts to CSV
+{
+  "accounts":    ["wgs-usa", "all-pedal"],
+  "subject":     "Pines Rd",
+  "since":       "2024-01-01",
+  "before":      "2025-01-01",
+  "format":      "csv",
+  "max_rows":    5000,
+  "destination": "/Users/me/Downloads/pines-rd-2024.csv"
+}
+```
+
+Default CSV columns (snake_case headers): `id`, `account`, `date`, `from`, `subject`, `labels`, `attachments`, `has_attachments`, `seen`, `flagged`. Pass `columns` to pick a subset; available columns are `id`, `account`, `date`, `from`, `to`, `subject`, `flags`, `labels`, `attachments`, `preview`, `size`.
+
+- `attachments` serializes as `filename1.pdf|filename2.png`
+- `labels` serializes as `label1|label2`
+- `from` serializes as `"Name <addr@domain>"`
+- All escaping follows RFC 4180 (quote fields containing `",\n\r`, double embedded quotes)
+
+NDJSON mode emits one `JSON.stringify(EmailMeta)` per line — the `columns` parameter is ignored and the full structured record (including attachments array) is dumped.
+
+`max_rows` defaults to 5000 (hard ceiling 50 000). When the underlying match set is larger the file is truncated and the response sets `truncated: true`.
+
+### `save_attachment`
+
+Write a single attachment to disk without the ~5 MB ceiling and base64 hop of `download_attachment`. The file is piped from `imapflow` straight into `fs.createWriteStream` — no intermediate buffer, no MCP-response byte budget.
+
+```jsonc
+// Save a single lease PDF to ~/Downloads
+{
+  "account":    "wgs-usa",
+  "emailId":    "12345",
+  "mailbox":    "INBOX",
+  "filename":   "signed_lease_v7.pdf",
+  "open":       true   // optional — spawns `open <path>` on macOS after save
+}
+```
+
+Contrast:
+
+| | `download_attachment` (legacy) | `save_attachment` (new) |
+|---|---|---|
+| Response payload | base64-encoded bytes | `{ path, size, mimeType }` summary |
+| Size limit | 5 MB | None |
+| MCP token budget | Consumes ~25k tokens for typical PDFs | Constant-size response |
+| Use case | Inline preview, AI analysis | Bulk save, user-facing download |
+
+Auto-collision suffix: if `lease.pdf` exists the tool writes `lease-1.pdf`, `lease-2.pdf`, etc. Pass `overwrite: true` to opt in.
+
+### `save_all_attachments_from_search`
+
+Run a search and sweep every matching attachment into a dated folder. Great for year-end lease-PDF audits, vendor invoice collections, monthly statement exports.
+
+```jsonc
+// Year-end Pines Rd lease-PDF sweep — 2024, across two accounts,
+// filtered to PDFs whose filename mentions "lease", bucketed by month.
+{
+  "accounts":            ["wgs-usa", "all-pedal"],
+  "subject":             "Pines Rd",
+  "since":               "2024-01-01",
+  "before":              "2025-01-01",
+  "attachment_filename": "lease",
+  "attachment_mimetype": "application/pdf",
+  "organize_by":         "date"
+}
+```
+
+`organize_by` controls the subfolder layout under the destination:
+
+- `flat` — all files in a single folder (default)
+- `date` — `YYYY-MM/` buckets based on each email's date
+- `sender` — bucketed by sender domain (e.g. `example.com/`)
+- `account` — bucketed by originating account name (useful for multi-account sweeps)
+
+Default destination is `~/Downloads/email-attachments-<ISO-ts>/`. Per-email errors are collected in `errors[]` rather than aborting the whole run — you get a summary with `files_saved`, `total_size`, `skipped`, and the error list.
+
 ## API
 
-### Tools (49)
+### Tools (52)
 
-#### Read (16)
+#### Read (19)
 
 | Tool | Description |
 |------|-------------|
@@ -834,7 +919,10 @@ seen    = false
 | `search_emails` | Search by keyword across subject, sender, and body |
 | `search_all_accounts` | Fan a search across multiple accounts in parallel; merges + date-sorts results and tags each with its account |
 | `run_preset` | Run a saved search preset defined under `[[searches]]` in config.toml |
-| `download_attachment` | Download an email attachment by filename |
+| `export_search` | Run a search and stream the result set to a CSV or NDJSON file under `~/Downloads/` (bypasses MCP response byte budget) |
+| `download_attachment` | Download an email attachment by filename (base64 in response; ≤5MB) |
+| `save_attachment` | Save an attachment directly to disk — no base64 hop, no size limit |
+| `save_all_attachments_from_search` | Run a search and download every matching attachment into a dated folder (with optional filename/mimetype filter) |
 | `find_email_folder` | Discover the real folder(s) an email resides in (resolves virtual folders) |
 | `extract_contacts` | Extract unique contacts from recent email headers |
 | `get_thread` | Reconstruct a conversation thread via References/In-Reply-To |
