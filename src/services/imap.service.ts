@@ -38,6 +38,51 @@ const MAX_SEARCH_UIDS = 5000;
 /** Maximum match-set size for which we'll envelope-fetch to compute facets. */
 const MAX_FACET_UIDS = 10000;
 
+/**
+ * Per-account fetch cap for `searchAcrossAccounts`. Each account is queried
+ * with `page=1` and `pageSize = min(requestedPageSize * 10, 500)` so we have
+ * enough rows to merge + paginate without fetching the full match set.
+ */
+const CROSS_ACCOUNT_MAX_PER_ACCOUNT = 500;
+
+// ---------------------------------------------------------------------------
+// Search option shape — shared between searchEmails / searchAcrossAccounts
+// ---------------------------------------------------------------------------
+
+export interface SearchOptions {
+  mailbox?: string;
+  page?: number;
+  pageSize?: number;
+  to?: string;
+  from?: string;
+  subject?: string;
+  cc?: string;
+  bcc?: string;
+  text?: string;
+  body?: string;
+  since?: string;
+  before?: string;
+  on?: string;
+  sentSince?: string;
+  sentBefore?: string;
+  seen?: boolean;
+  flagged?: boolean;
+  answered?: boolean;
+  draft?: boolean;
+  deleted?: boolean;
+  keyword?: string | string[];
+  notKeyword?: string | string[];
+  header?: Record<string, string>;
+  uids?: number[] | string;
+  hasAttachment?: boolean;
+  largerThan?: number;
+  smallerThan?: number;
+  attachmentFilename?: string;
+  attachmentMimetype?: string;
+  facets?: ('sender' | 'year' | 'mailbox')[];
+  gmailRaw?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers (must be defined before ImapService)
 // ---------------------------------------------------------------------------
@@ -825,6 +870,153 @@ export default class ImapService {
     } finally {
       lock.release();
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Cross-account search
+  // -------------------------------------------------------------------------
+
+  /**
+   * Fan-out search across multiple accounts. Executes `searchEmails` in
+   * parallel against every account, merges the per-account pages into a
+   * single date-sorted list, and paginates the merged result.
+   *
+   * Each returned item is stamped with `.account` so callers can tell
+   * where a match came from. Facet maps are unioned across accounts; the
+   * `mailbox` facet is re-keyed to the account name so the caller gets an
+   * account-level breakdown rather than a single `INBOX` bucket.
+   *
+   * Partial failures are surfaced as `warnings[]` without failing the
+   * whole call. If *every* account fails, throws a summary error.
+   */
+  async searchAcrossAccounts(
+    accountNames: string[],
+    query: string,
+    options: SearchOptions = {},
+  ): Promise<PaginatedResult<EmailMeta> & { warnings?: { account: string; error: string }[] }> {
+    if (accountNames.length === 0) {
+      throw new Error('searchAcrossAccounts requires at least one account name');
+    }
+
+    const page = options.page ?? 1;
+    const pageSize = options.pageSize ?? 20;
+
+    // Cap per-account fetch so large pageSize requests don't balloon into full
+    // mailbox scans, but always fetch enough to feed the merged pagination.
+    const perAccountPageSize = Math.min(pageSize * 10, CROSS_ACCOUNT_MAX_PER_ACCOUNT);
+
+    const searchOptionsPerAccount: SearchOptions = {
+      ...options,
+      page: 1,
+      pageSize: perAccountPageSize,
+    };
+    const settled = await Promise.allSettled(
+      accountNames.map(async (name) => this.searchEmails(name, query, searchOptionsPerAccount)),
+    );
+
+    const warnings: { account: string; error: string }[] = [];
+    const perAccountWarnings: string[] = [];
+    let totalAcross = 0;
+    let totalApprox = false;
+    // Pre-allocate facet buckets so we avoid assignment-in-expression inside
+    // the reduce loop. We strip empty buckets from the returned payload at
+    // the end of the function.
+    const facetSender: Record<string, number> = {};
+    const facetYear: Record<string, number> = {};
+    const facetMailbox: Record<string, number> = {};
+    let anySender = false;
+    let anyYear = false;
+    let anyMailbox = false;
+    const collectedItems: EmailMeta[] = [];
+
+    settled.forEach((outcome, idx) => {
+      const name = accountNames[idx];
+      if (outcome.status === 'rejected') {
+        const err = outcome.reason as unknown;
+        warnings.push({
+          account: name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+
+      const res = outcome.value;
+
+      // Stamp every item with its account so downstream callers know where
+      // the match came from.
+      res.items.forEach((item) => {
+        collectedItems.push({ ...item, account: name });
+      });
+
+      totalAcross += res.total;
+      if (res.totalApprox) totalApprox = true;
+      if (res.warning) perAccountWarnings.push(`${name}: ${res.warning}`);
+
+      if (res.facets) {
+        if (res.facets.sender) {
+          anySender = true;
+          Object.entries(res.facets.sender).forEach(([k, v]) => {
+            facetSender[k] = (facetSender[k] ?? 0) + v;
+          });
+        }
+        if (res.facets.year) {
+          anyYear = true;
+          Object.entries(res.facets.year).forEach(([k, v]) => {
+            facetYear[k] = (facetYear[k] ?? 0) + v;
+          });
+        }
+        if (res.facets.mailbox) {
+          // Re-key the mailbox facet by account — cross-account callers want
+          // to see the per-account breakdown, not a single "INBOX" bucket.
+          anyMailbox = true;
+          const sum = Object.values(res.facets.mailbox).reduce((a, b) => a + b, 0);
+          facetMailbox[name] = (facetMailbox[name] ?? 0) + sum;
+        }
+      }
+    });
+
+    // If every account failed, surface a summary error — callers expect a
+    // throw rather than an empty page for total failure.
+    if (warnings.length === accountNames.length) {
+      const summary = warnings.map((w) => `${w.account}: ${w.error}`).join('; ');
+      throw new Error(`All ${accountNames.length} accounts failed: ${summary}`);
+    }
+
+    // Merge + paginate the collected items.
+    collectedItems.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    const start = (page - 1) * pageSize;
+    const items = collectedItems.slice(start, start + pageSize);
+
+    const warningBits: string[] = [];
+    if (perAccountWarnings.length > 0) warningBits.push(perAccountWarnings.join(' | '));
+    if (warnings.length > 0) {
+      warningBits.push(
+        `${warnings.length} of ${accountNames.length} account(s) failed: ${warnings
+          .map((w) => `${w.account} (${w.error})`)
+          .join(', ')}`,
+      );
+    }
+    const warning = warningBits.length > 0 ? warningBits.join('; ') : undefined;
+
+    let facetsPresent: FacetResult | undefined;
+    if (anySender || anyYear || anyMailbox) {
+      facetsPresent = {};
+      if (anySender) facetsPresent.sender = facetSender;
+      if (anyYear) facetsPresent.year = facetYear;
+      if (anyMailbox) facetsPresent.mailbox = facetMailbox;
+    }
+
+    return {
+      items,
+      total: totalAcross,
+      page,
+      pageSize,
+      hasMore: start + pageSize < collectedItems.length,
+      ...(warning ? { warning } : {}),
+      ...(totalApprox ? { totalApprox } : {}),
+      ...(facetsPresent ? { facets: facetsPresent } : {}),
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
   }
 
   // -------------------------------------------------------------------------

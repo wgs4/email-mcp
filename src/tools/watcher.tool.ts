@@ -9,6 +9,7 @@ import { loadRawConfig, saveConfig } from '../config/loader.js';
 import type HooksService from '../services/hooks.service.js';
 import NotifierService from '../services/notifier.service.js';
 import { listPresets as listAllPresets } from '../services/presets.js';
+import type { SearchPresetRegistry } from '../services/search-presets.js';
 import type WatcherService from '../services/watcher.service.js';
 import type { AlertsConfig } from '../types/index.js';
 
@@ -16,6 +17,7 @@ export default function registerWatcherTools(
   server: McpServer,
   watcherService: WatcherService,
   hooksService: HooksService,
+  searchPresetRegistry: SearchPresetRegistry,
 ): void {
   const hooksConfig = hooksService.getHooksConfig();
   // -------------------------------------------------------------------------
@@ -63,29 +65,40 @@ export default function registerWatcherTools(
 
   server.tool(
     'list_presets',
-    'List all available AI triage presets with their descriptions and suggested labels.',
+    'List all available AI triage presets AND saved search presets (from [[searches]] in config.toml).',
     {},
     { readOnlyHint: true, destructiveHint: false },
     async () => {
       const presets = listAllPresets();
       const activePreset = hooksConfig.preset;
 
-      const lines = presets.map((p) => {
+      const hookLines = presets.map((p) => {
         const active = p.id === activePreset ? ' ✅ (active)' : '';
         const labels =
           p.suggestedLabels.length > 0 ? `\n     Labels: ${p.suggestedLabels.join(', ')}` : '';
         return `• ${p.name} [${p.id}]${active}\n     ${p.description}${labels}`;
       });
 
+      const savedSearches = searchPresetRegistry.list();
+      const savedLines =
+        savedSearches.length > 0
+          ? savedSearches.map((s) => {
+              const scope = s.accounts?.length
+                ? s.accounts.join(',')
+                : (s.account ?? '(default account)');
+              const desc = s.description ? ` — ${s.description}` : '';
+              return `  • ${s.name}${desc} (scope: ${scope})`;
+            })
+          : ['  (none — add [[searches]] to config.toml)'];
+
+      const text =
+        `🎯 Available Hook Presets:\n\n${hookLines.join('\n\n')}` +
+        `\n\nTo change preset, set \`preset = "${activePreset}"\` in [settings.hooks] of your config.toml.` +
+        `\n\n📋 Saved searches (from config.toml)\n${savedLines.join('\n')}` +
+        `\n\nRun a saved search with the \`run_preset\` tool (pass \`name\`).`;
+
       return {
-        content: [
-          {
-            type: 'text' as const,
-            text:
-              `🎯 Available Hook Presets:\n\n${lines.join('\n\n')}` +
-              `\n\nTo change preset, set \`preset = "${activePreset}"\` in [settings.hooks] of your config.toml.`,
-          },
-        ],
+        content: [{ type: 'text' as const, text }],
       };
     },
   );

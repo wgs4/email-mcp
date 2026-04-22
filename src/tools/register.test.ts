@@ -16,6 +16,7 @@ vi.mock('./label.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./locate.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./mailboxes.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./manage.tool.js', () => ({ default: vi.fn() }));
+vi.mock('./saved-searches.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./scheduler.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./send.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./templates.tool.js', () => ({
@@ -59,6 +60,7 @@ function createConfig(readOnly: boolean): AppConfig {
       },
     },
     accounts: [],
+    searches: [],
   };
 }
 
@@ -74,6 +76,7 @@ describe('registerAllTools', () => {
       {} as never,
       {} as never,
       createConfig(false),
+      {} as never,
       {} as never,
       {} as never,
       {} as never,
@@ -103,6 +106,7 @@ describe('registerAllTools', () => {
       {} as never,
       {} as never,
       createConfig(true),
+      {} as never,
       {} as never,
       {} as never,
       {} as never,
