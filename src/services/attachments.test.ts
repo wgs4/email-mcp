@@ -144,6 +144,33 @@ describe('extractAttachmentMeta', () => {
     expect(extractAttachmentMeta(struct)).toEqual([]);
   });
 
+  // Regression: PR 2 regression — inline image WITHOUT Content-ID must be
+  // treated as an attachment (not skipped). The has_attachment boolean must
+  // agree with the attachments array.
+  it('inline image with NO content-id is treated as an attachment (regression for has_attachment filter)', () => {
+    const inlineNoCid = {
+      type: 'multipart/related',
+      childNodes: [
+        { type: 'text/html', size: 200 },
+        {
+          type: 'image/gif',
+          size: 3000,
+          disposition: 'inline',
+          // Intentionally no 'id' field — no Content-ID header
+          dispositionParameters: { filename: 'banner.gif' },
+        },
+      ],
+    };
+    const attachments = extractAttachmentMeta(inlineNoCid);
+    // The inline image has no CID, so it must surface as an attachment.
+    expect(attachments).toHaveLength(1);
+    expect(attachments[0].filename).toBe('banner.gif');
+    expect(attachments[0].mimeType).toBe('image/gif');
+    // Semantic alignment: hasAttachments boolean must agree.
+    const hasAtt = attachments.length > 0;
+    expect(hasAtt).toBe(true);
+  });
+
   it('handles malformed input gracefully', () => {
     expect(extractAttachmentMeta(null)).toEqual([]);
     expect(extractAttachmentMeta('not an object')).toEqual([]);

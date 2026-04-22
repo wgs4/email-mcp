@@ -11,6 +11,7 @@ export {
   seedEmail,
   seedEmails,
   seedEmailWithAttachment,
+  seedEmailWithInlineAttachmentNoCid,
   seedThread,
   waitForDelivery,
 } from './seed.js';
