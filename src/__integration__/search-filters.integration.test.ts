@@ -4,6 +4,7 @@ import {
   createTestServices,
   seedEmail,
   seedEmailWithAttachment,
+  seedEmailWithInlineAttachmentNoCid,
   TEST_ACCOUNT_NAME,
   waitForDelivery,
 } from './helpers/index.js';
@@ -199,6 +200,43 @@ describe('Power Search filters (integration)', () => {
       // sender / year should not be populated when not requested.
       expect(result.facets?.sender).toBeUndefined();
       expect(result.facets?.year).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Phase H — has_attachment regression (inline image without Content-ID)
+  // -------------------------------------------------------------------------
+
+  describe('has_attachment regression — inline image no Content-ID', () => {
+    let inlineNoCidSubject: string;
+
+    beforeAll(async () => {
+      inlineNoCidSubject = `Inline no-cid regression ${Date.now()}`;
+      await seedEmailWithInlineAttachmentNoCid({ subject: inlineNoCidSubject });
+      await waitForDelivery();
+    });
+
+    it('search_emails(has_attachment=true) returns the inline-no-cid email', async () => {
+      const result = await services.imapService.searchEmails(TEST_ACCOUNT_NAME, '', {
+        hasAttachment: true,
+        pageSize: 100,
+      });
+      const found = result.items.find((e) => e.subject === inlineNoCidSubject);
+      expect(found).toBeDefined();
+      // The attachments array must also be populated (semantic alignment).
+      expect((found?.attachments ?? []).length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('the seeded email carries banner.gif in its attachments metadata', async () => {
+      // Verify extractAttachmentMeta surfaces the inline-no-cid image.
+      const result = await services.imapService.searchEmails(TEST_ACCOUNT_NAME, '', {
+        subject: inlineNoCidSubject,
+        pageSize: 10,
+      });
+      expect(result.items.length).toBeGreaterThanOrEqual(1);
+      const email = result.items[0];
+      expect(email.hasAttachments).toBe(true);
+      expect((email.attachments ?? []).some((a) => /banner\.gif/.test(a.filename))).toBe(true);
     });
   });
 });

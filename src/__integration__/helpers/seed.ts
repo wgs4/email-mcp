@@ -107,3 +107,25 @@ export async function seedEmailWithAttachment(
 export async function waitForDelivery(ms = 500): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/**
+ * Seed an HTML email that contains an inline image without a Content-ID.
+ * This is the trigger case for the has_attachment regression: extractAttachmentMeta
+ * surfaces inline parts without CIDs; the old hasAttachments() boolean did not.
+ */
+export async function seedEmailWithInlineAttachmentNoCid(options: SeedEmailOptions = {}) {
+  return seedEmail({
+    ...options,
+    subject: options.subject ?? 'Email with inline image no cid',
+    html: '<p>Check out this image</p>',
+    attachments: [
+      {
+        filename: 'banner.gif',
+        content: Buffer.from('GIF89a'),
+        contentType: 'image/gif',
+        contentDisposition: 'inline',
+        // Intentionally no cid field — exercises the no-Content-ID inline path
+      },
+    ],
+  });
+}

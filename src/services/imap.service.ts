@@ -54,16 +54,6 @@ function parseAddresses(addrs: { name?: string; address?: string }[] | undefined
   return addrs.map(parseAddress);
 }
 
-function hasAttachments(bodyStructure: unknown): boolean {
-  if (!bodyStructure || typeof bodyStructure !== 'object') return false;
-  const bs = bodyStructure as Record<string, unknown>;
-  if (bs.disposition === 'attachment') return true;
-  if (Array.isArray(bs.childNodes)) {
-    return bs.childNodes.some((child: unknown) => hasAttachments(child));
-  }
-  return false;
-}
-
 /**
  * Walk a bodyStructure tree and collect attachment metadata.
  *
@@ -138,6 +128,12 @@ export function extractAttachmentMeta(bodyStructure: unknown): AttachmentMeta[] 
 
   walk(bodyStructure);
   return out;
+}
+
+function hasAttachments(bodyStructure: unknown): boolean {
+  // Delegate to the richer helper so legacy callers (e.g. getEmailStats) use
+  // the same semantics as extractAttachmentMeta / EmailMeta.hasAttachments.
+  return extractAttachmentMeta(bodyStructure).length > 0;
 }
 
 function extractAttachments(bodyStructure: unknown): AttachmentMeta[] {
@@ -231,7 +227,7 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
     seen: flags.has('\\Seen'),
     flagged: flags.has('\\Flagged'),
     answered: flags.has('\\Answered'),
-    hasAttachments: hasAttachments(msg.bodyStructure),
+    hasAttachments: (attachments?.length ?? 0) > 0,
     labels,
     preview,
     ...(attachments !== undefined ? { attachments } : {}),
