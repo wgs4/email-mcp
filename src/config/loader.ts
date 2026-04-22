@@ -8,8 +8,14 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 import { parse as parseTOML, stringify as stringifyTOML } from 'smol-toml';
-import type { AccountConfig, AppConfig, HookRule, OAuth2Config } from '../types/index.js';
-import type { RawAccountConfig, RawAppConfig } from './schema.js';
+import type {
+  AccountConfig,
+  AppConfig,
+  HookRule,
+  OAuth2Config,
+  SearchPreset,
+} from '../types/index.js';
+import type { RawAccountConfig, RawAppConfig, RawSearchPreset } from './schema.js';
 import { AppConfigFileSchema } from './schema.js';
 import { CONFIG_FILE, xdg } from './xdg.js';
 
@@ -119,6 +125,7 @@ function loadFromEnv(): RawAppConfig | null {
         },
       },
     ],
+    searches: [],
   };
 }
 
@@ -205,6 +212,44 @@ function normalizeHookRule(raw: {
   };
 }
 
+function normalizeSearchPreset(raw: RawSearchPreset): SearchPreset {
+  return {
+    name: raw.name,
+    description: raw.description,
+    account: raw.account,
+    accounts: raw.accounts,
+    mailbox: raw.mailbox,
+    query: raw.query,
+    to: raw.to,
+    from: raw.from,
+    subject: raw.subject,
+    cc: raw.cc,
+    bcc: raw.bcc,
+    text: raw.text,
+    body: raw.body,
+    since: raw.since,
+    before: raw.before,
+    on: raw.on,
+    sentSince: raw.sent_since,
+    sentBefore: raw.sent_before,
+    seen: raw.seen,
+    flagged: raw.flagged,
+    answered: raw.answered,
+    draft: raw.draft,
+    deleted: raw.deleted,
+    keyword: raw.keyword,
+    notKeyword: raw.not_keyword,
+    header: raw.header,
+    largerThan: raw.larger_than,
+    smallerThan: raw.smaller_than,
+    hasAttachment: raw.has_attachment,
+    attachmentFilename: raw.attachment_filename,
+    attachmentMimetype: raw.attachment_mimetype,
+    facets: raw.facets,
+    gmailRaw: raw.gmail_raw,
+  };
+}
+
 function normalizeConfig(raw: RawAppConfig): AppConfig {
   return {
     settings: {
@@ -238,6 +283,7 @@ function normalizeConfig(raw: RawAppConfig): AppConfig {
       },
     },
     accounts: raw.accounts.map(normalizeAccount),
+    searches: (raw.searches ?? []).map(normalizeSearchPreset),
   };
 }
 

@@ -751,7 +751,7 @@ The response appends a `📊 Facets` block with the top 10 senders and year buck
   By year:   2025 (52), 2024 (20)
 ```
 
-Facets are computed via a single envelope-only IMAP fetch in 500-UID chunks. When the match set exceeds **10000 UIDs** facets are skipped with a warning — narrow the query (date range, sender, subject) to unlock them. `"mailbox"` is a reserved single-entry bucket for the current mailbox; cross-account search is coming in a later PR.
+Facets are computed via a single envelope-only IMAP fetch in 500-UID chunks. When the match set exceeds **10000 UIDs** facets are skipped with a warning — narrow the query (date range, sender, subject) to unlock them. In `search_emails`, `"mailbox"` is a single-entry bucket for the current mailbox. In `search_all_accounts`, the `mailbox` facet is re-keyed by account name, giving a per-account breakdown (e.g. `{ "wgs-usa": 42, "all-pedal": 10 }`).
 
 ### Performance Notes
 
@@ -759,11 +759,69 @@ Facets are computed via a single envelope-only IMAP fetch in 500-UID chunks. Whe
 - **`has_attachment` is post-pagination**: because IMAP has no native attachment search, the filter is now applied only to the current page's body-structure fetches — so a 78k-message folder no longer triggers a full-folder body-structure scan upfront. The trade-off: if the filter trims items on a page, the page serves fewer results and `totalApprox` is set; narrow the query instead of relying on `has_attachment` alone.
 - **Relative date tokens** (`7d`, `2w`, `1m`, `yesterday`, `today`) are evaluated in UTC at call time.
 
+### Cross-account search
+
+`search_all_accounts` fans a single query out across multiple accounts in parallel (Promise.allSettled), merges results sorted by date, and tags each item with the originating account name. Partial failures are surfaced as `warnings` — a single bad account does not fail the entire call. Omit the `accounts` field to default to every configured account.
+
+```jsonc
+// Find every "Pines Rd" message across all configured accounts
+{
+  "query":    "Pines Rd",
+  "accounts": ["wgs-usa", "all-pedal"],  // optional — defaults to every account
+  "since":    "90d",
+  "facets":   ["sender", "mailbox"]       // `mailbox` facet is re-keyed by account
+}
+```
+
+Each result in the rendered output is prefixed with `[account-name]` so you can see the source, and the response appends a `⚠️ Warnings` block whenever one or more accounts failed.
+
+#### Automatic mailbox aliasing
+
+Different providers expose different folder structures. Gmail's archive is
+`[Gmail]/All Mail`; cPanel Dovecot uses `INBOX.Archive`; Exchange uses yet
+another path. When you call `search_all_accounts(mailbox="INBOX.Archive")`,
+each account's mailbox list is checked, and if the literal folder doesn't
+exist, the server's SPECIAL-USE flags (`\All`, `\Archive`, `\Sent`, `\Trash`,
+`\Drafts`, `\Junk`) are used to find the equivalent folder automatically.
+Remappings are surfaced in the response as `ℹ️` notices so you can see what
+was actually searched. Mailbox lists are cached per-account for 5 minutes to
+avoid re-LISTing on every call.
+
+### Saved searches
+
+Define reusable named filter combinations in `config.toml` under `[[searches]]`. Each preset bundles the same parameter set as `search_emails` and can target a single account (`account = "..."`) or fan out across multiple (`accounts = ["a", "b"]`). Run them via `run_preset`.
+
+```toml
+[[searches]]
+name        = "pines-lease"
+description = "Pines Rd 2024 lease paperwork across WGS USA + All Pedal"
+accounts    = ["wgs-usa", "all-pedal"]    # cross-account; omit for single-account use
+subject     = "Pines Rd"
+since       = "2024-01-01"
+before      = "2025-01-01"
+has_attachment       = true
+attachment_filename  = "lease"
+facets      = ["sender", "year", "mailbox"]
+
+[[searches]]
+name    = "urgent-flagged"
+account = "primary"                        # single-account variant
+flagged = true
+seen    = false
+```
+
+```jsonc
+// Tool call
+{ "name": "pines-lease", "pageSize": 20 }
+```
+
+`list_presets` appends a `📋 Saved searches (from config.toml)` section so the available names are discoverable at runtime.
+
 ## API
 
-### Tools (47)
+### Tools (49)
 
-#### Read (14)
+#### Read (16)
 
 | Tool | Description |
 |------|-------------|
@@ -774,6 +832,8 @@ Facets are computed via a single envelope-only IMAP fetch in 500-UID chunks. Whe
 | `get_emails` | Fetch full content of multiple emails in a single call (max 20) |
 | `get_email_status` | Get read/flag/label state of an email without fetching the body |
 | `search_emails` | Search by keyword across subject, sender, and body |
+| `search_all_accounts` | Fan a search across multiple accounts in parallel; merges + date-sorts results and tags each with its account |
+| `run_preset` | Run a saved search preset defined under `[[searches]]` in config.toml |
 | `download_attachment` | Download an email attachment by filename |
 | `find_email_folder` | Discover the real folder(s) an email resides in (resolves virtual folders) |
 | `extract_contacts` | Extract unique contacts from recent email headers |
@@ -823,7 +883,7 @@ Facets are computed via a single envelope-only IMAP fetch in 500-UID chunks. Whe
 | Tool | Description |
 |------|-------------|
 | `get_watcher_status` | Show IMAP IDLE connections, folders being monitored, and last-seen UIDs |
-| `list_presets` | List available AI triage presets with descriptions and suggested labels |
+| `list_presets` | List available AI triage presets AND saved search presets (from `[[searches]]` in config.toml) |
 | `get_hooks_config` | Show current hooks configuration — preset, rules, and custom instructions |
 | `configure_alerts` | Update alert/notification settings at runtime |
 | `check_notification_setup` | Diagnose desktop notification support and provide setup instructions |

@@ -26,6 +26,7 @@ import LocalCalendarService from './services/local-calendar.service.js';
 import OAuthService from './services/oauth.service.js';
 import RemindersService from './services/reminders.service.js';
 import SchedulerService from './services/scheduler.service.js';
+import { SearchPresetRegistry } from './services/search-presets.js';
 import SmtpService from './services/smtp.service.js';
 import TemplateService from './services/template.service.js';
 import WatcherService from './services/watcher.service.js';
@@ -85,6 +86,7 @@ async function runServer(): Promise<void> {
   const schedulerService = new SchedulerService(smtpService, imapService);
   const watcherService = new WatcherService(config.settings.watcher, config.accounts);
   const hooksService = new HooksService(config.settings.hooks, imapService);
+  const searchPresetRegistry = new SearchPresetRegistry(config.searches);
 
   const server = createServer();
   bindServer(server);
@@ -102,6 +104,7 @@ async function runServer(): Promise<void> {
     schedulerService,
     watcherService,
     hooksService,
+    searchPresetRegistry,
   );
   registerAllResources(server, connections, imapService, templateService, schedulerService);
   registerAllPrompts(server);

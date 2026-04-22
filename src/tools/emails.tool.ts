@@ -1,12 +1,14 @@
 /**
- * MCP tools: list_emails, get_email, get_emails, get_email_status, search_emails
+ * MCP tools: list_emails, get_email, get_emails, get_email_status,
+ * search_emails, search_all_accounts.
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
+import type ConnectionManager from '../connections/manager.js';
 import type ImapService from '../services/imap.service.js';
-import type { Email, EmailMeta } from '../types/index.js';
+import type { Email, EmailMeta, FacetResult, PaginatedResult } from '../types/index.js';
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -39,7 +41,92 @@ function formatEmailMeta(email: EmailMeta): string {
     attachLine = `\n  📎 Attachments: ${shown}${extra}`;
   }
 
-  return `[${email.id}] ${flags} ${email.subject}\n  From: ${from} | ${email.date}${labelStr}${attachLine}${email.preview ? `\n  ${email.preview}` : ''}`;
+  const accountTag = email.account ? `[${email.account}] ` : '';
+  return `${accountTag}[${email.id}] ${flags} ${email.subject}\n  From: ${from} | ${email.date}${labelStr}${attachLine}${email.preview ? `\n  ${email.preview}` : ''}`;
+}
+
+/**
+ * Render a facet result block (sender/year/mailbox) — shared between
+ * `search_emails`, `search_all_accounts`, and `run_preset`.
+ */
+export function formatFacetsBlock(facets: FacetResult | undefined): string {
+  if (!facets) return '';
+  const lines: string[] = ['', '📊 Facets'];
+  if (facets.sender) {
+    const top = Object.entries(facets.sender)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([k, v]) => `${k} (${v})`)
+      .join(', ');
+    lines.push(`  By sender: ${top || '(none)'}`);
+  }
+  if (facets.year) {
+    const all = Object.entries(facets.year)
+      .sort((a, b) => b[0].localeCompare(a[0]))
+      .map(([k, v]) => `${k} (${v})`)
+      .join(', ');
+    lines.push(`  By year:   ${all || '(none)'}`);
+  }
+  if (facets.mailbox) {
+    const all = Object.entries(facets.mailbox)
+      .map(([k, v]) => `${k} (${v})`)
+      .join(', ');
+    lines.push(`  By mailbox: ${all || '(none)'}`);
+  }
+  return `\n${lines.join('\n')}`;
+}
+
+/**
+ * Format a paginated search result (single- or cross-account) for MCP text
+ * output. Used by `search_emails`, `search_all_accounts`, and `run_preset`.
+ */
+export function formatSearchResult(
+  result: PaginatedResult<EmailMeta> & {
+    warnings?: { account: string; error: string }[];
+  },
+  header: string,
+  emptyMessage: string,
+): string {
+  const warningPrefix = result.warning ? `⚠️ ${result.warning}\n` : '';
+
+  if (result.items.length === 0) {
+    return `${warningPrefix}${emptyMessage}`;
+  }
+
+  const emails = result.items.map(formatEmailMeta).join('\n\n');
+  const facetsBlock = formatFacetsBlock(result.facets);
+
+  let accountWarningsBlock = '';
+  if (result.warnings && result.warnings.length > 0) {
+    // Split warnings into "informational remaps" (ℹ️-prefixed message) vs
+    // hard errors/skips. Both live in the same warnings[] array for backward
+    // compat; we classify here purely for rendering.
+    const infos = result.warnings.filter((w) => w.error.startsWith('ℹ️'));
+    const hard = result.warnings.filter((w) => !w.error.startsWith('ℹ️'));
+    const blocks: string[] = [];
+    if (hard.length > 0) {
+      const lines = [`⚠️ Warnings (${hard.length} account${hard.length === 1 ? '' : 's'})`];
+      hard.forEach((w) => {
+        lines.push(`  - ${w.account}: ${w.error}`);
+      });
+      blocks.push(lines.join('\n'));
+    }
+    if (infos.length > 0) {
+      const lines = [`ℹ️ Remapped (${infos.length} account${infos.length === 1 ? '' : 's'})`];
+      infos.forEach((w) => {
+        // Strip the leading emoji + space since the section header already
+        // carries one — avoid double-ℹ️ in rendered output.
+        const msg = w.error.replace(/^ℹ️\s*/, '');
+        lines.push(`  - ${w.account}: ${msg}`);
+      });
+      blocks.push(lines.join('\n'));
+    }
+    if (blocks.length > 0) {
+      accountWarningsBlock = `\n\n${blocks.join('\n\n')}`;
+    }
+  }
+
+  return `${warningPrefix}${header}\n${emails}${facetsBlock}${accountWarningsBlock}`;
 }
 
 /** Strips HTML markup and decodes common entities to produce readable plain text. */
@@ -117,7 +204,11 @@ function formatEmailStatus(email: Pick<Email, 'seen' | 'flagged' | 'answered' | 
 
 // ---------------------------------------------------------------------------
 
-export default function registerEmailsTools(server: McpServer, imapService: ImapService): void {
+export default function registerEmailsTools(
+  server: McpServer,
+  imapService: ImapService,
+  connections: ConnectionManager,
+): void {
   // ---------------------------------------------------------------------------
   // list_emails
   // ---------------------------------------------------------------------------
@@ -639,62 +730,21 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
           gmailRaw: params.gmail_raw,
         });
 
-        const warningPrefix = result.warning ? `⚠️ ${result.warning}\n` : '';
-
-        if (result.items.length === 0) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text:
-                  warningPrefix +
-                  (params.query
-                    ? `No emails found matching "${params.query}".`
-                    : 'No emails found matching the specified filters.'),
-              },
-            ],
-          };
-        }
-
         const totalDisplay = result.totalApprox ? `~${result.total}` : `${result.total}`;
         const queryLabel = params.query ? `"${params.query}"` : 'filters';
+        const totalPages = result.total > 0 ? Math.ceil(result.total / result.pageSize) : 1;
         const header =
           `🔍 [${params.mailbox}] ${totalDisplay} result(s) for ${queryLabel} ` +
-          `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})\n`;
-        const emails = result.items.map(formatEmailMeta).join('\n\n');
-
-        let facetsBlock = '';
-        if (result.facets) {
-          const lines: string[] = ['', '📊 Facets'];
-          if (result.facets.sender) {
-            const top = Object.entries(result.facets.sender)
-              .sort((a, b) => b[1] - a[1])
-              .slice(0, 10)
-              .map(([k, v]) => `${k} (${v})`)
-              .join(', ');
-            lines.push(`  By sender: ${top || '(none)'}`);
-          }
-          if (result.facets.year) {
-            const all = Object.entries(result.facets.year)
-              .sort((a, b) => b[0].localeCompare(a[0]))
-              .map(([k, v]) => `${k} (${v})`)
-              .join(', ');
-            lines.push(`  By year:   ${all || '(none)'}`);
-          }
-          if (result.facets.mailbox) {
-            const all = Object.entries(result.facets.mailbox)
-              .map(([k, v]) => `${k} (${v})`)
-              .join(', ');
-            lines.push(`  By mailbox: ${all || '(none)'}`);
-          }
-          facetsBlock = `\n${lines.join('\n')}`;
-        }
+          `(page ${result.page}/${totalPages})\n`;
+        const emptyMsg = params.query
+          ? `No emails found matching "${params.query}".`
+          : 'No emails found matching the specified filters.';
 
         return {
           content: [
             {
               type: 'text' as const,
-              text: `${warningPrefix}${header}\n${emails}${facetsBlock}`,
+              text: formatSearchResult(result, header, emptyMsg),
             },
           ],
         };
@@ -705,6 +755,154 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
             {
               type: 'text' as const,
               text: `Failed to search emails: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // search_all_accounts
+  // ---------------------------------------------------------------------------
+  server.tool(
+    'search_all_accounts',
+    'Search emails across multiple accounts in parallel. Same filter set as search_emails ' +
+      'but fans out across N accounts and merges results sorted by date. Each result is tagged ' +
+      'with the account it came from. Partial failures are surfaced as warnings without failing ' +
+      'the whole call. Useful for "find X anywhere in my inboxes" queries across your email ecosystem.',
+    {
+      query: z
+        .string()
+        .optional()
+        .default('')
+        .describe('Search keyword across subject/from/body (omit to use filters only)'),
+      accounts: z
+        .array(z.string())
+        .optional()
+        .describe('Specific accounts to search (default: all accounts from list_accounts)'),
+      mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
+      page: z.number().int().min(1).default(1).describe('Page number of the merged result set'),
+      pageSize: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .default(20)
+        .describe('Results per page (merged across accounts)'),
+      to: z.string().optional(),
+      from: z.string().optional(),
+      subject: z.string().optional(),
+      cc: z.string().optional(),
+      bcc: z.string().optional(),
+      text: z.string().optional(),
+      body: z.string().optional(),
+      since: z.string().optional(),
+      before: z.string().optional(),
+      on: z.string().optional(),
+      sent_since: z.string().optional(),
+      sent_before: z.string().optional(),
+      seen: z.boolean().optional(),
+      flagged: z.boolean().optional(),
+      has_attachment: z.boolean().optional(),
+      larger_than: z.number().optional(),
+      smaller_than: z.number().optional(),
+      answered: z.boolean().optional(),
+      draft: z.boolean().optional(),
+      deleted: z.boolean().optional(),
+      keyword: z.union([z.string(), z.array(z.string())]).optional(),
+      not_keyword: z.union([z.string(), z.array(z.string())]).optional(),
+      header: z.record(z.string(), z.string()).optional(),
+      attachment_filename: z.string().optional(),
+      attachment_mimetype: z.string().optional(),
+      facets: z.array(z.enum(['sender', 'year', 'mailbox'])).optional(),
+      gmail_raw: z
+        .string()
+        .optional()
+        .describe(
+          'Gmail accounts ONLY (when targeted accounts include Gmail). Non-Gmail accounts in the ' +
+            'fan-out will error individually and appear in warnings.',
+        ),
+    },
+    { readOnlyHint: true, destructiveHint: false },
+    async (params) => {
+      try {
+        const accountNames =
+          params.accounts && params.accounts.length > 0
+            ? params.accounts
+            : connections.getAccountNames();
+
+        if (accountNames.length === 0) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text: 'No accounts configured — add at least one account to config.toml.',
+              },
+            ],
+          };
+        }
+
+        const result = await imapService.searchAcrossAccounts(accountNames, params.query ?? '', {
+          mailbox: params.mailbox,
+          page: params.page,
+          pageSize: params.pageSize,
+          to: params.to,
+          from: params.from,
+          subject: params.subject,
+          cc: params.cc,
+          bcc: params.bcc,
+          text: params.text,
+          body: params.body,
+          since: params.since,
+          before: params.before,
+          on: params.on,
+          sentSince: params.sent_since,
+          sentBefore: params.sent_before,
+          seen: params.seen,
+          flagged: params.flagged,
+          hasAttachment: params.has_attachment,
+          largerThan: params.larger_than,
+          smallerThan: params.smaller_than,
+          answered: params.answered,
+          draft: params.draft,
+          deleted: params.deleted,
+          keyword: params.keyword,
+          notKeyword: params.not_keyword,
+          header: params.header,
+          attachmentFilename: params.attachment_filename,
+          attachmentMimetype: params.attachment_mimetype,
+          facets: params.facets,
+          gmailRaw: params.gmail_raw,
+        });
+
+        const totalDisplay = result.totalApprox ? `~${result.total}` : `${result.total}`;
+        const queryLabel = params.query ? `"${params.query}"` : 'filters';
+        const totalPages = result.total > 0 ? Math.ceil(result.total / result.pageSize) : 1;
+        const header =
+          `🔍 [${accountNames.length} account(s) · ${params.mailbox}] ` +
+          `${totalDisplay} result(s) for ${queryLabel} ` +
+          `(page ${result.page}/${totalPages})\n`;
+        const emptyMsg = params.query
+          ? `No emails found matching "${params.query}" across ${accountNames.length} account(s).`
+          : `No emails found matching the specified filters across ${accountNames.length} account(s).`;
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: formatSearchResult(result, header, emptyMsg),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `Failed to search accounts: ${err instanceof Error ? err.message : String(err)}`,
             },
           ],
         };
