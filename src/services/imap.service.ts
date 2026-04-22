@@ -9,6 +9,7 @@ import type { IConnectionManager } from '../connections/types.js';
 import { sanitizeMailboxName } from '../safety/validation.js';
 import type {
   AttachmentMeta,
+  AttachmentSaveResult,
   BulkResult,
   Contact,
   DailyVolume,
@@ -23,6 +24,7 @@ import type {
   QuotaInfo,
   SenderStat,
 } from '../types/index.js';
+import { assertSafeDestination, resolveUniquePath, sanitizeFilename } from './file-paths.js';
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
 import type { MailboxRef } from './mailbox-resolver.js';
@@ -2375,5 +2377,396 @@ export default class ImapService {
     }
 
     return parts;
+  }
+
+  // -------------------------------------------------------------------------
+  // Buffered search for export / bulk-attachment-save (PR 4)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Buffered search for the export / bulk-attachment-save tools.
+   *
+   * Runs a single-account or cross-account search and returns up to `maxRows`
+   * `EmailMeta` items. Unlike `searchEmails` / `searchAcrossAccounts` (which
+   * paginate at 100/page max), this caps at 50_000 rows — well within memory
+   * for an enveloped `EmailMeta`.
+   *
+   * - Single-account mode: pass `accountName`, leave `accountNames=null`.
+   *   Runs IMAP SEARCH once, then fetches envelopes in chunks of 100.
+   * - Multi-account mode: pass `accountNames` (non-null), leave
+   *   `accountName=null`. Fans out to per-account `searchForExport` calls and
+   *   merges by date. Each item is stamped with `.account`.
+   *
+   * Returns `{ items, truncated }` where `truncated=true` means the underlying
+   * match set exceeded `maxRows` and rows were dropped.
+   */
+  async searchForExport(
+    accountNames: string[] | null,
+    accountName: string | null,
+    query: string,
+    options: SearchOptions & { maxRows: number },
+  ): Promise<{ items: EmailMeta[]; truncated: boolean }> {
+    const { maxRows, ...searchOpts } = options;
+
+    // ------------------------------------------------------------------
+    // Multi-account — delegate per account and merge
+    // ------------------------------------------------------------------
+    if (accountNames !== null) {
+      if (accountNames.length === 0) {
+        throw new Error('searchForExport requires at least one account name');
+      }
+      const perAccountCap = maxRows; // let each account contribute up to maxRows
+      const settled = await Promise.allSettled(
+        accountNames.map(async (name) => {
+          const r = await this.searchForExport(null, name, query, {
+            ...searchOpts,
+            maxRows: perAccountCap,
+          });
+          return r;
+        }),
+      );
+
+      let merged: EmailMeta[] = [];
+      let anyTruncated = false;
+      settled.forEach((outcome, idx) => {
+        if (outcome.status === 'fulfilled') {
+          const name = accountNames[idx];
+          outcome.value.items.forEach((m) => {
+            merged.push({ ...m, account: name });
+          });
+          if (outcome.value.truncated) anyTruncated = true;
+        }
+      });
+      merged.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+      if (merged.length > maxRows) {
+        merged = merged.slice(0, maxRows);
+        anyTruncated = true;
+      }
+      return { items: merged, truncated: anyTruncated };
+    }
+
+    // ------------------------------------------------------------------
+    // Single-account — one IMAP SEARCH, chunked envelope fetch
+    // ------------------------------------------------------------------
+    if (accountName === null) {
+      throw new Error(
+        'searchForExport requires either accountNames (multi) or accountName (single)',
+      );
+    }
+    const client = await this.connections.getImapClient(accountName);
+    const account = this.connections.getAccount(accountName);
+    const isGmail = account.imap.host === 'imap.gmail.com';
+    const mailbox = sanitizeMailboxName(searchOpts.mailbox ?? 'INBOX');
+
+    const lock = await client.getMailboxLock(mailbox);
+    try {
+      const params: SearchParams = { ...(searchOpts as SearchParams), query };
+      const { criteria, postFilters } = buildSearchCriteria(params, { isGmail });
+      const searchResult = await client.search(criteria, { uid: true });
+      let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      let truncated = false;
+
+      if (uids.length === 0) {
+        return { items: [], truncated: false };
+      }
+
+      uids.sort((a, b) => b - a);
+
+      if (uids.length > maxRows) {
+        uids = uids.slice(0, maxRows);
+        truncated = true;
+      }
+
+      let items: EmailMeta[] = [];
+      const chunks = chunkUids(uids, 100);
+      /* eslint-disable no-restricted-syntax, no-await-in-loop */
+      for (const chunk of chunks) {
+        const range = chunk.join(',');
+        for await (const msg of client.fetch(
+          range,
+          {
+            uid: true,
+            envelope: true,
+            flags: true,
+            bodyStructure: true,
+            source: { start: 0, maxLength: 256 },
+          },
+          { uid: true },
+        )) {
+          items.push(messageToEmailMeta(msg as unknown as Record<string, unknown>));
+        }
+      }
+      /* eslint-enable no-restricted-syntax, no-await-in-loop */
+
+      // Apply post-pagination filters (hasAttachment / attachment_filename /
+      // attachment_mimetype) to the full buffered set — these are cheap in
+      // memory since we already have bodyStructure-derived `attachments`.
+      if (postFilters.hasAttachment !== undefined) {
+        const want = postFilters.hasAttachment;
+        items = items.filter((m) => m.hasAttachments === want);
+      }
+      if (postFilters.attachmentFilename) {
+        const needle = postFilters.attachmentFilename.toLowerCase();
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => a.filename.toLowerCase().includes(needle));
+        });
+      }
+      if (postFilters.attachmentMimetype) {
+        let re: RegExp;
+        try {
+          re = new RegExp(postFilters.attachmentMimetype, 'i');
+        } catch (err) {
+          throw new Error(
+            `Invalid attachment_mimetype pattern: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        items = items.filter((m) => (m.attachments ?? []).some((a) => re.test(a.mimeType)));
+      }
+
+      items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      return { items, truncated };
+    } finally {
+      lock.release();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Direct-to-disk attachment save (PR 4)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Save a single attachment directly to disk, streaming from imapflow into
+   * `fs.createWriteStream` — no base64 hop, no MCP-response byte budget, no
+   * 5 MB ceiling.
+   *
+   * `destination` may be:
+   *   - an absolute file path (e.g. `/Users/me/Downloads/lease.pdf`)
+   *   - an absolute directory (e.g. `/Users/me/Downloads`) — the attachment's
+   *     original filename is appended.
+   *
+   * Throws if the resolved destination is outside `$HOME` or `/tmp`.
+   */
+  async saveAttachmentToDisk(
+    accountName: string,
+    emailId: string,
+    mailbox: string,
+    filename: string,
+    destination: string,
+    overwrite = false,
+  ): Promise<AttachmentSaveResult> {
+    const { createWriteStream } = await import('node:fs');
+    const { mkdir, stat } = await import('node:fs/promises');
+    const { dirname, join } = await import('node:path');
+    const { pipeline } = await import('node:stream/promises');
+
+    // Resolve target — directory vs file path
+    assertSafeDestination(destination);
+    let targetPath: string;
+    try {
+      const info = await stat(destination);
+      if (info.isDirectory()) {
+        targetPath = join(destination, sanitizeFilename(filename));
+      } else {
+        targetPath = destination;
+      }
+    } catch {
+      // Destination doesn't exist yet — treat as a file path.
+      targetPath = destination;
+    }
+    // Re-check the final resolved path (defense in depth — the file component
+    // is user-supplied and could include `..` in theory).
+    assertSafeDestination(targetPath);
+
+    // Auto-collision suffix when overwrite=false.
+    const finalPath = await resolveUniquePath(targetPath, overwrite);
+    await mkdir(dirname(finalPath), { recursive: true });
+
+    const client = await this.connections.getImapClient(accountName);
+    const uid = parseInt(emailId, 10);
+    const safeMailbox = sanitizeMailboxName(mailbox);
+
+    const lock = await client.getMailboxLock(safeMailbox);
+    try {
+      const msg = await client.fetchOne(
+        String(uid),
+        { uid: true, bodyStructure: true },
+        { uid: true },
+      );
+      if (!msg) {
+        throw new Error(`Email ${emailId} not found in ${mailbox}`);
+      }
+
+      const attachments = extractAttachmentMeta(msg.bodyStructure);
+      const attachment = attachments.find((a) => a.filename === filename);
+      if (!attachment) {
+        throw new Error(
+          `Attachment "${filename}" not found. Available: ${
+            attachments.map((a) => a.filename).join(', ') || 'none'
+          }`,
+        );
+      }
+
+      const partNumber = findMimePartByFilename(msg.bodyStructure, filename);
+      if (!partNumber) {
+        throw new Error(`Could not locate MIME part for "${filename}"`);
+      }
+
+      const downloadResult = await client.download(String(uid), partNumber, { uid: true });
+      if (!downloadResult?.content) {
+        throw new Error(`Failed to download attachment "${filename}"`);
+      }
+
+      const ws = createWriteStream(finalPath);
+      await pipeline(downloadResult.content, ws);
+
+      const written = await stat(finalPath);
+      return {
+        path: finalPath,
+        size: written.size,
+        mimeType: attachment.mimeType,
+      };
+    } finally {
+      lock.release();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Batch attachment save — run a search and sweep every matching attachment
+  // -------------------------------------------------------------------------
+
+  /**
+   * Run `searchForExport` with the given filters and download every
+   * matching attachment into `destinationFolder`, optionally bucketed by
+   * date / sender / account. Designed for "year-end lease-PDF sweep" style
+   * batch exports.
+   *
+   * Filename / MIME-type filters narrow *which* attachments to save; emails
+   * without any qualifying attachment are skipped. Per-email errors are
+   * collected and returned rather than aborting the whole run.
+   */
+  async saveAllAttachmentsFromSearch(input: {
+    accountNames: string[] | null;
+    accountName: string | null;
+    query: string;
+    searchOptions: SearchOptions;
+    maxEmails: number;
+    destinationFolder: string;
+    organizeBy: 'flat' | 'date' | 'sender' | 'account';
+    attachmentFilename?: string;
+    attachmentMimetype?: string;
+  }): Promise<{
+    folder: string;
+    files_saved: number;
+    total_size: number;
+    skipped: number;
+    errors: { emailId: string; filename: string; error: string }[];
+  }> {
+    const { mkdir } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+
+    assertSafeDestination(input.destinationFolder);
+    await mkdir(input.destinationFolder, { recursive: true });
+
+    const { items } = await this.searchForExport(
+      input.accountNames,
+      input.accountName,
+      input.query,
+      { ...input.searchOptions, maxRows: input.maxEmails },
+    );
+
+    // Optional filters for *which* attachments to save.
+    const nameNeedle = input.attachmentFilename?.toLowerCase();
+    let mimeRe: RegExp | undefined;
+    if (input.attachmentMimetype) {
+      try {
+        mimeRe = new RegExp(input.attachmentMimetype, 'i');
+      } catch (err) {
+        throw new Error(
+          `Invalid attachment_mimetype pattern: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    let filesSaved = 0;
+    let totalSize = 0;
+    let skipped = 0;
+    const errors: { emailId: string; filename: string; error: string }[] = [];
+
+    /* eslint-disable no-restricted-syntax, no-await-in-loop */
+    for (const email of items) {
+      const atts = email.attachments ?? [];
+      const qualifying = atts.filter((a) => {
+        if (nameNeedle && !a.filename.toLowerCase().includes(nameNeedle)) return false;
+        if (mimeRe && !mimeRe.test(a.mimeType)) return false;
+        return true;
+      });
+
+      if (qualifying.length === 0) {
+        skipped += 1;
+      } else {
+        // Per-email account resolution — in cross-account mode EmailMeta
+        // carries `.account`; in single-account mode we use the provided
+        // accountName.
+        const accountForEmail = email.account ?? input.accountName;
+        if (!accountForEmail) {
+          errors.push({
+            emailId: email.id,
+            filename: '(n/a)',
+            error: 'Could not determine account for email',
+          });
+        } else {
+          // Subfolder strategy
+          let subfolder = input.destinationFolder;
+          if (input.organizeBy === 'date') {
+            const d = new Date(email.date);
+            const ym = Number.isNaN(d.getTime())
+              ? 'unknown-date'
+              : `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+            subfolder = join(input.destinationFolder, ym);
+          } else if (input.organizeBy === 'sender') {
+            const domain = email.from.address.includes('@')
+              ? (email.from.address.split('@')[1] ?? 'unknown-sender')
+              : 'unknown-sender';
+            subfolder = join(input.destinationFolder, sanitizeFilename(domain));
+          } else if (input.organizeBy === 'account') {
+            subfolder = join(input.destinationFolder, sanitizeFilename(accountForEmail));
+          }
+
+          await mkdir(subfolder, { recursive: true });
+
+          for (const att of qualifying) {
+            try {
+              const saved = await this.saveAttachmentToDisk(
+                accountForEmail,
+                email.id,
+                input.searchOptions.mailbox ?? 'INBOX',
+                att.filename,
+                subfolder,
+                false,
+              );
+              filesSaved += 1;
+              totalSize += saved.size;
+            } catch (err) {
+              errors.push({
+                emailId: email.id,
+                filename: att.filename,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+        }
+      }
+    }
+    /* eslint-enable no-restricted-syntax, no-await-in-loop */
+
+    return {
+      folder: input.destinationFolder,
+      files_saved: filesSaved,
+      total_size: totalSize,
+      skipped,
+      errors,
+    };
   }
 }

@@ -1,3 +1,8 @@
+/* eslint-disable n/no-sync -- tests use sync fs helpers for setup/teardown */
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { resolveUniquePath, sanitizeFilename } from './file-paths.js';
 import { extractAttachmentMeta } from './imap.service.js';
 
 // ---------------------------------------------------------------------------
@@ -175,5 +180,104 @@ describe('extractAttachmentMeta', () => {
     expect(extractAttachmentMeta(null)).toEqual([]);
     expect(extractAttachmentMeta('not an object')).toEqual([]);
     expect(extractAttachmentMeta({})).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// sanitizeFilename — strips path separators + reserved characters (PR 4)
+// ---------------------------------------------------------------------------
+
+describe('sanitizeFilename', () => {
+  it('strips forward-slashes and backslashes', () => {
+    expect(sanitizeFilename('some/path/lease.pdf')).toBe('some_path_lease.pdf');
+    expect(sanitizeFilename('some\\path\\lease.pdf')).toBe('some_path_lease.pdf');
+  });
+
+  it('replaces Windows-reserved and shell-special chars with underscore', () => {
+    expect(sanitizeFilename('foo<bar>.pdf')).toBe('foo_bar_.pdf');
+    expect(sanitizeFilename('a"b|c?d*e.pdf')).toBe('a_b_c_d_e.pdf');
+  });
+
+  it('collapses consecutive underscores from multi-char replacements', () => {
+    expect(sanitizeFilename('a////b.pdf')).toBe('a_b.pdf');
+  });
+
+  it('strips leading dots to prevent hidden-file surprises', () => {
+    expect(sanitizeFilename('...hidden.txt')).toBe('hidden.txt');
+  });
+
+  it('strips trailing dots and whitespace', () => {
+    expect(sanitizeFilename('lease.pdf...  ')).toBe('lease.pdf');
+  });
+
+  it("neutralizes '..' traversal — reduces to 'unnamed' after strip passes", () => {
+    expect(sanitizeFilename('..')).toBe('unnamed');
+  });
+
+  it('returns "unnamed" for empty / whitespace-only / dot-only inputs', () => {
+    expect(sanitizeFilename('')).toBe('unnamed');
+    expect(sanitizeFilename('   ')).toBe('unnamed');
+    expect(sanitizeFilename('.')).toBe('unnamed');
+  });
+
+  it('preserves a normal filename untouched', () => {
+    expect(sanitizeFilename('quarterly_report_v7.pdf')).toBe('quarterly_report_v7.pdf');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveUniquePath — collision auto-suffix (PR 4)
+// ---------------------------------------------------------------------------
+
+describe('resolveUniquePath', () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'pr4-collide-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('returns the desired path unchanged when nothing exists there', async () => {
+    const p = join(tmp, 'lease.pdf');
+    await expect(resolveUniquePath(p, false)).resolves.toBe(p);
+  });
+
+  it('returns the desired path unchanged when overwrite=true (even if the file exists)', async () => {
+    const p = join(tmp, 'lease.pdf');
+    writeFileSync(p, 'old');
+    await expect(resolveUniquePath(p, true)).resolves.toBe(p);
+  });
+
+  it('auto-suffixes lease.pdf -> lease-1.pdf when the target exists', async () => {
+    const p = join(tmp, 'lease.pdf');
+    writeFileSync(p, 'original');
+    await expect(resolveUniquePath(p, false)).resolves.toBe(join(tmp, 'lease-1.pdf'));
+  });
+
+  it('increments the suffix until a free slot is found', async () => {
+    writeFileSync(join(tmp, 'lease.pdf'), 'x');
+    writeFileSync(join(tmp, 'lease-1.pdf'), 'x');
+    writeFileSync(join(tmp, 'lease-2.pdf'), 'x');
+    await expect(resolveUniquePath(join(tmp, 'lease.pdf'), false)).resolves.toBe(
+      join(tmp, 'lease-3.pdf'),
+    );
+  });
+
+  it('keeps the original extension intact across suffixing', async () => {
+    writeFileSync(join(tmp, 'archive.tar.gz'), 'x');
+    // basename(filename, '.gz') -> 'archive.tar' so suffix appends before .gz
+    await expect(resolveUniquePath(join(tmp, 'archive.tar.gz'), false)).resolves.toBe(
+      join(tmp, 'archive.tar-1.gz'),
+    );
+  });
+
+  it('suffixes files without an extension', async () => {
+    writeFileSync(join(tmp, 'README'), 'x');
+    await expect(resolveUniquePath(join(tmp, 'README'), false)).resolves.toBe(
+      join(tmp, 'README-1'),
+    );
   });
 });
