@@ -165,4 +165,94 @@ describe('ImapService', () => {
       expect(client.messageFlagsAdd).toHaveBeenCalledWith('10', ['\\Flagged'], { uid: true });
     });
   });
+
+  // -----------------------------------------------------------------------
+  // searchEmails — Power Search wiring (Phase A + B)
+  // -----------------------------------------------------------------------
+
+  describe('searchEmails (Power Search)', () => {
+    it('passes a Date to client.search when since is a YYYY-MM-DD string', async () => {
+      client.search.mockResolvedValue([]);
+
+      await service.searchEmails('test', '', { since: '2024-01-01' });
+
+      expect(client.search).toHaveBeenCalledTimes(1);
+      const [criteria] = client.search.mock.calls[0];
+      expect(criteria.since).toBeInstanceOf(Date);
+      expect((criteria.since as Date).toISOString()).toBe('2024-01-01T00:00:00.000Z');
+    });
+
+    it('applies hasAttachment post-filter only after pagination (no upfront bodyStructure fetch)', async () => {
+      // Pretend the server matches 3 UIDs; only the current page should be body-structured.
+      client.search.mockResolvedValue([1, 2, 3]);
+
+      // Mock fetch: only invoked ONCE with the page range (not the full search set).
+      // The mock yields three messages — two with attachments, one without.
+      const mockMessages = [
+        {
+          uid: 3,
+          envelope: { subject: 'A', from: [{ address: 'a@x' }], to: [], date: '2024-01-03' },
+          flags: new Set<string>(),
+          bodyStructure: { disposition: 'attachment' },
+          source: Buffer.from(''),
+        },
+        {
+          uid: 2,
+          envelope: { subject: 'B', from: [{ address: 'b@x' }], to: [], date: '2024-01-02' },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text', subtype: 'plain' },
+          source: Buffer.from(''),
+        },
+        {
+          uid: 1,
+          envelope: { subject: 'C', from: [{ address: 'c@x' }], to: [], date: '2024-01-01' },
+          flags: new Set<string>(),
+          bodyStructure: { disposition: 'attachment' },
+          source: Buffer.from(''),
+        },
+      ];
+      client.fetch.mockReturnValueOnce(
+        // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+        (async function* gen() {
+          for (const m of mockMessages) yield m;
+        })(),
+      );
+
+      const result = await service.searchEmails('test', '', {
+        hasAttachment: true,
+        pageSize: 10,
+      });
+
+      // Fetch was called exactly ONCE with the page range — never upfront for all matches.
+      expect(client.fetch).toHaveBeenCalledTimes(1);
+      // pageUids = first `pageSize` of sorted-desc UIDs = "3,2,1"
+      expect(client.fetch.mock.calls[0][0]).toBe('3,2,1');
+
+      // Two of three messages have attachments → the filter should retain 2
+      expect(result.items).toHaveLength(2);
+      expect(result.totalApprox).toBe(true);
+    });
+
+    it('caps at MAX_SEARCH_UIDS (5000) and emits a truncation warning', async () => {
+      // Return 6000 synthetic UIDs
+      const tooMany = Array.from({ length: 6000 }, (_, i) => i + 1);
+      client.search.mockResolvedValue(tooMany);
+
+      // fetch yields nothing — we only care about the truncation warning path
+      client.fetch.mockReturnValueOnce((async function* gen() {})());
+
+      const result = await service.searchEmails('test', '', {});
+
+      expect(result.totalApprox).toBe(true);
+      expect(result.warning).toBeDefined();
+      expect(result.warning).toMatch(/Truncated to 5000 of 6000/);
+      expect(result.total).toBe(5000);
+    });
+
+    it('throws when gmail_raw is used on non-Gmail account', async () => {
+      await expect(service.searchEmails('test', '', { gmailRaw: 'from:foo' })).rejects.toThrow(
+        /only valid on Gmail accounts/,
+      );
+    });
+  });
 });

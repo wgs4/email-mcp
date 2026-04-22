@@ -6,7 +6,7 @@
 
 import type { ImapFlow } from 'imapflow';
 import type { IConnectionManager } from '../connections/types.js';
-import { sanitizeMailboxName, sanitizeSearchQuery } from '../safety/validation.js';
+import { sanitizeMailboxName } from '../safety/validation.js';
 import type {
   AttachmentMeta,
   BulkResult,
@@ -24,6 +24,15 @@ import type {
 } from '../types/index.js';
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
+import type { SearchParams } from './search-criteria.js';
+import { buildSearchCriteria } from './search-criteria.js';
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+/** Maximum UIDs retained after the server SEARCH before pagination. */
+const MAX_SEARCH_UIDS = 5000;
 
 // ---------------------------------------------------------------------------
 // Helpers (must be defined before ImapService)
@@ -291,6 +300,7 @@ export default class ImapService {
       mailbox?: string;
       page?: number;
       pageSize?: number;
+      // Legacy (unchanged) filters — still camelCase:
       since?: string;
       before?: string;
       from?: string;
@@ -299,73 +309,89 @@ export default class ImapService {
       flagged?: boolean;
       hasAttachment?: boolean;
       answered?: boolean;
+      // Power Search additions (PR 1 phase A):
+      to?: string;
+      on?: string;
+      sentSince?: string;
+      sentBefore?: string;
+      cc?: string;
+      bcc?: string;
+      text?: string;
+      body?: string;
+      draft?: boolean;
+      deleted?: boolean;
+      keyword?: string | string[];
+      notKeyword?: string | string[];
+      header?: Record<string, string>;
+      uids?: number[] | string;
+      largerThan?: number;
+      smallerThan?: number;
+      gmailRaw?: string;
     } = {},
   ): Promise<PaginatedResult<EmailMeta>> {
     const client = await this.connections.getImapClient(accountName);
+    const account = this.connections.getAccount(accountName);
+    const isGmail = account.imap.host === 'imap.gmail.com';
     const mailbox = sanitizeMailboxName(options.mailbox ?? 'INBOX');
     const page = options.page ?? 1;
     const pageSize = options.pageSize ?? 20;
 
     const lock = await client.getMailboxLock(mailbox);
     try {
-      // Build search criteria
-      const search: Record<string, unknown> = {};
-      if (options.since) search.since = new Date(options.since);
-      if (options.before) search.before = new Date(options.before);
-      if (options.from) search.from = options.from;
-      if (options.subject) search.subject = options.subject;
-      if (options.seen !== undefined) search.seen = options.seen;
-      if (options.flagged !== undefined) search.flagged = options.flagged;
-      if (options.answered !== undefined) search.answered = options.answered;
+      const { criteria, postFilters, warnings } = buildSearchCriteria(options as SearchParams, {
+        isGmail,
+      });
 
-      // Search for matching UIDs
-      const searchResult = await client.search(search, { uid: true });
+      const searchResult = await client.search(criteria, { uid: true });
       let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      let totalApprox = false;
 
-      // Post-filter for hasAttachment (IMAP has no native attachment search)
-      if (options.hasAttachment !== undefined && uids.length > 0) {
-        const filteredUids: number[] = [];
-        // eslint-disable-next-line no-restricted-syntax
-        for await (const msg of client.fetch(
-          uids.join(','),
-          { uid: true, bodyStructure: true },
-          { uid: true },
-        )) {
-          const raw = msg as unknown as Record<string, unknown>;
-          if (options.hasAttachment === hasAttachments(raw.bodyStructure)) {
-            filteredUids.push(raw.uid as number);
-          }
-        }
-        uids = filteredUids;
+      // Cap pre-pagination UIDs so huge folders don't balloon later work.
+      if (uids.length > MAX_SEARCH_UIDS) {
+        const originalCount = uids.length;
+        uids.sort((a, b) => b - a);
+        uids = uids.slice(0, MAX_SEARCH_UIDS);
+        totalApprox = true;
+        warnings.push(
+          `Truncated to ${MAX_SEARCH_UIDS} of ${originalCount} matches — narrow the query with more filters`,
+        );
       }
 
       if (uids.length === 0) {
+        const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
         return {
           items: [],
           total: 0,
           page,
           pageSize,
           hasMore: false,
+          ...(warning ? { warning } : {}),
+          ...(totalApprox ? { totalApprox } : {}),
         };
       }
 
-      // Sort descending (newest first) and paginate
+      // Sort descending (newest first) and paginate FIRST — the hasAttachment
+      // post-filter is applied only to the current page to avoid fetching
+      // bodyStructure for tens of thousands of messages on huge folders.
       uids.sort((a, b) => b - a);
       const total = uids.length;
       const start = (page - 1) * pageSize;
       const pageUids = uids.slice(start, start + pageSize);
 
       if (pageUids.length === 0) {
+        const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
         return {
           items: [],
           total,
           page,
           pageSize,
           hasMore: false,
+          ...(warning ? { warning } : {}),
+          ...(totalApprox ? { totalApprox } : {}),
         };
       }
 
-      const items: EmailMeta[] = [];
+      let items: EmailMeta[] = [];
       const range = pageUids.join(',');
 
       // eslint-disable-next-line no-restricted-syntax
@@ -383,15 +409,29 @@ export default class ImapService {
         items.push(messageToEmailMeta(msg as unknown as Record<string, unknown>));
       }
 
+      // Post-pagination hasAttachment filter. If it trims this page, we simply
+      // serve fewer items for the page and mark totalApprox=true — PR 1 keeps
+      // it simple; we do not backfill from later UIDs.
+      if (postFilters.hasAttachment !== undefined) {
+        const want = postFilters.hasAttachment;
+        items = items.filter((m) => m.hasAttachments === want);
+        if (items.length !== pageUids.length) {
+          totalApprox = true;
+        }
+      }
+
       // Sort by date descending
       items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
+      const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
       return {
         items,
         total,
         page,
         pageSize,
         hasMore: start + pageSize < total,
+        ...(warning ? { warning } : {}),
+        ...(totalApprox ? { totalApprox } : {}),
       };
     } finally {
       lock.release();
@@ -500,79 +540,71 @@ export default class ImapService {
       mailbox?: string;
       page?: number;
       pageSize?: number;
+      // Legacy (unchanged) filters — camelCase:
       to?: string;
       hasAttachment?: boolean;
       largerThan?: number;
       smallerThan?: number;
       answered?: boolean;
+      // Power Search additions (PR 1 phase A):
+      from?: string;
+      subject?: string;
+      cc?: string;
+      bcc?: string;
+      text?: string;
+      body?: string;
+      since?: string;
+      before?: string;
+      on?: string;
+      sentSince?: string;
+      sentBefore?: string;
+      seen?: boolean;
+      flagged?: boolean;
+      draft?: boolean;
+      deleted?: boolean;
+      keyword?: string | string[];
+      notKeyword?: string | string[];
+      header?: Record<string, string>;
+      uids?: number[] | string;
+      gmailRaw?: string;
     } = {},
   ): Promise<PaginatedResult<EmailMeta>> {
     const client = await this.connections.getImapClient(accountName);
+    const account = this.connections.getAccount(accountName);
+    const isGmail = account.imap.host === 'imap.gmail.com';
     const mailbox = sanitizeMailboxName(options.mailbox ?? 'INBOX');
     const page = options.page ?? 1;
     const pageSize = options.pageSize ?? 20;
-    const sanitizedQuery = query ? sanitizeSearchQuery(query) : '';
 
     const lock = await client.getMailboxLock(mailbox);
     try {
-      // Build search criteria — base query OR across subject/from/body
-      const baseCriteria: Record<string, unknown> = sanitizedQuery
-        ? { or: [{ subject: sanitizedQuery }, { from: sanitizedQuery }, { body: sanitizedQuery }] }
-        : {};
+      const params: SearchParams = { ...(options as SearchParams), query };
+      const { criteria, postFilters, warnings } = buildSearchCriteria(params, { isGmail });
 
-      // Build additional filters as AND conditions
-      const andConditions: Record<string, unknown>[] = [baseCriteria];
-
-      if (options.to) {
-        andConditions.push({ to: options.to });
-      }
-      if (options.largerThan !== undefined) {
-        andConditions.push({ larger: options.largerThan * 1024 });
-      }
-      if (options.smallerThan !== undefined) {
-        andConditions.push({ smaller: options.smallerThan * 1024 });
-      }
-      if (options.answered === true) {
-        andConditions.push({ answered: true });
-      } else if (options.answered === false) {
-        andConditions.push({ answered: false });
-      }
-
-      // Use the combined criteria or just the base
-      const searchCriteria =
-        andConditions.length === 1 ? baseCriteria : Object.assign({}, ...andConditions);
-
-      const searchResult = await client.search(searchCriteria, { uid: true });
+      const searchResult = await client.search(criteria, { uid: true });
       let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      let totalApprox = false;
 
-      // Post-filter for has_attachment if requested (IMAP doesn't have native support)
-      if (options.hasAttachment !== undefined && uids.length > 0) {
-        const filteredUids: number[] = [];
-        const checkRange = uids.join(',');
-
-        // eslint-disable-next-line no-restricted-syntax
-        for await (const msg of client.fetch(
-          checkRange,
-          { uid: true, bodyStructure: true },
-          { uid: true },
-        )) {
-          const raw = msg as unknown as Record<string, unknown>;
-          const msgHasAtt = hasAttachments(raw.bodyStructure);
-          if (options.hasAttachment === msgHasAtt) {
-            filteredUids.push(raw.uid as number);
-          }
-        }
-
-        uids = filteredUids;
+      if (uids.length > MAX_SEARCH_UIDS) {
+        const originalCount = uids.length;
+        uids.sort((a, b) => b - a);
+        uids = uids.slice(0, MAX_SEARCH_UIDS);
+        totalApprox = true;
+        warnings.push(
+          `Truncated to ${MAX_SEARCH_UIDS} of ${originalCount} matches — narrow the query with more filters`,
+        );
       }
 
       if (uids.length === 0) {
+        const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
         return {
           items: [],
           total: 0,
           page,
           pageSize,
           hasMore: false,
+          ...(warning ? { warning } : {}),
+          ...(totalApprox ? { totalApprox } : {}),
         };
       }
 
@@ -582,16 +614,19 @@ export default class ImapService {
       const pageUids = uids.slice(start, start + pageSize);
 
       if (pageUids.length === 0) {
+        const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
         return {
           items: [],
           total,
           page,
           pageSize,
           hasMore: false,
+          ...(warning ? { warning } : {}),
+          ...(totalApprox ? { totalApprox } : {}),
         };
       }
 
-      const items: EmailMeta[] = [];
+      let items: EmailMeta[] = [];
       const range = pageUids.join(',');
 
       // eslint-disable-next-line no-restricted-syntax
@@ -609,14 +644,27 @@ export default class ImapService {
         items.push(messageToEmailMeta(msg as unknown as Record<string, unknown>));
       }
 
+      // Post-pagination hasAttachment filter — applied only to the current page.
+      // If filter trims items, we simply serve fewer results and mark totalApprox.
+      if (postFilters.hasAttachment !== undefined) {
+        const want = postFilters.hasAttachment;
+        items = items.filter((m) => m.hasAttachments === want);
+        if (items.length !== pageUids.length) {
+          totalApprox = true;
+        }
+      }
+
       items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
+      const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
       return {
         items,
         total,
         page,
         pageSize,
         hasMore: start + pageSize < total,
+        ...(warning ? { warning } : {}),
+        ...(totalApprox ? { totalApprox } : {}),
       };
     } finally {
       lock.release();

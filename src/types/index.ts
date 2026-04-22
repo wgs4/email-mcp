@@ -210,6 +210,13 @@ export interface PaginatedResult<T> {
   page: number;
   pageSize: number;
   hasMore: boolean;
+  /** Optional human-readable warning (e.g. "Truncated to 5000 of 78000 matches"). */
+  warning?: string;
+  /**
+   * When true, `total` is an approximation — typically because the server
+   * returned more UIDs than the cap and results were truncated before counting.
+   */
+  totalApprox?: boolean;
 }
 
 // ---------------------------------------------------------------------------
