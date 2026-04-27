@@ -186,6 +186,9 @@ function normalizeAccount(raw: RawAccountConfig): AccountConfig {
         maxMessages: raw.smtp.pool.max_messages,
       },
     },
+    sentFolder: raw.sent_folder,
+    saveToSent: raw.save_to_sent,
+    gmailAutoSave: raw.gmail_auto_save,
   };
 }
 

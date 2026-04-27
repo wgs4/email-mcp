@@ -1606,6 +1606,95 @@ export default class ImapService {
   }
 
   // -------------------------------------------------------------------------
+  // Sent folder helpers
+  // -------------------------------------------------------------------------
+
+  /**
+   * Resolve the Sent folder path for an account.
+   * Uses account config override, then SPECIAL-USE attribute, then common names.
+   */
+  async resolveSentFolder(accountName: string): Promise<string> {
+    const account = this.connections.getAccount(accountName);
+    if (account.sentFolder) return account.sentFolder;
+
+    const client = await this.connections.getImapClient(accountName);
+    const mailboxesRaw = await client.list();
+    const mailboxes = Array.isArray(mailboxesRaw) ? mailboxesRaw : [...mailboxesRaw];
+
+    // Try SPECIAL-USE attribute first
+    function isSent(mb: unknown): mb is { specialUse: string; path: string } {
+      if (typeof mb !== 'object' || mb === null) return false;
+      if (!('specialUse' in mb) || !('path' in mb)) return false;
+      const r = mb as { specialUse: unknown; path: unknown };
+      return r.specialUse === '\\Sent' && typeof r.path === 'string';
+    }
+
+    const specialUse = mailboxes.find(isSent);
+    if (specialUse) return specialUse.path;
+
+    // Fall back to common names
+    const commonNames = [
+      'INBOX.Sent',
+      'Sent',
+      'Sent Items',
+      'Sent Mail',
+      '[Gmail]/Sent Mail',
+      'INBOX.Sent Items',
+      'INBOX.Sent Messages',
+    ];
+
+    function hasPath(mb: unknown): mb is { path: string } {
+      if (typeof mb !== 'object' || mb === null) return false;
+      if (!('path' in mb)) return false;
+      return typeof (mb as { path: unknown }).path === 'string';
+    }
+
+    const paths = new Set(mailboxes.filter(hasPath).map((mb) => mb.path));
+    const match = commonNames.find((name) => paths.has(name));
+    if (!match) {
+      throw new Error(
+        `Cannot resolve Sent folder for "${accountName}". ` +
+          `Available mailboxes: ${[...paths].join(', ')}`,
+      );
+    }
+    return match;
+  }
+
+  /**
+   * Append a raw RFC 822 message to the Sent folder.
+   */
+  async appendToSent(
+    accountName: string,
+    rawMessage: Buffer | string,
+    flags?: string[],
+  ): Promise<void> {
+    const sentFolder = await this.resolveSentFolder(accountName);
+    const client = await this.connections.getImapClient(accountName);
+
+    try {
+      const lock = await client.getMailboxLock(sentFolder);
+      try {
+        await client.append(sentFolder, Buffer.from(rawMessage), flags ?? ['\\Seen']);
+      } finally {
+        lock.release();
+      }
+    } catch (err) {
+      // If mailbox doesn't exist, create it and retry once
+      if (err instanceof Error && /TRYCREATE|no such mailbox|not found/i.test(err.message)) {
+        await client.mailboxCreate(sentFolder);
+        const lock = await client.getMailboxLock(sentFolder);
+        try {
+          await client.append(sentFolder, Buffer.from(rawMessage), flags ?? ['\\Seen']);
+        } finally {
+          lock.release();
+        }
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Draft management
   // -------------------------------------------------------------------------
 
