@@ -45,16 +45,23 @@ exited.
 
 What the wrapper does:
 
-1. Records `$PPID` (the MCP host process) at startup.
-2. Spawns `email-mcp` with stdio inherited so the JSON-RPC stream is
-   unchanged from the host's perspective.
-3. Forwards `SIGTERM`, `SIGINT`, `SIGHUP`, and normal `EXIT` to the
-   child via a `trap`.
-4. Spawns a background watchdog that polls the recorded parent PID.
-   When the parent disappears, the watchdog `SIGTERM`s and then
-   `SIGKILL`s the `email-mcp` child. This survives even a `SIGKILL`
-   of the wrapper itself, since the watchdog is reparented to launchd
-   and continues running.
+1. Records `$PPID` (the MCP host process) and `$$` (its own PID) at
+   startup.
+2. Detaches a watchdog subshell with stdio redirected to `/dev/null`,
+   so it cannot interfere with the JSON-RPC pipe.
+3. `exec`s `email-mcp` in place — bash is replaced by `email-mcp` with
+   the same PID and the host's stdin/stdout/stderr inherited directly.
+   There is **no shell layer** sitting in the JSON-RPC pipe, so
+   stdio contention is impossible.
+4. The watchdog polls the recorded parent PID. When the parent
+   disappears, it `SIGTERM`s (then `SIGKILL`s) `email-mcp` by the
+   wrapper's original PID — which, after the `exec`, is `email-mcp`'s
+   PID. This works even if the wrapper itself were `SIGKILL`ed,
+   because by the time the watchdog runs, the bash process is already
+   gone and the watchdog is reparented to launchd.
+5. The watchdog also exits cleanly if `email-mcp` dies first (normal
+   shutdown, IMAP error, etc.), so it never lingers as an orphan
+   itself.
 
 The wrapper is intentionally bash-only — no Node, no extra deps — so
 it has nothing to break and nothing to keep up to date with the
