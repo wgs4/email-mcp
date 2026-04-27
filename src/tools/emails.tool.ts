@@ -1,12 +1,14 @@
 /**
- * MCP tools: list_emails, get_email, get_emails, get_email_status, search_emails
+ * MCP tools: list_emails, get_email, get_emails, get_email_status,
+ * search_emails, search_all_accounts.
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
+import type ConnectionManager from '../connections/manager.js';
 import type ImapService from '../services/imap.service.js';
-import type { Email, EmailMeta } from '../types/index.js';
+import type { Email, EmailMeta, FacetResult, PaginatedResult } from '../types/index.js';
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -31,7 +33,100 @@ function formatEmailMeta(email: EmailMeta): string {
   const from = email.from.name ? `${email.from.name} <${email.from.address}>` : email.from.address;
   const labelStr = email.labels.length > 0 ? `\n  🏷️ ${email.labels.join(', ')}` : '';
 
-  return `[${email.id}] ${flags} ${email.subject}\n  From: ${from} | ${email.date}${labelStr}${email.preview ? `\n  ${email.preview}` : ''}`;
+  let attachLine = '';
+  if (email.attachments && email.attachments.length > 0) {
+    const names = email.attachments.map((a) => a.filename);
+    const shown = names.slice(0, 3).join(', ');
+    const extra = names.length > 3 ? ` (+${names.length - 3} more)` : '';
+    attachLine = `\n  📎 Attachments: ${shown}${extra}`;
+  }
+
+  const accountTag = email.account ? `[${email.account}] ` : '';
+  return `${accountTag}[${email.id}] ${flags} ${email.subject}\n  From: ${from} | ${email.date}${labelStr}${attachLine}${email.preview ? `\n  ${email.preview}` : ''}`;
+}
+
+/**
+ * Render a facet result block (sender/year/mailbox) — shared between
+ * `search_emails`, `search_all_accounts`, and `run_preset`.
+ */
+export function formatFacetsBlock(facets: FacetResult | undefined): string {
+  if (!facets) return '';
+  const lines: string[] = ['', '📊 Facets'];
+  if (facets.sender) {
+    const top = Object.entries(facets.sender)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([k, v]) => `${k} (${v})`)
+      .join(', ');
+    lines.push(`  By sender: ${top || '(none)'}`);
+  }
+  if (facets.year) {
+    const all = Object.entries(facets.year)
+      .sort((a, b) => b[0].localeCompare(a[0]))
+      .map(([k, v]) => `${k} (${v})`)
+      .join(', ');
+    lines.push(`  By year:   ${all || '(none)'}`);
+  }
+  if (facets.mailbox) {
+    const all = Object.entries(facets.mailbox)
+      .map(([k, v]) => `${k} (${v})`)
+      .join(', ');
+    lines.push(`  By mailbox: ${all || '(none)'}`);
+  }
+  return `\n${lines.join('\n')}`;
+}
+
+/**
+ * Format a paginated search result (single- or cross-account) for MCP text
+ * output. Used by `search_emails`, `search_all_accounts`, and `run_preset`.
+ */
+export function formatSearchResult(
+  result: PaginatedResult<EmailMeta> & {
+    warnings?: { account: string; error: string }[];
+  },
+  header: string,
+  emptyMessage: string,
+): string {
+  const warningPrefix = result.warning ? `⚠️ ${result.warning}\n` : '';
+
+  if (result.items.length === 0) {
+    return `${warningPrefix}${emptyMessage}`;
+  }
+
+  const emails = result.items.map(formatEmailMeta).join('\n\n');
+  const facetsBlock = formatFacetsBlock(result.facets);
+
+  let accountWarningsBlock = '';
+  if (result.warnings && result.warnings.length > 0) {
+    // Split warnings into "informational remaps" (ℹ️-prefixed message) vs
+    // hard errors/skips. Both live in the same warnings[] array for backward
+    // compat; we classify here purely for rendering.
+    const infos = result.warnings.filter((w) => w.error.startsWith('ℹ️'));
+    const hard = result.warnings.filter((w) => !w.error.startsWith('ℹ️'));
+    const blocks: string[] = [];
+    if (hard.length > 0) {
+      const lines = [`⚠️ Warnings (${hard.length} account${hard.length === 1 ? '' : 's'})`];
+      hard.forEach((w) => {
+        lines.push(`  - ${w.account}: ${w.error}`);
+      });
+      blocks.push(lines.join('\n'));
+    }
+    if (infos.length > 0) {
+      const lines = [`ℹ️ Remapped (${infos.length} account${infos.length === 1 ? '' : 's'})`];
+      infos.forEach((w) => {
+        // Strip the leading emoji + space since the section header already
+        // carries one — avoid double-ℹ️ in rendered output.
+        const msg = w.error.replace(/^ℹ️\s*/, '');
+        lines.push(`  - ${w.account}: ${msg}`);
+      });
+      blocks.push(lines.join('\n'));
+    }
+    if (blocks.length > 0) {
+      accountWarningsBlock = `\n\n${blocks.join('\n\n')}`;
+    }
+  }
+
+  return `${warningPrefix}${header}\n${emails}${facetsBlock}${accountWarningsBlock}`;
 }
 
 /** Strips HTML markup and decodes common entities to produce readable plain text. */
@@ -109,14 +204,21 @@ function formatEmailStatus(email: Pick<Email, 'seen' | 'flagged' | 'answered' | 
 
 // ---------------------------------------------------------------------------
 
-export default function registerEmailsTools(server: McpServer, imapService: ImapService): void {
+export default function registerEmailsTools(
+  server: McpServer,
+  imapService: ImapService,
+  connections: ConnectionManager,
+): void {
   // ---------------------------------------------------------------------------
   // list_emails
   // ---------------------------------------------------------------------------
   server.tool(
     'list_emails',
-    'List emails in a mailbox with optional filters. Returns paginated results with metadata ' +
-      '(read/unread 🔵, flagged ⭐, replied ↩️, attachments 📎, labels 🏷️). ' +
+    'List emails with optional server-side filters. Supports date ranges (since/before/on, ' +
+      'including relative tokens like "7d", "yesterday"), subject/from/to/cc/bcc/body/text search, ' +
+      'read/flag/answered state, keywords/labels, header matches, and UID ranges. ' +
+      'On Gmail accounts, pass gmail_raw for native Gmail search syntax (dramatically faster). ' +
+      'Returns paginated metadata (read/unread 🔵, flagged ⭐, replied ↩️, attachments 📎, labels 🏷️). ' +
       'Use get_email to fetch full body content. ' +
       'ProtonMail note: labels are represented as IMAP folders — use list_labels to discover them, ' +
       'then list_emails with mailbox="Labels/X" to find labeled emails.',
@@ -125,17 +227,70 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
       mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
       page: z.number().int().min(1).default(1).describe('Page number'),
       pageSize: z.number().int().min(1).max(100).default(20).describe('Results per page'),
-      since: z.string().optional().describe('Show emails after this date (ISO 8601)'),
-      before: z.string().optional().describe('Show emails before this date (ISO 8601)'),
+      since: z
+        .string()
+        .optional()
+        .describe(
+          'Date filter: received on/after. Accepts ISO 8601, YYYY-MM-DD, or relative like "7d" / "yesterday"',
+        ),
+      before: z.string().optional().describe('Date filter: received strictly before'),
+      on: z.string().optional().describe('Date filter: received on specific date'),
+      sent_since: z
+        .string()
+        .optional()
+        .describe(
+          'Date header: sent on/after (differs from since which uses internal delivery date)',
+        ),
+      sent_before: z.string().optional().describe('Date header: sent before'),
       from: z.string().optional().describe('Filter by sender address or name'),
-      subject: z.string().optional().describe('Filter by subject keyword'),
-      seen: z.boolean().optional().describe('Filter: true=read only, false=unread only'),
-      flagged: z.boolean().optional().describe('Filter: true=flagged only, false=unflagged only'),
+      subject: z.string().optional().describe('Substring in Subject'),
+      to: z.string().optional().describe('Substring in To'),
+      cc: z.string().optional().describe('Substring in Cc'),
+      bcc: z.string().optional().describe('Substring in Bcc'),
+      text: z.string().optional().describe('Any text field (headers + body)'),
+      body: z.string().optional().describe('Body only'),
+      seen: z.boolean().optional().describe('true = read only; false = unread only'),
+      flagged: z.boolean().optional().describe('true = flagged; false = unflagged'),
       has_attachment: z
         .boolean()
         .optional()
         .describe('Filter: true=has attachments, false=no attachments'),
       answered: z.boolean().optional().describe('Filter: true=replied, false=not yet replied'),
+      draft: z.boolean().optional(),
+      deleted: z.boolean().optional(),
+      keyword: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe('IMAP keyword/label (AND when array)'),
+      not_keyword: z.union([z.string(), z.array(z.string())]).optional(),
+      header: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe('Arbitrary header name/value match, e.g. {"X-Custom": "value"}'),
+      uids: z
+        .union([z.array(z.number()), z.string()])
+        .optional()
+        .describe('Specific UID ranges (array of numbers or IMAP sequence string like "1:100")'),
+      larger_than: z.number().optional().describe('Minimum email size in KB'),
+      smaller_than: z.number().optional().describe('Maximum email size in KB'),
+      attachment_filename: z
+        .string()
+        .optional()
+        .describe(
+          'Filter by attachment filename substring (case-insensitive). Example: "lease" matches "signed_lease_v7.pdf".',
+        ),
+      attachment_mimetype: z
+        .string()
+        .optional()
+        .describe(
+          'Filter by MIME type regex (case-insensitive). Examples: "application/pdf", "image/.*".',
+        ),
+      gmail_raw: z
+        .string()
+        .optional()
+        .describe(
+          "Gmail accounts ONLY: pass Gmail search syntax (e.g. 'from:foo has:attachment') for dramatically faster server-side search. Other filters ignored when set.",
+        ),
     },
     { readOnlyHint: true, destructiveHint: false },
     async (params) => {
@@ -146,28 +301,60 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
           pageSize: params.pageSize,
           since: params.since,
           before: params.before,
+          on: params.on,
+          sentSince: params.sent_since,
+          sentBefore: params.sent_before,
           from: params.from,
           subject: params.subject,
+          to: params.to,
+          cc: params.cc,
+          bcc: params.bcc,
+          text: params.text,
+          body: params.body,
           seen: params.seen,
           flagged: params.flagged,
           hasAttachment: params.has_attachment,
           answered: params.answered,
+          draft: params.draft,
+          deleted: params.deleted,
+          keyword: params.keyword,
+          notKeyword: params.not_keyword,
+          header: params.header,
+          uids: params.uids,
+          largerThan: params.larger_than,
+          smallerThan: params.smaller_than,
+          attachmentFilename: params.attachment_filename,
+          attachmentMimetype: params.attachment_mimetype,
+          gmailRaw: params.gmail_raw,
         });
+
+        const warningPrefix = result.warning ? `⚠️ ${result.warning}\n` : '';
 
         if (result.items.length === 0) {
           return {
-            content: [{ type: 'text' as const, text: 'No emails found matching the criteria.' }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `${warningPrefix}No emails found matching the criteria.`,
+              },
+            ],
           };
         }
 
+        const totalDisplay = result.totalApprox ? `~${result.total}` : `${result.total}`;
         const header =
-          `📬 [${params.mailbox}] ${result.total} emails ` +
+          `📬 [${params.mailbox}] ${totalDisplay} emails ` +
           `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})` +
           `${result.hasMore ? ' — more pages available' : ''}\n`;
         const emails = result.items.map(formatEmailMeta).join('\n\n');
 
         return {
-          content: [{ type: 'text' as const, text: `${header}\n${emails}` }],
+          content: [
+            {
+              type: 'text' as const,
+              text: `${warningPrefix}${header}\n${emails}`,
+            },
+          ],
         };
       } catch (err) {
         return {
@@ -419,21 +606,45 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
   // ---------------------------------------------------------------------------
   server.tool(
     'search_emails',
-    'Search emails by keyword across subject, sender, and body. ' +
-      'Omit query (or pass an empty string) to use it as a pure filter — e.g. find all emails ' +
-      'with attachments from a specific recipient without a keyword. ' +
-      'Supports additional filters for recipient, attachments, size, and reply status.',
+    'Search emails with server-side filters. Omit query (or pass an empty string) to use pure filters. ' +
+      'Supports date ranges (since/before/on, including "7d" / "yesterday"), subject/from/to/cc/bcc/body/text ' +
+      'filters, read/flag/answered state, keywords/labels, header matches, UID ranges, size limits, and attachments. ' +
+      "On Gmail accounts, pass gmail_raw (e.g. 'from:foo has:attachment older_than:30d') for a dramatically " +
+      'faster native Gmail search. Results are paginated; large result sets are capped at 5000 UIDs with a warning.',
     {
       account: z.string().describe('Account name from list_accounts'),
       query: z
         .string()
         .optional()
         .default('')
-        .describe('Search keyword (omit or leave empty to use filters only)'),
+        .describe('Search keyword across subject/from/body (omit to use filters only)'),
       mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
       page: z.number().int().min(1).default(1).describe('Page number'),
       pageSize: z.number().int().min(1).max(100).default(20).describe('Results per page'),
       to: z.string().optional().describe('Filter by recipient address'),
+      from: z.string().optional().describe('Filter by sender address or name'),
+      subject: z.string().optional().describe('Substring in Subject'),
+      cc: z.string().optional().describe('Substring in Cc'),
+      bcc: z.string().optional().describe('Substring in Bcc'),
+      text: z.string().optional().describe('Any text field (headers + body)'),
+      body: z.string().optional().describe('Body only'),
+      since: z
+        .string()
+        .optional()
+        .describe(
+          'Date filter: received on/after. Accepts ISO 8601, YYYY-MM-DD, or relative like "7d" / "yesterday"',
+        ),
+      before: z.string().optional().describe('Date filter: received strictly before'),
+      on: z.string().optional().describe('Date filter: received on specific date'),
+      sent_since: z
+        .string()
+        .optional()
+        .describe(
+          'Date header: sent on/after (differs from since which uses internal delivery date)',
+        ),
+      sent_before: z.string().optional().describe('Date header: sent before'),
+      seen: z.boolean().optional().describe('true = read only; false = unread only'),
+      flagged: z.boolean().optional().describe('true = flagged; false = unflagged'),
       has_attachment: z
         .boolean()
         .optional()
@@ -441,6 +652,46 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
       larger_than: z.number().optional().describe('Minimum email size in KB'),
       smaller_than: z.number().optional().describe('Maximum email size in KB'),
       answered: z.boolean().optional().describe('Filter: true=replied, false=not replied'),
+      draft: z.boolean().optional(),
+      deleted: z.boolean().optional(),
+      keyword: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe('IMAP keyword/label (AND when array)'),
+      not_keyword: z.union([z.string(), z.array(z.string())]).optional(),
+      header: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe('Arbitrary header name/value match, e.g. {"X-Custom": "value"}'),
+      uids: z
+        .union([z.array(z.number()), z.string()])
+        .optional()
+        .describe('Specific UID ranges (array of numbers or IMAP sequence string like "1:100")'),
+      attachment_filename: z
+        .string()
+        .optional()
+        .describe(
+          'Filter by attachment filename substring (case-insensitive). Example: "lease" matches "signed_lease_v7.pdf".',
+        ),
+      attachment_mimetype: z
+        .string()
+        .optional()
+        .describe(
+          'Filter by MIME type regex (case-insensitive). Examples: "application/pdf", "image/.*".',
+        ),
+      facets: z
+        .array(z.enum(['sender', 'year', 'mailbox']))
+        .optional()
+        .describe(
+          'Return bucketed counts by sender/year/mailbox alongside the paginated results. ' +
+            'Useful for understanding large result sets. Skipped if match set exceeds 10000 UIDs.',
+        ),
+      gmail_raw: z
+        .string()
+        .optional()
+        .describe(
+          "Gmail accounts ONLY: pass Gmail search syntax (e.g. 'from:foo has:attachment') for dramatically faster server-side search. Other filters ignored when set.",
+        ),
     },
     { readOnlyHint: true, destructiveHint: false },
     async (params) => {
@@ -450,33 +701,52 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
           page: params.page,
           pageSize: params.pageSize,
           to: params.to,
+          from: params.from,
+          subject: params.subject,
+          cc: params.cc,
+          bcc: params.bcc,
+          text: params.text,
+          body: params.body,
+          since: params.since,
+          before: params.before,
+          on: params.on,
+          sentSince: params.sent_since,
+          sentBefore: params.sent_before,
+          seen: params.seen,
+          flagged: params.flagged,
           hasAttachment: params.has_attachment,
           largerThan: params.larger_than,
           smallerThan: params.smaller_than,
           answered: params.answered,
+          draft: params.draft,
+          deleted: params.deleted,
+          keyword: params.keyword,
+          notKeyword: params.not_keyword,
+          header: params.header,
+          uids: params.uids,
+          attachmentFilename: params.attachment_filename,
+          attachmentMimetype: params.attachment_mimetype,
+          facets: params.facets,
+          gmailRaw: params.gmail_raw,
         });
 
-        if (result.items.length === 0) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: params.query
-                  ? `No emails found matching "${params.query}".`
-                  : 'No emails found matching the specified filters.',
-              },
-            ],
-          };
-        }
-
+        const totalDisplay = result.totalApprox ? `~${result.total}` : `${result.total}`;
         const queryLabel = params.query ? `"${params.query}"` : 'filters';
+        const totalPages = result.total > 0 ? Math.ceil(result.total / result.pageSize) : 1;
         const header =
-          `🔍 [${params.mailbox}] ${result.total} result(s) for ${queryLabel} ` +
-          `(page ${result.page}/${Math.ceil(result.total / result.pageSize)})\n`;
-        const emails = result.items.map(formatEmailMeta).join('\n\n');
+          `🔍 [${params.mailbox}] ${totalDisplay} result(s) for ${queryLabel} ` +
+          `(page ${result.page}/${totalPages})\n`;
+        const emptyMsg = params.query
+          ? `No emails found matching "${params.query}".`
+          : 'No emails found matching the specified filters.';
 
         return {
-          content: [{ type: 'text' as const, text: `${header}\n${emails}` }],
+          content: [
+            {
+              type: 'text' as const,
+              text: formatSearchResult(result, header, emptyMsg),
+            },
+          ],
         };
       } catch (err) {
         return {
@@ -485,6 +755,154 @@ export default function registerEmailsTools(server: McpServer, imapService: Imap
             {
               type: 'text' as const,
               text: `Failed to search emails: ${err instanceof Error ? err.message : String(err)}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // search_all_accounts
+  // ---------------------------------------------------------------------------
+  server.tool(
+    'search_all_accounts',
+    'Search emails across multiple accounts in parallel. Same filter set as search_emails ' +
+      'but fans out across N accounts and merges results sorted by date. Each result is tagged ' +
+      'with the account it came from. Partial failures are surfaced as warnings without failing ' +
+      'the whole call. Useful for "find X anywhere in my inboxes" queries across your email ecosystem.',
+    {
+      query: z
+        .string()
+        .optional()
+        .default('')
+        .describe('Search keyword across subject/from/body (omit to use filters only)'),
+      accounts: z
+        .array(z.string())
+        .optional()
+        .describe('Specific accounts to search (default: all accounts from list_accounts)'),
+      mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
+      page: z.number().int().min(1).default(1).describe('Page number of the merged result set'),
+      pageSize: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .default(20)
+        .describe('Results per page (merged across accounts)'),
+      to: z.string().optional(),
+      from: z.string().optional(),
+      subject: z.string().optional(),
+      cc: z.string().optional(),
+      bcc: z.string().optional(),
+      text: z.string().optional(),
+      body: z.string().optional(),
+      since: z.string().optional(),
+      before: z.string().optional(),
+      on: z.string().optional(),
+      sent_since: z.string().optional(),
+      sent_before: z.string().optional(),
+      seen: z.boolean().optional(),
+      flagged: z.boolean().optional(),
+      has_attachment: z.boolean().optional(),
+      larger_than: z.number().optional(),
+      smaller_than: z.number().optional(),
+      answered: z.boolean().optional(),
+      draft: z.boolean().optional(),
+      deleted: z.boolean().optional(),
+      keyword: z.union([z.string(), z.array(z.string())]).optional(),
+      not_keyword: z.union([z.string(), z.array(z.string())]).optional(),
+      header: z.record(z.string(), z.string()).optional(),
+      attachment_filename: z.string().optional(),
+      attachment_mimetype: z.string().optional(),
+      facets: z.array(z.enum(['sender', 'year', 'mailbox'])).optional(),
+      gmail_raw: z
+        .string()
+        .optional()
+        .describe(
+          'Gmail accounts ONLY (when targeted accounts include Gmail). Non-Gmail accounts in the ' +
+            'fan-out will error individually and appear in warnings.',
+        ),
+    },
+    { readOnlyHint: true, destructiveHint: false },
+    async (params) => {
+      try {
+        const accountNames =
+          params.accounts && params.accounts.length > 0
+            ? params.accounts
+            : connections.getAccountNames();
+
+        if (accountNames.length === 0) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text: 'No accounts configured — add at least one account to config.toml.',
+              },
+            ],
+          };
+        }
+
+        const result = await imapService.searchAcrossAccounts(accountNames, params.query ?? '', {
+          mailbox: params.mailbox,
+          page: params.page,
+          pageSize: params.pageSize,
+          to: params.to,
+          from: params.from,
+          subject: params.subject,
+          cc: params.cc,
+          bcc: params.bcc,
+          text: params.text,
+          body: params.body,
+          since: params.since,
+          before: params.before,
+          on: params.on,
+          sentSince: params.sent_since,
+          sentBefore: params.sent_before,
+          seen: params.seen,
+          flagged: params.flagged,
+          hasAttachment: params.has_attachment,
+          largerThan: params.larger_than,
+          smallerThan: params.smaller_than,
+          answered: params.answered,
+          draft: params.draft,
+          deleted: params.deleted,
+          keyword: params.keyword,
+          notKeyword: params.not_keyword,
+          header: params.header,
+          attachmentFilename: params.attachment_filename,
+          attachmentMimetype: params.attachment_mimetype,
+          facets: params.facets,
+          gmailRaw: params.gmail_raw,
+        });
+
+        const totalDisplay = result.totalApprox ? `~${result.total}` : `${result.total}`;
+        const queryLabel = params.query ? `"${params.query}"` : 'filters';
+        const totalPages = result.total > 0 ? Math.ceil(result.total / result.pageSize) : 1;
+        const header =
+          `🔍 [${accountNames.length} account(s) · ${params.mailbox}] ` +
+          `${totalDisplay} result(s) for ${queryLabel} ` +
+          `(page ${result.page}/${totalPages})\n`;
+        const emptyMsg = params.query
+          ? `No emails found matching "${params.query}" across ${accountNames.length} account(s).`
+          : `No emails found matching the specified filters across ${accountNames.length} account(s).`;
+
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: formatSearchResult(result, header, emptyMsg),
+            },
+          ],
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `Failed to search accounts: ${err instanceof Error ? err.message : String(err)}`,
             },
           ],
         };

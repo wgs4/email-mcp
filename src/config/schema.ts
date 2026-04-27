@@ -147,6 +147,51 @@ export const SettingsSchema = z.object({
   }),
 });
 
+// ---------------------------------------------------------------------------
+// Saved-search presets — `[[searches]]` in config.toml
+// ---------------------------------------------------------------------------
+
+export const SearchPresetSchema = z
+  .object({
+    name: z.string().min(1, 'Search preset name is required'),
+    description: z.string().optional(),
+    account: z.string().optional(),
+    accounts: z.array(z.string()).optional(),
+    mailbox: z.string().optional(),
+    // SearchParams fields — snake_case to mirror TOML style.
+    query: z.string().optional(),
+    to: z.string().optional(),
+    from: z.string().optional(),
+    subject: z.string().optional(),
+    cc: z.string().optional(),
+    bcc: z.string().optional(),
+    text: z.string().optional(),
+    body: z.string().optional(),
+    since: z.string().optional(),
+    before: z.string().optional(),
+    on: z.string().optional(),
+    sent_since: z.string().optional(),
+    sent_before: z.string().optional(),
+    seen: z.boolean().optional(),
+    flagged: z.boolean().optional(),
+    answered: z.boolean().optional(),
+    draft: z.boolean().optional(),
+    deleted: z.boolean().optional(),
+    keyword: z.union([z.string(), z.array(z.string())]).optional(),
+    not_keyword: z.union([z.string(), z.array(z.string())]).optional(),
+    header: z.record(z.string(), z.string()).optional(),
+    larger_than: z.number().optional(),
+    smaller_than: z.number().optional(),
+    has_attachment: z.boolean().optional(),
+    attachment_filename: z.string().optional(),
+    attachment_mimetype: z.string().optional(),
+    facets: z.array(z.enum(['sender', 'year', 'mailbox'])).optional(),
+    gmail_raw: z.string().optional(),
+  })
+  .refine((p) => !(p.account && p.accounts && p.accounts.length > 0), {
+    message: "Use 'account' OR 'accounts', not both",
+  });
+
 export const AppConfigFileSchema = z.object({
   settings: SettingsSchema.default({
     rate_limit: 10,
@@ -177,7 +222,9 @@ export const AppConfigFileSchema = z.object({
     },
   }),
   accounts: z.array(AccountConfigSchema).min(1, 'At least one account is required'),
+  searches: z.array(SearchPresetSchema).default([]),
 });
 
 export type RawAccountConfig = z.infer<typeof AccountConfigSchema>;
 export type RawAppConfig = z.infer<typeof AppConfigFileSchema>;
+export type RawSearchPreset = z.infer<typeof SearchPresetSchema>;

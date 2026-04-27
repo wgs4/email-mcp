@@ -148,6 +148,55 @@ export interface AppConfig {
     hooks: HooksConfig;
   };
   accounts: AccountConfig[];
+  /** Saved-search presets from `[[searches]]` in config.toml. Empty when none. */
+  searches: SearchPreset[];
+}
+
+// ---------------------------------------------------------------------------
+// Saved-search presets
+// ---------------------------------------------------------------------------
+
+/**
+ * Camel-cased view of a `[[searches]]` entry from config.toml. Bundles a
+ * named filter combination that can be executed via `run_preset`.
+ *
+ * Every search parameter mirrors the `SearchParams` shape. Either `account`
+ * (single-account) or `accounts` (cross-account) may be set — not both.
+ */
+export interface SearchPreset {
+  name: string;
+  description?: string;
+  account?: string;
+  accounts?: string[];
+  mailbox?: string;
+  query?: string;
+  to?: string;
+  from?: string;
+  subject?: string;
+  cc?: string;
+  bcc?: string;
+  text?: string;
+  body?: string;
+  since?: string;
+  before?: string;
+  on?: string;
+  sentSince?: string;
+  sentBefore?: string;
+  seen?: boolean;
+  flagged?: boolean;
+  answered?: boolean;
+  draft?: boolean;
+  deleted?: boolean;
+  keyword?: string | string[];
+  notKeyword?: string | string[];
+  header?: Record<string, string>;
+  largerThan?: number;
+  smallerThan?: number;
+  hasAttachment?: boolean;
+  attachmentFilename?: string;
+  attachmentMimetype?: string;
+  facets?: ('sender' | 'year' | 'mailbox')[];
+  gmailRaw?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -178,6 +227,18 @@ export interface EmailMeta {
   hasAttachments: boolean;
   labels: string[];
   preview?: string;
+  /**
+   * Attachment metadata, populated when bodyStructure is fetched. Undefined
+   * means "unknown" (e.g. envelope-only fetches); an empty array means the
+   * message was inspected and has no attachments.
+   */
+  attachments?: AttachmentMeta[];
+  /**
+   * Account name — populated only by cross-account search
+   * (`ImapService.searchAcrossAccounts`). Single-account callers leave this
+   * undefined.
+   */
+  account?: string;
 }
 
 export interface AttachmentMeta {
@@ -213,6 +274,24 @@ export interface PaginatedResult<T> {
   page: number;
   pageSize: number;
   hasMore: boolean;
+  /** Optional human-readable warning (e.g. "Truncated to 5000 of 78000 matches"). */
+  warning?: string;
+  /**
+   * When true, `total` is an approximation — typically because the server
+   * returned more UIDs than the cap and results were truncated before counting.
+   */
+  totalApprox?: boolean;
+  /** Optional bucketed counts across the full match set (capped). */
+  facets?: FacetResult;
+}
+
+export interface FacetResult {
+  /** Map of sender address (lowercased) → count. */
+  sender?: Record<string, number>;
+  /** Map of year (stringified) → count. */
+  year?: Record<string, number>;
+  /** Map of mailbox path → count. Reserved for cross-account search. */
+  mailbox?: Record<string, number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -377,4 +456,29 @@ export interface ScheduledEmail {
   references?: string[];
   sentAt?: string;
   sentMessageId?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Export & Attachment Save — PR 4
+// ---------------------------------------------------------------------------
+
+export interface ExportResult {
+  path: string;
+  rows_written: number;
+  truncated: boolean;
+  format: 'csv' | 'ndjson';
+}
+
+export interface AttachmentSaveResult {
+  path: string;
+  size: number;
+  mimeType: string;
+}
+
+export interface BatchAttachmentResult {
+  folder: string;
+  files_saved: number;
+  total_size: number;
+  skipped: number;
+  errors: { emailId: string; filename: string; error: string }[];
 }

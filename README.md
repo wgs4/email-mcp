@@ -640,11 +640,273 @@ Features:
 - **Graceful degradation** — Falls back to notify mode if client doesn't support sampling
 - **Resource subscriptions** — Pushes `notifications/resources/updated` for unread counts
 
+## Power Search
+
+`list_emails` and `search_emails` support a rich set of server-side filters translated to native IMAP search criteria. All filters combine with AND; `query` matches as OR across `subject`/`from`/`body`. Snake_case at the tool layer, camelCase in the service layer.
+
+### Supported filters
+
+| Tool param        | Service option  | Type             | IMAP term / behavior                                                                                  |
+|-------------------|-----------------|------------------|-------------------------------------------------------------------------------------------------------|
+| `query`           | `query`         | string           | OR across `SUBJECT` / `FROM` / `BODY`                                                                 |
+| `from`            | `from`          | string           | `FROM` substring                                                                                      |
+| `to`              | `to`            | string           | `TO` substring                                                                                        |
+| `cc`              | `cc`            | string           | `CC` substring                                                                                        |
+| `bcc`             | `bcc`           | string           | `BCC` substring                                                                                       |
+| `subject`         | `subject`       | string           | `SUBJECT` substring                                                                                   |
+| `body`            | `body`          | string           | `BODY` substring                                                                                      |
+| `text`            | `text`          | string           | `TEXT` (headers + body) substring                                                                     |
+| `since`           | `since`         | string           | `SINCE` — delivery date on/after. Accepts ISO 8601, `YYYY-MM-DD`, or relative (`7d`, `2w`, `1m`, `yesterday`, `today`) |
+| `before`          | `before`        | string           | `BEFORE` — delivery date strictly before                                                              |
+| `on`              | `on`            | string           | `ON` — delivery date equals                                                                            |
+| `sent_since`      | `sentSince`     | string           | `SENTSINCE` — header `Date` on/after                                                                  |
+| `sent_before`     | `sentBefore`    | string           | `SENTBEFORE` — header `Date` before                                                                   |
+| `seen`            | `seen`          | boolean          | `SEEN` / `UNSEEN`                                                                                     |
+| `flagged`         | `flagged`       | boolean          | `FLAGGED` / `UNFLAGGED`                                                                               |
+| `answered`        | `answered`      | boolean          | `ANSWERED` / `UNANSWERED`                                                                             |
+| `draft`           | `draft`         | boolean          | `DRAFT` / `UNDRAFT`                                                                                   |
+| `deleted`         | `deleted`       | boolean          | `DELETED` / `UNDELETED`                                                                               |
+| `keyword`         | `keyword`       | string or array  | `KEYWORD` (custom IMAP flag / label)                                                                  |
+| `not_keyword`     | `notKeyword`    | string or array  | `UNKEYWORD`                                                                                           |
+| `header`          | `header`        | object           | `HEADER name value` per entry (e.g. `{ "X-Custom": "foo" }`)                                          |
+| `uids`            | `uids`          | number[] or string | `UID` — filter to a UID set or IMAP range string (`"1:100"`)                                         |
+| `larger_than`     | `largerThan`    | number (KB)      | `LARGER` (converted to bytes)                                                                          |
+| `smaller_than`    | `smallerThan`   | number (KB)      | `SMALLER`                                                                                              |
+| `has_attachment`  | `hasAttachment` | boolean          | Post-pagination filter (IMAP has no native attachment search — applied to current page only)           |
+| `attachment_filename` | `attachmentFilename` | string    | Substring match (case-insensitive) against any attachment filename on the current page                 |
+| `attachment_mimetype` | `attachmentMimetype` | string    | Regex (case-insensitive) applied to each attachment's `type/subtype` on the current page               |
+| `facets`          | `facets`        | string[]         | `search_emails` only — returns bucketed counts by `sender` / `year` / `mailbox`                        |
+| `gmail_raw`       | `gmailRaw`      | string           | Gmail only — passes through to `X-GM-RAW` (Gmail native search syntax). Other filters ignored when set. |
+
+### Example — "Pines Rd" invoice search
+
+```jsonc
+// search_emails tool call
+{
+  "account":        "primary",
+  "subject":        "Pines Rd",
+  "body":           "invoice",
+  "since":          "2024-01-01",
+  "before":         "2024-12-31",
+  "has_attachment": true
+}
+```
+
+### Gmail Fast Path
+
+When the account's `imap.host === "imap.gmail.com"`, pass `gmail_raw` for native Gmail search syntax executed entirely server-side. Dramatically faster than client-side filtering for large mailboxes.
+
+```jsonc
+// search_emails on a Gmail account
+{
+  "account":   "gmail",
+  "gmail_raw": "from:alice@example.com has:attachment older_than:30d"
+}
+```
+
+Notes:
+- When `gmail_raw` is provided, other filters are ignored and a warning lists them.
+- On non-Gmail accounts, `gmail_raw` raises an error explaining the restriction.
+- Full Gmail syntax reference: <https://support.google.com/mail/answer/7190>.
+
+### Attachment filters
+
+When `has_attachment: true` alone returns too much noise, narrow by filename substring or MIME type regex. Both are applied post-pagination on the current page's body-structure fetches (same trade-off as `has_attachment`: if the filter trims the page, fewer items are served and `totalApprox` is set).
+
+```jsonc
+// Narrow a noisy Pines Rd thread to signed PDFs only
+{
+  "account":             "primary",
+  "subject":             "Pines Rd",
+  "attachment_filename": "lease",             // matches "signed_lease_v7.pdf"
+  "attachment_mimetype": "application/pdf"    // regex, case-insensitive
+}
+```
+
+Regex examples:
+
+- `"application/pdf"` — exact MIME
+- `"image/.*"` — any image attachment
+- `"^application/(pdf|zip)$"` — PDFs or zips
+
+Invalid regex patterns raise a `Invalid attachment_mimetype pattern: …` tool error.
+
+### Facets
+
+`search_emails` (only — not `list_emails`) accepts a `facets` array to return bucketed counts across the **full match set** (up to the 5000-UID cap) alongside the paginated page:
+
+```jsonc
+{
+  "account": "primary",
+  "since":   "90d",
+  "facets":  ["sender", "year"]
+}
+```
+
+The response appends a `📊 Facets` block with the top 10 senders and year buckets:
+
+```
+📊 Facets
+  By sender: alice@example.com (42), bob@example.com (15), ...
+  By year:   2025 (52), 2024 (20)
+```
+
+Facets are computed via a single envelope-only IMAP fetch in 500-UID chunks. When the match set exceeds **10000 UIDs** facets are skipped with a warning — narrow the query (date range, sender, subject) to unlock them. In `search_emails`, `"mailbox"` is a single-entry bucket for the current mailbox. In `search_all_accounts`, the `mailbox` facet is re-keyed by account name, giving a per-account breakdown (e.g. `{ "wgs-usa": 42, "all-pedal": 10 }`).
+
+### Performance Notes
+
+- **UID cap**: large result sets are capped at **5000 UIDs** before pagination. When truncation happens the response includes a `warning` and the rendered count is prefixed with `~` to indicate `totalApprox`. Narrow the query with more filters (dates, sender, subject) to drop below the cap.
+- **`has_attachment` is post-pagination**: because IMAP has no native attachment search, the filter is now applied only to the current page's body-structure fetches — so a 78k-message folder no longer triggers a full-folder body-structure scan upfront. The trade-off: if the filter trims items on a page, the page serves fewer results and `totalApprox` is set; narrow the query instead of relying on `has_attachment` alone.
+- **Relative date tokens** (`7d`, `2w`, `1m`, `yesterday`, `today`) are evaluated in UTC at call time.
+
+### Cross-account search
+
+`search_all_accounts` fans a single query out across multiple accounts in parallel (Promise.allSettled), merges results sorted by date, and tags each item with the originating account name. Partial failures are surfaced as `warnings` — a single bad account does not fail the entire call. Omit the `accounts` field to default to every configured account.
+
+```jsonc
+// Find every "Pines Rd" message across all configured accounts
+{
+  "query":    "Pines Rd",
+  "accounts": ["wgs-usa", "all-pedal"],  // optional — defaults to every account
+  "since":    "90d",
+  "facets":   ["sender", "mailbox"]       // `mailbox` facet is re-keyed by account
+}
+```
+
+Each result in the rendered output is prefixed with `[account-name]` so you can see the source, and the response appends a `⚠️ Warnings` block whenever one or more accounts failed.
+
+#### Automatic mailbox aliasing
+
+Different providers expose different folder structures. Gmail's archive is
+`[Gmail]/All Mail`; cPanel Dovecot uses `INBOX.Archive`; Exchange uses yet
+another path. When you call `search_all_accounts(mailbox="INBOX.Archive")`,
+each account's mailbox list is checked, and if the literal folder doesn't
+exist, the server's SPECIAL-USE flags (`\All`, `\Archive`, `\Sent`, `\Trash`,
+`\Drafts`, `\Junk`) are used to find the equivalent folder automatically.
+Remappings are surfaced in the response as `ℹ️` notices so you can see what
+was actually searched. Mailbox lists are cached per-account for 5 minutes to
+avoid re-LISTing on every call.
+
+### Saved searches
+
+Define reusable named filter combinations in `config.toml` under `[[searches]]`. Each preset bundles the same parameter set as `search_emails` and can target a single account (`account = "..."`) or fan out across multiple (`accounts = ["a", "b"]`). Run them via `run_preset`.
+
+```toml
+[[searches]]
+name        = "pines-lease"
+description = "Pines Rd 2024 lease paperwork across WGS USA + All Pedal"
+accounts    = ["wgs-usa", "all-pedal"]    # cross-account; omit for single-account use
+subject     = "Pines Rd"
+since       = "2024-01-01"
+before      = "2025-01-01"
+has_attachment       = true
+attachment_filename  = "lease"
+facets      = ["sender", "year", "mailbox"]
+
+[[searches]]
+name    = "urgent-flagged"
+account = "primary"                        # single-account variant
+flagged = true
+seen    = false
+```
+
+```jsonc
+// Tool call
+{ "name": "pines-lease", "pageSize": 20 }
+```
+
+`list_presets` appends a `📋 Saved searches (from config.toml)` section so the available names are discoverable at runtime.
+
+## Export & Attachment Save
+
+Three tools that write directly to disk under `~/Downloads/` (or a caller-supplied path under `$HOME` / `/tmp`). Every path is validated — attempts to write to `/etc`, `/System`, `/usr/bin`, etc. are rejected, and `..` traversal is stripped.
+
+### `export_search`
+
+Run any `search_emails` / `search_all_accounts` query and stream the result set to a **CSV** or **NDJSON** file. The MCP response carries only a tiny summary (path + row count + truncation flag); the bulk of the data lives on disk, so this bypasses the ~25k-token response cap.
+
+```jsonc
+// Export every Pines Rd message across two accounts to CSV
+{
+  "accounts":    ["wgs-usa", "all-pedal"],
+  "subject":     "Pines Rd",
+  "since":       "2024-01-01",
+  "before":      "2025-01-01",
+  "format":      "csv",
+  "max_rows":    5000,
+  "destination": "/Users/me/Downloads/pines-rd-2024.csv"
+}
+```
+
+Default CSV columns (snake_case headers): `id`, `account`, `date`, `from`, `subject`, `labels`, `attachments`, `has_attachments`, `seen`, `flagged`. Pass `columns` to pick a subset; available columns are `id`, `account`, `date`, `from`, `to`, `subject`, `flags`, `labels`, `attachments`, `preview`, `size`.
+
+- `attachments` serializes as `filename1.pdf|filename2.png`
+- `labels` serializes as `label1|label2`
+- `from` serializes as `"Name <addr@domain>"`
+- All escaping follows RFC 4180 (quote fields containing `",\n\r`, double embedded quotes)
+
+NDJSON mode emits one `JSON.stringify(EmailMeta)` per line — the `columns` parameter is ignored and the full structured record (including attachments array) is dumped.
+
+`max_rows` defaults to 5000 (hard ceiling 50 000). When the underlying match set is larger the file is truncated and the response sets `truncated: true`.
+
+### `save_attachment`
+
+Write a single attachment to disk without the ~5 MB ceiling and base64 hop of `download_attachment`. The file is piped from `imapflow` straight into `fs.createWriteStream` — no intermediate buffer, no MCP-response byte budget.
+
+```jsonc
+// Save a single lease PDF to ~/Downloads
+{
+  "account":    "wgs-usa",
+  "emailId":    "12345",
+  "mailbox":    "INBOX",
+  "filename":   "signed_lease_v7.pdf",
+  "open":       true   // optional — spawns `open <path>` on macOS after save
+}
+```
+
+Contrast:
+
+| | `download_attachment` (legacy) | `save_attachment` (new) |
+|---|---|---|
+| Response payload | base64-encoded bytes | `{ path, size, mimeType }` summary |
+| Size limit | 5 MB | None |
+| MCP token budget | Consumes ~25k tokens for typical PDFs | Constant-size response |
+| Use case | Inline preview, AI analysis | Bulk save, user-facing download |
+
+Auto-collision suffix: if `lease.pdf` exists the tool writes `lease-1.pdf`, `lease-2.pdf`, etc. Pass `overwrite: true` to opt in.
+
+### `save_all_attachments_from_search`
+
+Run a search and sweep every matching attachment into a dated folder. Great for year-end lease-PDF audits, vendor invoice collections, monthly statement exports.
+
+```jsonc
+// Year-end Pines Rd lease-PDF sweep — 2024, across two accounts,
+// filtered to PDFs whose filename mentions "lease", bucketed by month.
+{
+  "accounts":            ["wgs-usa", "all-pedal"],
+  "subject":             "Pines Rd",
+  "since":               "2024-01-01",
+  "before":              "2025-01-01",
+  "attachment_filename": "lease",
+  "attachment_mimetype": "application/pdf",
+  "organize_by":         "date"
+}
+```
+
+`organize_by` controls the subfolder layout under the destination:
+
+- `flat` — all files in a single folder (default)
+- `date` — `YYYY-MM/` buckets based on each email's date
+- `sender` — bucketed by sender domain (e.g. `example.com/`)
+- `account` — bucketed by originating account name (useful for multi-account sweeps)
+
+Default destination is `~/Downloads/email-attachments-<ISO-ts>/`. Per-email errors are collected in `errors[]` rather than aborting the whole run — you get a summary with `files_saved`, `total_size`, `skipped`, and the error list.
+
 ## API
 
-### Tools (47)
+### Tools (52)
 
-#### Read (14)
+#### Read (19)
 
 | Tool | Description |
 |------|-------------|
@@ -655,7 +917,12 @@ Features:
 | `get_emails` | Fetch full content of multiple emails in a single call (max 20) |
 | `get_email_status` | Get read/flag/label state of an email without fetching the body |
 | `search_emails` | Search by keyword across subject, sender, and body |
-| `download_attachment` | Download an email attachment by filename |
+| `search_all_accounts` | Fan a search across multiple accounts in parallel; merges + date-sorts results and tags each with its account |
+| `run_preset` | Run a saved search preset defined under `[[searches]]` in config.toml |
+| `export_search` | Run a search and stream the result set to a CSV or NDJSON file under `~/Downloads/` (bypasses MCP response byte budget) |
+| `download_attachment` | Download an email attachment by filename (base64 in response; ≤5MB) |
+| `save_attachment` | Save an attachment directly to disk — no base64 hop, no size limit |
+| `save_all_attachments_from_search` | Run a search and download every matching attachment into a dated folder (with optional filename/mimetype filter) |
 | `find_email_folder` | Discover the real folder(s) an email resides in (resolves virtual folders) |
 | `extract_contacts` | Extract unique contacts from recent email headers |
 | `get_thread` | Reconstruct a conversation thread via References/In-Reply-To |
@@ -704,7 +971,7 @@ Features:
 | Tool | Description |
 |------|-------------|
 | `get_watcher_status` | Show IMAP IDLE connections, folders being monitored, and last-seen UIDs |
-| `list_presets` | List available AI triage presets with descriptions and suggested labels |
+| `list_presets` | List available AI triage presets AND saved search presets (from `[[searches]]` in config.toml) |
 | `get_hooks_config` | Show current hooks configuration — preset, rules, and custom instructions |
 | `configure_alerts` | Update alert/notification settings at runtime |
 | `check_notification_setup` | Diagnose desktop notification support and provide setup instructions |

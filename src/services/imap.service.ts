@@ -6,9 +6,10 @@
 
 import type { ImapFlow } from 'imapflow';
 import type { IConnectionManager } from '../connections/types.js';
-import { sanitizeMailboxName, sanitizeSearchQuery } from '../safety/validation.js';
+import { sanitizeMailboxName } from '../safety/validation.js';
 import type {
   AttachmentMeta,
+  AttachmentSaveResult,
   BulkResult,
   Contact,
   DailyVolume,
@@ -16,14 +17,75 @@ import type {
   EmailAddress,
   EmailMeta,
   EmailStats,
+  FacetResult,
   LabelInfo,
   Mailbox,
   PaginatedResult,
   QuotaInfo,
   SenderStat,
 } from '../types/index.js';
+import { assertSafeDestination, resolveUniquePath, sanitizeFilename } from './file-paths.js';
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
+import type { MailboxRef } from './mailbox-resolver.js';
+import { resolveMailboxForAccount } from './mailbox-resolver.js';
+import type { SearchParams } from './search-criteria.js';
+import { buildSearchCriteria, chunkUids } from './search-criteria.js';
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+/** Maximum UIDs retained after the server SEARCH before pagination. */
+const MAX_SEARCH_UIDS = 5000;
+
+/** Maximum match-set size for which we'll envelope-fetch to compute facets. */
+const MAX_FACET_UIDS = 10000;
+
+/**
+ * Per-account fetch cap for `searchAcrossAccounts`. Each account is queried
+ * with `page=1` and `pageSize = min(requestedPageSize * 10, 500)` so we have
+ * enough rows to merge + paginate without fetching the full match set.
+ */
+const CROSS_ACCOUNT_MAX_PER_ACCOUNT = 500;
+
+// ---------------------------------------------------------------------------
+// Search option shape — shared between searchEmails / searchAcrossAccounts
+// ---------------------------------------------------------------------------
+
+export interface SearchOptions {
+  mailbox?: string;
+  page?: number;
+  pageSize?: number;
+  to?: string;
+  from?: string;
+  subject?: string;
+  cc?: string;
+  bcc?: string;
+  text?: string;
+  body?: string;
+  since?: string;
+  before?: string;
+  on?: string;
+  sentSince?: string;
+  sentBefore?: string;
+  seen?: boolean;
+  flagged?: boolean;
+  answered?: boolean;
+  draft?: boolean;
+  deleted?: boolean;
+  keyword?: string | string[];
+  notKeyword?: string | string[];
+  header?: Record<string, string>;
+  uids?: number[] | string;
+  hasAttachment?: boolean;
+  largerThan?: number;
+  smallerThan?: number;
+  attachmentFilename?: string;
+  attachmentMimetype?: string;
+  facets?: ('sender' | 'year' | 'mailbox')[];
+  gmailRaw?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers (must be defined before ImapService)
@@ -41,14 +103,86 @@ function parseAddresses(addrs: { name?: string; address?: string }[] | undefined
   return addrs.map(parseAddress);
 }
 
+/**
+ * Walk a bodyStructure tree and collect attachment metadata.
+ *
+ * Rules (all case-insensitive; imapflow emits lowercase type/subtype strings):
+ * - A part with `disposition === 'attachment'` is always an attachment.
+ * - A part with `disposition === 'inline'` AND a Content-ID (`id` field) is
+ *   treated as an embedded inline resource (e.g. HTML image) and skipped.
+ * - A non-multipart, non-text/plain part that carries a filename/name
+ *   parameter but no disposition is also treated as an attachment (some mailers
+ *   omit Content-Disposition for PDFs etc).
+ *
+ * The helper is tolerant to missing fields — imapflow's parsed shape uses
+ * `type` as the combined `type/subtype` string (e.g. `"application/pdf"`),
+ * `dispositionParameters` and `parameters` for filename/name.
+ */
+export function extractAttachmentMeta(bodyStructure: unknown): AttachmentMeta[] {
+  const out: AttachmentMeta[] = [];
+
+  const walk = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return;
+    const n = node as Record<string, unknown>;
+
+    const rawType = typeof n.type === 'string' ? n.type : '';
+    const lowerType = rawType.toLowerCase();
+    const isMultipart = lowerType.startsWith('multipart/');
+
+    // Recurse first so we cover every branch.
+    if (Array.isArray(n.childNodes)) {
+      n.childNodes.forEach((child) => {
+        walk(child);
+      });
+    }
+
+    if (isMultipart) return;
+
+    const disposition = typeof n.disposition === 'string' ? n.disposition.toLowerCase() : undefined;
+    const dispParams = (n.dispositionParameters ?? {}) as Record<string, string>;
+    const typeParams = (n.parameters ?? {}) as Record<string, string>;
+    const filename = dispParams.filename ?? dispParams.name ?? typeParams.name ?? undefined;
+    const contentId = typeof n.id === 'string' ? n.id : undefined;
+
+    // Skip inline resources that have a Content-ID (embedded HTML images).
+    if (disposition === 'inline' && contentId) return;
+
+    let isAttachment = false;
+    if (disposition === 'attachment') {
+      isAttachment = true;
+    } else if (filename) {
+      // No explicit disposition but a filename is present — treat as attachment
+      // unless it's a plain text body.
+      if (lowerType !== 'text/plain' && lowerType !== 'text/html') {
+        isAttachment = true;
+      }
+    }
+
+    if (!isAttachment) return;
+
+    // mimeType — imapflow's `type` is already `"maintype/subtype"`. Fall back
+    // gracefully if only `subtype` is set (older shapes).
+    let mimeType = lowerType;
+    if (!mimeType) {
+      const sub = typeof n.subtype === 'string' ? n.subtype.toLowerCase() : '';
+      mimeType = sub ? `application/${sub}` : 'application/octet-stream';
+    }
+
+    out.push({
+      filename: filename ?? 'unnamed',
+      mimeType,
+      size: typeof n.size === 'number' ? n.size : 0,
+    });
+  };
+
+  walk(bodyStructure);
+  return out;
+}
+
 function hasAttachments(bodyStructure: unknown): boolean {
-  if (!bodyStructure || typeof bodyStructure !== 'object') return false;
-  const bs = bodyStructure as Record<string, unknown>;
-  if (bs.disposition === 'attachment') return true;
-  if (Array.isArray(bs.childNodes)) {
-    return bs.childNodes.some((child: unknown) => hasAttachments(child));
-  }
-  return false;
+  // Delegate to the richer helper so legacy callers (e.g. getEmailStats) use
+  // the same semantics as extractAttachmentMeta / EmailMeta.hasAttachments.
+  return extractAttachmentMeta(bodyStructure).length > 0;
 }
 
 function extractAttachments(bodyStructure: unknown): AttachmentMeta[] {
@@ -125,6 +259,12 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
     }
   }
 
+  // Only populate attachments when bodyStructure was actually fetched. An
+  // undefined value signals "unknown" to downstream callers (e.g. post-filters
+  // should not treat an envelope-only message as definitively attachment-free).
+  const attachments =
+    msg.bodyStructure !== undefined ? extractAttachmentMeta(msg.bodyStructure) : undefined;
+
   return {
     id: String(msg.uid ?? msg.seq),
     subject: (envelope.subject as string) ?? '(no subject)',
@@ -136,9 +276,10 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
     seen: flags.has('\\Seen'),
     flagged: flags.has('\\Flagged'),
     answered: flags.has('\\Answered'),
-    hasAttachments: hasAttachments(msg.bodyStructure),
+    hasAttachments: (attachments?.length ?? 0) > 0,
     labels,
     preview,
+    ...(attachments !== undefined ? { attachments } : {}),
   };
 }
 
@@ -219,7 +360,84 @@ export default class ImapService {
 
   private labelStrategyPending = new Map<string, Promise<LabelStrategy>>();
 
+  /**
+   * Per-account mailbox-list cache keyed by account name. Populated lazily
+   * during `searchAcrossAccounts` fan-out to avoid issuing a `LIST` on every
+   * cross-account call. TTL'd at `MAILBOX_CACHE_TTL_MS`.
+   */
+  private mailboxListCache = new Map<string, { list: MailboxRef[]; expiresAt: number }>();
+
+  private static readonly MAILBOX_CACHE_TTL_MS = 5 * 60 * 1000;
+
+  /**
+   * Structural LIST-response flags we must NOT interpret as SPECIAL-USE.
+   * These describe the mailbox's hierarchy position, not its semantic role.
+   */
+  private static readonly STRUCTURAL_FLAGS = new Set([
+    '\\HasChildren',
+    '\\HasNoChildren',
+    '\\Noselect',
+    '\\Noinferiors',
+    '\\Marked',
+    '\\Unmarked',
+  ]);
+
+  /**
+   * Extract a SPECIAL-USE flag (e.g. `\All`, `\Sent`) from a LIST response's
+   * `flags` field — used as a fallback when the server does not populate
+   * `specialUse` directly (Gmail XLIST, some legacy Dovecot builds).
+   */
+  private static extractSpecialUseFromFlags(flagsRaw: unknown): string | undefined {
+    let candidates: unknown[] = [];
+    if (flagsRaw instanceof Set) {
+      candidates = Array.from(flagsRaw as Set<unknown>);
+    } else if (Array.isArray(flagsRaw)) {
+      candidates = flagsRaw;
+    }
+    const found = candidates.find((f) => {
+      if (typeof f !== 'string') return false;
+      if (!f.startsWith('\\')) return false;
+      return !ImapService.STRUCTURAL_FLAGS.has(f);
+    });
+    return typeof found === 'string' ? found : undefined;
+  }
+
   constructor(private connections: IConnectionManager) {}
+
+  /**
+   * Fetch (and cache) the lightweight mailbox reference list for an account.
+   * Used by `searchAcrossAccounts` to resolve mailbox aliases via SPECIAL-USE
+   * flags without issuing `LIST` on every fan-out call.
+   *
+   * imapflow's `client.list()` exposes `specialUse` as a string when present;
+   * Gmail accounts using XLIST can occasionally surface the flag in `flags`
+   * rather than `specialUse`, so we fall back to scanning `flags` for any
+   * value starting with `\` when `specialUse` is missing.
+   */
+  private async getMailboxList(accountName: string): Promise<MailboxRef[]> {
+    const cached = this.mailboxListCache.get(accountName);
+    if (cached && cached.expiresAt > Date.now()) return cached.list;
+
+    const client = await this.connections.getImapClient(accountName);
+    const raw = await client.list();
+    const list: MailboxRef[] = raw.map((m) => {
+      const rawRecord = m as unknown as Record<string, unknown>;
+      if (typeof rawRecord.specialUse === 'string') {
+        return { path: m.path, specialUse: rawRecord.specialUse };
+      }
+      // Fall back to scanning `flags` for a backslash-prefixed SPECIAL-USE
+      // flag — covers Gmail XLIST and a few older servers that report the
+      // flag in `flags` rather than `specialUse`.
+      const specialUse = ImapService.extractSpecialUseFromFlags(rawRecord.flags);
+      return { path: m.path, specialUse };
+    });
+
+    this.mailboxListCache.set(accountName, {
+      list,
+      expiresAt: Date.now() + ImapService.MAILBOX_CACHE_TTL_MS,
+    });
+    return list;
+  }
 
   private async getLabelStrategy(accountName: string): Promise<LabelStrategy> {
     const cached = this.labelStrategies.get(accountName);
@@ -291,6 +509,7 @@ export default class ImapService {
       mailbox?: string;
       page?: number;
       pageSize?: number;
+      // Legacy (unchanged) filters — still camelCase:
       since?: string;
       before?: string;
       from?: string;
@@ -299,73 +518,92 @@ export default class ImapService {
       flagged?: boolean;
       hasAttachment?: boolean;
       answered?: boolean;
+      // Power Search additions (PR 1 phase A):
+      to?: string;
+      on?: string;
+      sentSince?: string;
+      sentBefore?: string;
+      cc?: string;
+      bcc?: string;
+      text?: string;
+      body?: string;
+      draft?: boolean;
+      deleted?: boolean;
+      keyword?: string | string[];
+      notKeyword?: string | string[];
+      header?: Record<string, string>;
+      uids?: number[] | string;
+      largerThan?: number;
+      smallerThan?: number;
+      gmailRaw?: string;
+      // PR 2 phase E additions:
+      attachmentFilename?: string;
+      attachmentMimetype?: string;
     } = {},
   ): Promise<PaginatedResult<EmailMeta>> {
     const client = await this.connections.getImapClient(accountName);
+    const account = this.connections.getAccount(accountName);
+    const isGmail = account.imap.host === 'imap.gmail.com';
     const mailbox = sanitizeMailboxName(options.mailbox ?? 'INBOX');
     const page = options.page ?? 1;
     const pageSize = options.pageSize ?? 20;
 
     const lock = await client.getMailboxLock(mailbox);
     try {
-      // Build search criteria
-      const search: Record<string, unknown> = {};
-      if (options.since) search.since = new Date(options.since);
-      if (options.before) search.before = new Date(options.before);
-      if (options.from) search.from = options.from;
-      if (options.subject) search.subject = options.subject;
-      if (options.seen !== undefined) search.seen = options.seen;
-      if (options.flagged !== undefined) search.flagged = options.flagged;
-      if (options.answered !== undefined) search.answered = options.answered;
+      const { criteria, postFilters, warnings } = buildSearchCriteria(options as SearchParams, {
+        isGmail,
+      });
 
-      // Search for matching UIDs
-      const searchResult = await client.search(search, { uid: true });
+      const searchResult = await client.search(criteria, { uid: true });
       let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      let totalApprox = false;
 
-      // Post-filter for hasAttachment (IMAP has no native attachment search)
-      if (options.hasAttachment !== undefined && uids.length > 0) {
-        const filteredUids: number[] = [];
-        // eslint-disable-next-line no-restricted-syntax
-        for await (const msg of client.fetch(
-          uids.join(','),
-          { uid: true, bodyStructure: true },
-          { uid: true },
-        )) {
-          const raw = msg as unknown as Record<string, unknown>;
-          if (options.hasAttachment === hasAttachments(raw.bodyStructure)) {
-            filteredUids.push(raw.uid as number);
-          }
-        }
-        uids = filteredUids;
+      // Cap pre-pagination UIDs so huge folders don't balloon later work.
+      if (uids.length > MAX_SEARCH_UIDS) {
+        const originalCount = uids.length;
+        uids.sort((a, b) => b - a);
+        uids = uids.slice(0, MAX_SEARCH_UIDS);
+        totalApprox = true;
+        warnings.push(
+          `Truncated to ${MAX_SEARCH_UIDS} of ${originalCount} matches — narrow the query with more filters`,
+        );
       }
 
       if (uids.length === 0) {
+        const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
         return {
           items: [],
           total: 0,
           page,
           pageSize,
           hasMore: false,
+          ...(warning ? { warning } : {}),
+          ...(totalApprox ? { totalApprox } : {}),
         };
       }
 
-      // Sort descending (newest first) and paginate
+      // Sort descending (newest first) and paginate FIRST — the hasAttachment
+      // post-filter is applied only to the current page to avoid fetching
+      // bodyStructure for tens of thousands of messages on huge folders.
       uids.sort((a, b) => b - a);
       const total = uids.length;
       const start = (page - 1) * pageSize;
       const pageUids = uids.slice(start, start + pageSize);
 
       if (pageUids.length === 0) {
+        const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
         return {
           items: [],
           total,
           page,
           pageSize,
           hasMore: false,
+          ...(warning ? { warning } : {}),
+          ...(totalApprox ? { totalApprox } : {}),
         };
       }
 
-      const items: EmailMeta[] = [];
+      let items: EmailMeta[] = [];
       const range = pageUids.join(',');
 
       // eslint-disable-next-line no-restricted-syntax
@@ -383,15 +621,54 @@ export default class ImapService {
         items.push(messageToEmailMeta(msg as unknown as Record<string, unknown>));
       }
 
+      // Post-pagination hasAttachment filter. If it trims this page, we simply
+      // serve fewer items for the page and mark totalApprox=true — PR 1 keeps
+      // it simple; we do not backfill from later UIDs.
+      if (postFilters.hasAttachment !== undefined) {
+        const want = postFilters.hasAttachment;
+        items = items.filter((m) => m.hasAttachments === want);
+        if (items.length !== pageUids.length) {
+          totalApprox = true;
+        }
+      }
+
+      // PR 2 Phase E — attachment filename / mimetype post-filters.
+      if (postFilters.attachmentFilename) {
+        const needle = postFilters.attachmentFilename.toLowerCase();
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => a.filename.toLowerCase().includes(needle));
+        });
+        if (items.length !== pageUids.length) totalApprox = true;
+      }
+      if (postFilters.attachmentMimetype) {
+        let re: RegExp;
+        try {
+          re = new RegExp(postFilters.attachmentMimetype, 'i');
+        } catch (err) {
+          throw new Error(
+            `Invalid attachment_mimetype pattern: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => re.test(a.mimeType));
+        });
+        if (items.length !== pageUids.length) totalApprox = true;
+      }
+
       // Sort by date descending
       items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
+      const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
       return {
         items,
         total,
         page,
         pageSize,
         hasMore: start + pageSize < total,
+        ...(warning ? { warning } : {}),
+        ...(totalApprox ? { totalApprox } : {}),
       };
     } finally {
       lock.release();
@@ -500,79 +777,76 @@ export default class ImapService {
       mailbox?: string;
       page?: number;
       pageSize?: number;
+      // Legacy (unchanged) filters — camelCase:
       to?: string;
       hasAttachment?: boolean;
       largerThan?: number;
       smallerThan?: number;
       answered?: boolean;
+      // Power Search additions (PR 1 phase A):
+      from?: string;
+      subject?: string;
+      cc?: string;
+      bcc?: string;
+      text?: string;
+      body?: string;
+      since?: string;
+      before?: string;
+      on?: string;
+      sentSince?: string;
+      sentBefore?: string;
+      seen?: boolean;
+      flagged?: boolean;
+      draft?: boolean;
+      deleted?: boolean;
+      keyword?: string | string[];
+      notKeyword?: string | string[];
+      header?: Record<string, string>;
+      uids?: number[] | string;
+      gmailRaw?: string;
+      // PR 2 phase E additions:
+      attachmentFilename?: string;
+      attachmentMimetype?: string;
+      // PR 2 phase G additions:
+      facets?: ('sender' | 'year' | 'mailbox')[];
     } = {},
   ): Promise<PaginatedResult<EmailMeta>> {
     const client = await this.connections.getImapClient(accountName);
+    const account = this.connections.getAccount(accountName);
+    const isGmail = account.imap.host === 'imap.gmail.com';
     const mailbox = sanitizeMailboxName(options.mailbox ?? 'INBOX');
     const page = options.page ?? 1;
     const pageSize = options.pageSize ?? 20;
-    const sanitizedQuery = query ? sanitizeSearchQuery(query) : '';
 
     const lock = await client.getMailboxLock(mailbox);
     try {
-      // Build search criteria — base query OR across subject/from/body
-      const baseCriteria: Record<string, unknown> = sanitizedQuery
-        ? { or: [{ subject: sanitizedQuery }, { from: sanitizedQuery }, { body: sanitizedQuery }] }
-        : {};
+      const params: SearchParams = { ...(options as SearchParams), query };
+      const { criteria, postFilters, warnings } = buildSearchCriteria(params, { isGmail });
 
-      // Build additional filters as AND conditions
-      const andConditions: Record<string, unknown>[] = [baseCriteria];
-
-      if (options.to) {
-        andConditions.push({ to: options.to });
-      }
-      if (options.largerThan !== undefined) {
-        andConditions.push({ larger: options.largerThan * 1024 });
-      }
-      if (options.smallerThan !== undefined) {
-        andConditions.push({ smaller: options.smallerThan * 1024 });
-      }
-      if (options.answered === true) {
-        andConditions.push({ answered: true });
-      } else if (options.answered === false) {
-        andConditions.push({ answered: false });
-      }
-
-      // Use the combined criteria or just the base
-      const searchCriteria =
-        andConditions.length === 1 ? baseCriteria : Object.assign({}, ...andConditions);
-
-      const searchResult = await client.search(searchCriteria, { uid: true });
+      const searchResult = await client.search(criteria, { uid: true });
       let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      let totalApprox = false;
 
-      // Post-filter for has_attachment if requested (IMAP doesn't have native support)
-      if (options.hasAttachment !== undefined && uids.length > 0) {
-        const filteredUids: number[] = [];
-        const checkRange = uids.join(',');
-
-        // eslint-disable-next-line no-restricted-syntax
-        for await (const msg of client.fetch(
-          checkRange,
-          { uid: true, bodyStructure: true },
-          { uid: true },
-        )) {
-          const raw = msg as unknown as Record<string, unknown>;
-          const msgHasAtt = hasAttachments(raw.bodyStructure);
-          if (options.hasAttachment === msgHasAtt) {
-            filteredUids.push(raw.uid as number);
-          }
-        }
-
-        uids = filteredUids;
+      if (uids.length > MAX_SEARCH_UIDS) {
+        const originalCount = uids.length;
+        uids.sort((a, b) => b - a);
+        uids = uids.slice(0, MAX_SEARCH_UIDS);
+        totalApprox = true;
+        warnings.push(
+          `Truncated to ${MAX_SEARCH_UIDS} of ${originalCount} matches — narrow the query with more filters`,
+        );
       }
 
       if (uids.length === 0) {
+        const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
         return {
           items: [],
           total: 0,
           page,
           pageSize,
           hasMore: false,
+          ...(warning ? { warning } : {}),
+          ...(totalApprox ? { totalApprox } : {}),
         };
       }
 
@@ -581,17 +855,34 @@ export default class ImapService {
       const start = (page - 1) * pageSize;
       const pageUids = uids.slice(start, start + pageSize);
 
+      // PR 2 Phase G — faceted counts across the full (post-cap) UID set.
+      // Skip when the match set is too large to envelope-fetch efficiently.
+      let facets: FacetResult | undefined;
+      if (postFilters.facets && postFilters.facets.length > 0) {
+        if (uids.length > MAX_FACET_UIDS) {
+          warnings.push(
+            `Facets skipped — match set (${uids.length}) exceeds ${MAX_FACET_UIDS}. Add more filters to enable facets.`,
+          );
+        } else {
+          facets = await ImapService.computeFacets(client, uids, postFilters.facets, mailbox);
+        }
+      }
+
       if (pageUids.length === 0) {
+        const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
         return {
           items: [],
           total,
           page,
           pageSize,
           hasMore: false,
+          ...(warning ? { warning } : {}),
+          ...(totalApprox ? { totalApprox } : {}),
+          ...(facets ? { facets } : {}),
         };
       }
 
-      const items: EmailMeta[] = [];
+      let items: EmailMeta[] = [];
       const range = pageUids.join(',');
 
       // eslint-disable-next-line no-restricted-syntax
@@ -609,18 +900,332 @@ export default class ImapService {
         items.push(messageToEmailMeta(msg as unknown as Record<string, unknown>));
       }
 
+      // Post-pagination hasAttachment filter — applied only to the current page.
+      // If filter trims items, we simply serve fewer results and mark totalApprox.
+      if (postFilters.hasAttachment !== undefined) {
+        const want = postFilters.hasAttachment;
+        items = items.filter((m) => m.hasAttachments === want);
+        if (items.length !== pageUids.length) {
+          totalApprox = true;
+        }
+      }
+
+      // PR 2 Phase E — attachment filename / mimetype post-filters.
+      if (postFilters.attachmentFilename) {
+        const needle = postFilters.attachmentFilename.toLowerCase();
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => a.filename.toLowerCase().includes(needle));
+        });
+        if (items.length !== pageUids.length) totalApprox = true;
+      }
+      if (postFilters.attachmentMimetype) {
+        let re: RegExp;
+        try {
+          re = new RegExp(postFilters.attachmentMimetype, 'i');
+        } catch (err) {
+          throw new Error(
+            `Invalid attachment_mimetype pattern: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => re.test(a.mimeType));
+        });
+        if (items.length !== pageUids.length) totalApprox = true;
+      }
+
       items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
 
+      const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
       return {
         items,
         total,
         page,
         pageSize,
         hasMore: start + pageSize < total,
+        ...(warning ? { warning } : {}),
+        ...(totalApprox ? { totalApprox } : {}),
+        ...(facets ? { facets } : {}),
       };
     } finally {
       lock.release();
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Cross-account search
+  // -------------------------------------------------------------------------
+
+  /**
+   * Fan-out search across multiple accounts. Executes `searchEmails` in
+   * parallel against every account, merges the per-account pages into a
+   * single date-sorted list, and paginates the merged result.
+   *
+   * Each returned item is stamped with `.account` so callers can tell
+   * where a match came from. Facet maps are unioned across accounts; the
+   * `mailbox` facet is re-keyed to the account name so the caller gets an
+   * account-level breakdown rather than a single `INBOX` bucket.
+   *
+   * Partial failures are surfaced as `warnings[]` without failing the
+   * whole call. If *every* account fails, throws a summary error.
+   */
+  async searchAcrossAccounts(
+    accountNames: string[],
+    query: string,
+    options: SearchOptions = {},
+  ): Promise<PaginatedResult<EmailMeta> & { warnings?: { account: string; error: string }[] }> {
+    if (accountNames.length === 0) {
+      throw new Error('searchAcrossAccounts requires at least one account name');
+    }
+
+    const page = options.page ?? 1;
+    const pageSize = options.pageSize ?? 20;
+
+    // Cap per-account fetch so large pageSize requests don't balloon into full
+    // mailbox scans, but always fetch enough to feed the merged pagination.
+    const perAccountPageSize = Math.min(pageSize * 10, CROSS_ACCOUNT_MAX_PER_ACCOUNT);
+
+    const requestedMailbox = options.mailbox;
+    // INBOX is universal across providers — skip the remap preflight entirely.
+    const needsRemapCheck =
+      typeof requestedMailbox === 'string' &&
+      requestedMailbox.length > 0 &&
+      requestedMailbox.toUpperCase() !== 'INBOX';
+
+    // Pre-flight each account: either resolve a real mailbox path or record a
+    // warning and skip. We collect `remapNotices` separately so they surface
+    // as informational (ℹ️) entries in the warnings array while hard skips
+    // land as ⚠️ entries.
+    const warnings: { account: string; error: string }[] = [];
+    const remapNotices: { account: string; error: string }[] = [];
+    // Name of each account that actually participates in the fan-out, paired
+    // with the per-account search options (remapped mailbox if applicable).
+    const participants: { name: string; options: SearchOptions }[] = [];
+
+    if (needsRemapCheck && typeof requestedMailbox === 'string') {
+      // Resolve sequentially per account; each underlying LIST is cached so
+      // repeat calls within the TTL are free. We do this sequentially to keep
+      // the cache warm deterministically and to bound concurrency on LIST.
+      // eslint-disable-next-line no-restricted-syntax
+      for (const name of accountNames) {
+        // eslint-disable-next-line no-await-in-loop
+        const list = await this.getMailboxList(name).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          warnings.push({
+            account: name,
+            error: `Could not list mailboxes to resolve "${requestedMailbox}": ${msg}`,
+          });
+          return null;
+        });
+
+        if (list !== null) {
+          const resolved = resolveMailboxForAccount(requestedMailbox, list);
+          if (resolved.resolved === null) {
+            warnings.push({
+              account: name,
+              error: `Mailbox "${requestedMailbox}" not found on this account and no equivalent folder by SPECIAL-USE flag; skipped.`,
+            });
+          } else {
+            if (resolved.remapped) {
+              remapNotices.push({
+                account: name,
+                error: `ℹ️ Remapped "${requestedMailbox}" → "${resolved.resolved}" via ${resolved.specialUse ?? '(special-use)'} flag.`,
+              });
+            }
+            participants.push({
+              name,
+              options: {
+                ...options,
+                mailbox: resolved.resolved,
+                page: 1,
+                pageSize: perAccountPageSize,
+              },
+            });
+          }
+        }
+      }
+    } else {
+      // No remap needed — every account participates as-is.
+      accountNames.forEach((name) => {
+        participants.push({
+          name,
+          options: {
+            ...options,
+            page: 1,
+            pageSize: perAccountPageSize,
+          },
+        });
+      });
+    }
+
+    // If the preflight skipped every account (none had a literal match AND
+    // none had a SPECIAL-USE equivalent AND no LIST succeeded), surface a
+    // summary error — mirrors the "all accounts failed" path below.
+    if (participants.length === 0) {
+      const summary = warnings.map((w) => `${w.account}: ${w.error}`).join('; ');
+      throw new Error(`All ${accountNames.length} accounts failed: ${summary}`);
+    }
+
+    const settled = await Promise.allSettled(
+      participants.map(async (p) => this.searchEmails(p.name, query, p.options)),
+    );
+
+    const perAccountWarnings: string[] = [];
+    let totalAcross = 0;
+    let totalApprox = false;
+    // Pre-allocate facet buckets so we avoid assignment-in-expression inside
+    // the reduce loop. We strip empty buckets from the returned payload at
+    // the end of the function.
+    const facetSender: Record<string, number> = {};
+    const facetYear: Record<string, number> = {};
+    const facetMailbox: Record<string, number> = {};
+    let anySender = false;
+    let anyYear = false;
+    let anyMailbox = false;
+    const collectedItems: EmailMeta[] = [];
+
+    settled.forEach((outcome, idx) => {
+      const { name } = participants[idx];
+      if (outcome.status === 'rejected') {
+        const err = outcome.reason as unknown;
+        warnings.push({
+          account: name,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+
+      const res = outcome.value;
+
+      // Stamp every item with its account so downstream callers know where
+      // the match came from.
+      res.items.forEach((item) => {
+        collectedItems.push({ ...item, account: name });
+      });
+
+      totalAcross += res.total;
+      if (res.totalApprox) totalApprox = true;
+      if (res.warning) perAccountWarnings.push(`${name}: ${res.warning}`);
+
+      if (res.facets) {
+        if (res.facets.sender) {
+          anySender = true;
+          Object.entries(res.facets.sender).forEach(([k, v]) => {
+            facetSender[k] = (facetSender[k] ?? 0) + v;
+          });
+        }
+        if (res.facets.year) {
+          anyYear = true;
+          Object.entries(res.facets.year).forEach(([k, v]) => {
+            facetYear[k] = (facetYear[k] ?? 0) + v;
+          });
+        }
+        if (res.facets.mailbox) {
+          // Re-key the mailbox facet by account — cross-account callers want
+          // to see the per-account breakdown, not a single "INBOX" bucket.
+          anyMailbox = true;
+          const sum = Object.values(res.facets.mailbox).reduce((a, b) => a + b, 0);
+          facetMailbox[name] = (facetMailbox[name] ?? 0) + sum;
+        }
+      }
+    });
+
+    // If every account failed (preflight skip + hard search failure combined),
+    // surface a summary error — callers expect a throw rather than an empty
+    // page for total failure. Remap notices don't count as failures here.
+    if (warnings.length === accountNames.length) {
+      const summary = warnings.map((w) => `${w.account}: ${w.error}`).join('; ');
+      throw new Error(`All ${accountNames.length} accounts failed: ${summary}`);
+    }
+
+    // Merge + paginate the collected items.
+    collectedItems.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    const start = (page - 1) * pageSize;
+    const items = collectedItems.slice(start, start + pageSize);
+
+    const warningBits: string[] = [];
+    if (perAccountWarnings.length > 0) warningBits.push(perAccountWarnings.join(' | '));
+    if (warnings.length > 0) {
+      warningBits.push(
+        `${warnings.length} of ${accountNames.length} account(s) failed: ${warnings
+          .map((w) => `${w.account} (${w.error})`)
+          .join(', ')}`,
+      );
+    }
+    const warning = warningBits.length > 0 ? warningBits.join('; ') : undefined;
+
+    let facetsPresent: FacetResult | undefined;
+    if (anySender || anyYear || anyMailbox) {
+      facetsPresent = {};
+      if (anySender) facetsPresent.sender = facetSender;
+      if (anyYear) facetsPresent.year = facetYear;
+      if (anyMailbox) facetsPresent.mailbox = facetMailbox;
+    }
+
+    // Merge remap notices (ℹ️) and hard warnings (⚠️-prefixed by convention)
+    // into a single warnings[] for backward compatibility. Remap notices carry
+    // the ℹ️ prefix in their `error` field; the tool layer splits on that.
+    const mergedWarnings = [...warnings, ...remapNotices];
+
+    return {
+      items,
+      total: totalAcross,
+      page,
+      pageSize,
+      hasMore: start + pageSize < collectedItems.length,
+      ...(warning ? { warning } : {}),
+      ...(totalApprox ? { totalApprox } : {}),
+      ...(facetsPresent ? { facets: facetsPresent } : {}),
+      ...(mergedWarnings.length > 0 ? { warnings: mergedWarnings } : {}),
+    };
+  }
+
+  // -------------------------------------------------------------------------
+  // Faceted counts — envelope-only chunk fetch used by searchEmails
+  // -------------------------------------------------------------------------
+
+  private static async computeFacets(
+    client: ImapFlow,
+    uids: number[],
+    wanted: ('sender' | 'year' | 'mailbox')[],
+    mailbox: string,
+  ): Promise<FacetResult> {
+    const result: FacetResult = {};
+    if (wanted.includes('sender')) result.sender = {};
+    if (wanted.includes('year')) result.year = {};
+    if (wanted.includes('mailbox')) result.mailbox = { [mailbox]: uids.length };
+
+    // No envelope scan required if only mailbox was requested.
+    if (!wanted.includes('sender') && !wanted.includes('year')) return result;
+
+    const CHUNK = 500;
+    const chunks = chunkUids(uids, CHUNK);
+    // eslint-disable-next-line no-restricted-syntax
+    for (const chunk of chunks) {
+      const range = chunk.join(',');
+      // eslint-disable-next-line no-restricted-syntax, no-await-in-loop
+      for await (const msg of client.fetch(range, { uid: true, envelope: true }, { uid: true })) {
+        const raw = msg as unknown as Record<string, unknown>;
+        const env = (raw.envelope ?? {}) as Record<string, unknown>;
+        if (result.sender) {
+          const fromEntry = (env.from as Record<string, string>[] | undefined)?.[0];
+          if (fromEntry?.address) {
+            const key = fromEntry.address.toLowerCase();
+            result.sender[key] = (result.sender[key] ?? 0) + 1;
+          }
+        }
+        if (result.year && env.date) {
+          const yr = new Date(env.date as string).getFullYear();
+          if (!Number.isNaN(yr)) {
+            const k = String(yr);
+            result.year[k] = (result.year[k] ?? 0) + 1;
+          }
+        }
+      }
+    }
+
+    return result;
   }
 
   // -------------------------------------------------------------------------
@@ -1861,5 +2466,396 @@ export default class ImapService {
     }
 
     return parts;
+  }
+
+  // -------------------------------------------------------------------------
+  // Buffered search for export / bulk-attachment-save (PR 4)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Buffered search for the export / bulk-attachment-save tools.
+   *
+   * Runs a single-account or cross-account search and returns up to `maxRows`
+   * `EmailMeta` items. Unlike `searchEmails` / `searchAcrossAccounts` (which
+   * paginate at 100/page max), this caps at 50_000 rows — well within memory
+   * for an enveloped `EmailMeta`.
+   *
+   * - Single-account mode: pass `accountName`, leave `accountNames=null`.
+   *   Runs IMAP SEARCH once, then fetches envelopes in chunks of 100.
+   * - Multi-account mode: pass `accountNames` (non-null), leave
+   *   `accountName=null`. Fans out to per-account `searchForExport` calls and
+   *   merges by date. Each item is stamped with `.account`.
+   *
+   * Returns `{ items, truncated }` where `truncated=true` means the underlying
+   * match set exceeded `maxRows` and rows were dropped.
+   */
+  async searchForExport(
+    accountNames: string[] | null,
+    accountName: string | null,
+    query: string,
+    options: SearchOptions & { maxRows: number },
+  ): Promise<{ items: EmailMeta[]; truncated: boolean }> {
+    const { maxRows, ...searchOpts } = options;
+
+    // ------------------------------------------------------------------
+    // Multi-account — delegate per account and merge
+    // ------------------------------------------------------------------
+    if (accountNames !== null) {
+      if (accountNames.length === 0) {
+        throw new Error('searchForExport requires at least one account name');
+      }
+      const perAccountCap = maxRows; // let each account contribute up to maxRows
+      const settled = await Promise.allSettled(
+        accountNames.map(async (name) => {
+          const r = await this.searchForExport(null, name, query, {
+            ...searchOpts,
+            maxRows: perAccountCap,
+          });
+          return r;
+        }),
+      );
+
+      let merged: EmailMeta[] = [];
+      let anyTruncated = false;
+      settled.forEach((outcome, idx) => {
+        if (outcome.status === 'fulfilled') {
+          const name = accountNames[idx];
+          outcome.value.items.forEach((m) => {
+            merged.push({ ...m, account: name });
+          });
+          if (outcome.value.truncated) anyTruncated = true;
+        }
+      });
+      merged.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
+      if (merged.length > maxRows) {
+        merged = merged.slice(0, maxRows);
+        anyTruncated = true;
+      }
+      return { items: merged, truncated: anyTruncated };
+    }
+
+    // ------------------------------------------------------------------
+    // Single-account — one IMAP SEARCH, chunked envelope fetch
+    // ------------------------------------------------------------------
+    if (accountName === null) {
+      throw new Error(
+        'searchForExport requires either accountNames (multi) or accountName (single)',
+      );
+    }
+    const client = await this.connections.getImapClient(accountName);
+    const account = this.connections.getAccount(accountName);
+    const isGmail = account.imap.host === 'imap.gmail.com';
+    const mailbox = sanitizeMailboxName(searchOpts.mailbox ?? 'INBOX');
+
+    const lock = await client.getMailboxLock(mailbox);
+    try {
+      const params: SearchParams = { ...(searchOpts as SearchParams), query };
+      const { criteria, postFilters } = buildSearchCriteria(params, { isGmail });
+      const searchResult = await client.search(criteria, { uid: true });
+      let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      let truncated = false;
+
+      if (uids.length === 0) {
+        return { items: [], truncated: false };
+      }
+
+      uids.sort((a, b) => b - a);
+
+      if (uids.length > maxRows) {
+        uids = uids.slice(0, maxRows);
+        truncated = true;
+      }
+
+      let items: EmailMeta[] = [];
+      const chunks = chunkUids(uids, 100);
+      /* eslint-disable no-restricted-syntax, no-await-in-loop */
+      for (const chunk of chunks) {
+        const range = chunk.join(',');
+        for await (const msg of client.fetch(
+          range,
+          {
+            uid: true,
+            envelope: true,
+            flags: true,
+            bodyStructure: true,
+            source: { start: 0, maxLength: 256 },
+          },
+          { uid: true },
+        )) {
+          items.push(messageToEmailMeta(msg as unknown as Record<string, unknown>));
+        }
+      }
+      /* eslint-enable no-restricted-syntax, no-await-in-loop */
+
+      // Apply post-pagination filters (hasAttachment / attachment_filename /
+      // attachment_mimetype) to the full buffered set — these are cheap in
+      // memory since we already have bodyStructure-derived `attachments`.
+      if (postFilters.hasAttachment !== undefined) {
+        const want = postFilters.hasAttachment;
+        items = items.filter((m) => m.hasAttachments === want);
+      }
+      if (postFilters.attachmentFilename) {
+        const needle = postFilters.attachmentFilename.toLowerCase();
+        items = items.filter((m) => {
+          const atts = m.attachments ?? [];
+          return atts.some((a) => a.filename.toLowerCase().includes(needle));
+        });
+      }
+      if (postFilters.attachmentMimetype) {
+        let re: RegExp;
+        try {
+          re = new RegExp(postFilters.attachmentMimetype, 'i');
+        } catch (err) {
+          throw new Error(
+            `Invalid attachment_mimetype pattern: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+        items = items.filter((m) => (m.attachments ?? []).some((a) => re.test(a.mimeType)));
+      }
+
+      items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      return { items, truncated };
+    } finally {
+      lock.release();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Direct-to-disk attachment save (PR 4)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Save a single attachment directly to disk, streaming from imapflow into
+   * `fs.createWriteStream` — no base64 hop, no MCP-response byte budget, no
+   * 5 MB ceiling.
+   *
+   * `destination` may be:
+   *   - an absolute file path (e.g. `/Users/me/Downloads/lease.pdf`)
+   *   - an absolute directory (e.g. `/Users/me/Downloads`) — the attachment's
+   *     original filename is appended.
+   *
+   * Throws if the resolved destination is outside `$HOME` or `/tmp`.
+   */
+  async saveAttachmentToDisk(
+    accountName: string,
+    emailId: string,
+    mailbox: string,
+    filename: string,
+    destination: string,
+    overwrite = false,
+  ): Promise<AttachmentSaveResult> {
+    const { createWriteStream } = await import('node:fs');
+    const { mkdir, stat } = await import('node:fs/promises');
+    const { dirname, join } = await import('node:path');
+    const { pipeline } = await import('node:stream/promises');
+
+    // Resolve target — directory vs file path
+    assertSafeDestination(destination);
+    let targetPath: string;
+    try {
+      const info = await stat(destination);
+      if (info.isDirectory()) {
+        targetPath = join(destination, sanitizeFilename(filename));
+      } else {
+        targetPath = destination;
+      }
+    } catch {
+      // Destination doesn't exist yet — treat as a file path.
+      targetPath = destination;
+    }
+    // Re-check the final resolved path (defense in depth — the file component
+    // is user-supplied and could include `..` in theory).
+    assertSafeDestination(targetPath);
+
+    // Auto-collision suffix when overwrite=false.
+    const finalPath = await resolveUniquePath(targetPath, overwrite);
+    await mkdir(dirname(finalPath), { recursive: true });
+
+    const client = await this.connections.getImapClient(accountName);
+    const uid = parseInt(emailId, 10);
+    const safeMailbox = sanitizeMailboxName(mailbox);
+
+    const lock = await client.getMailboxLock(safeMailbox);
+    try {
+      const msg = await client.fetchOne(
+        String(uid),
+        { uid: true, bodyStructure: true },
+        { uid: true },
+      );
+      if (!msg) {
+        throw new Error(`Email ${emailId} not found in ${mailbox}`);
+      }
+
+      const attachments = extractAttachmentMeta(msg.bodyStructure);
+      const attachment = attachments.find((a) => a.filename === filename);
+      if (!attachment) {
+        throw new Error(
+          `Attachment "${filename}" not found. Available: ${
+            attachments.map((a) => a.filename).join(', ') || 'none'
+          }`,
+        );
+      }
+
+      const partNumber = findMimePartByFilename(msg.bodyStructure, filename);
+      if (!partNumber) {
+        throw new Error(`Could not locate MIME part for "${filename}"`);
+      }
+
+      const downloadResult = await client.download(String(uid), partNumber, { uid: true });
+      if (!downloadResult?.content) {
+        throw new Error(`Failed to download attachment "${filename}"`);
+      }
+
+      const ws = createWriteStream(finalPath);
+      await pipeline(downloadResult.content, ws);
+
+      const written = await stat(finalPath);
+      return {
+        path: finalPath,
+        size: written.size,
+        mimeType: attachment.mimeType,
+      };
+    } finally {
+      lock.release();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Batch attachment save — run a search and sweep every matching attachment
+  // -------------------------------------------------------------------------
+
+  /**
+   * Run `searchForExport` with the given filters and download every
+   * matching attachment into `destinationFolder`, optionally bucketed by
+   * date / sender / account. Designed for "year-end lease-PDF sweep" style
+   * batch exports.
+   *
+   * Filename / MIME-type filters narrow *which* attachments to save; emails
+   * without any qualifying attachment are skipped. Per-email errors are
+   * collected and returned rather than aborting the whole run.
+   */
+  async saveAllAttachmentsFromSearch(input: {
+    accountNames: string[] | null;
+    accountName: string | null;
+    query: string;
+    searchOptions: SearchOptions;
+    maxEmails: number;
+    destinationFolder: string;
+    organizeBy: 'flat' | 'date' | 'sender' | 'account';
+    attachmentFilename?: string;
+    attachmentMimetype?: string;
+  }): Promise<{
+    folder: string;
+    files_saved: number;
+    total_size: number;
+    skipped: number;
+    errors: { emailId: string; filename: string; error: string }[];
+  }> {
+    const { mkdir } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+
+    assertSafeDestination(input.destinationFolder);
+    await mkdir(input.destinationFolder, { recursive: true });
+
+    const { items } = await this.searchForExport(
+      input.accountNames,
+      input.accountName,
+      input.query,
+      { ...input.searchOptions, maxRows: input.maxEmails },
+    );
+
+    // Optional filters for *which* attachments to save.
+    const nameNeedle = input.attachmentFilename?.toLowerCase();
+    let mimeRe: RegExp | undefined;
+    if (input.attachmentMimetype) {
+      try {
+        mimeRe = new RegExp(input.attachmentMimetype, 'i');
+      } catch (err) {
+        throw new Error(
+          `Invalid attachment_mimetype pattern: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    let filesSaved = 0;
+    let totalSize = 0;
+    let skipped = 0;
+    const errors: { emailId: string; filename: string; error: string }[] = [];
+
+    /* eslint-disable no-restricted-syntax, no-await-in-loop */
+    for (const email of items) {
+      const atts = email.attachments ?? [];
+      const qualifying = atts.filter((a) => {
+        if (nameNeedle && !a.filename.toLowerCase().includes(nameNeedle)) return false;
+        if (mimeRe && !mimeRe.test(a.mimeType)) return false;
+        return true;
+      });
+
+      if (qualifying.length === 0) {
+        skipped += 1;
+      } else {
+        // Per-email account resolution — in cross-account mode EmailMeta
+        // carries `.account`; in single-account mode we use the provided
+        // accountName.
+        const accountForEmail = email.account ?? input.accountName;
+        if (!accountForEmail) {
+          errors.push({
+            emailId: email.id,
+            filename: '(n/a)',
+            error: 'Could not determine account for email',
+          });
+        } else {
+          // Subfolder strategy
+          let subfolder = input.destinationFolder;
+          if (input.organizeBy === 'date') {
+            const d = new Date(email.date);
+            const ym = Number.isNaN(d.getTime())
+              ? 'unknown-date'
+              : `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+            subfolder = join(input.destinationFolder, ym);
+          } else if (input.organizeBy === 'sender') {
+            const domain = email.from.address.includes('@')
+              ? (email.from.address.split('@')[1] ?? 'unknown-sender')
+              : 'unknown-sender';
+            subfolder = join(input.destinationFolder, sanitizeFilename(domain));
+          } else if (input.organizeBy === 'account') {
+            subfolder = join(input.destinationFolder, sanitizeFilename(accountForEmail));
+          }
+
+          await mkdir(subfolder, { recursive: true });
+
+          for (const att of qualifying) {
+            try {
+              const saved = await this.saveAttachmentToDisk(
+                accountForEmail,
+                email.id,
+                input.searchOptions.mailbox ?? 'INBOX',
+                att.filename,
+                subfolder,
+                false,
+              );
+              filesSaved += 1;
+              totalSize += saved.size;
+            } catch (err) {
+              errors.push({
+                emailId: email.id,
+                filename: att.filename,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          }
+        }
+      }
+    }
+    /* eslint-enable no-restricted-syntax, no-await-in-loop */
+
+    return {
+      folder: input.destinationFolder,
+      files_saved: filesSaved,
+      total_size: totalSize,
+      skipped,
+      errors,
+    };
   }
 }
