@@ -221,7 +221,10 @@ export default function registerEmailsTools(
       'Returns paginated metadata (read/unread 🔵, flagged ⭐, replied ↩️, attachments 📎, labels 🏷️). ' +
       'Use get_email to fetch full body content. ' +
       'ProtonMail note: labels are represented as IMAP folders — use list_labels to discover them, ' +
-      'then list_emails with mailbox="Labels/X" to find labeled emails.',
+      'then list_emails with mailbox="Labels/X" to find labeled emails. ' +
+      "If a query of INBOX returns nothing relevant, consider re-running against the account's Archive " +
+      'mailbox (use list_mailboxes to find its name); always pair archive queries with a date filter, ' +
+      'because archives can hold tens of thousands of messages.',
     {
       account: z.string().describe('Account name from list_accounts'),
       mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
@@ -610,7 +613,9 @@ export default function registerEmailsTools(
       'Supports date ranges (since/before/on, including "7d" / "yesterday"), subject/from/to/cc/bcc/body/text ' +
       'filters, read/flag/answered state, keywords/labels, header matches, UID ranges, size limits, and attachments. ' +
       "On Gmail accounts, pass gmail_raw (e.g. 'from:foo has:attachment older_than:30d') for a dramatically " +
-      'faster native Gmail search. Results are paginated; large result sets are capped at 5000 UIDs with a warning.',
+      'faster native Gmail search. Results are paginated; large result sets are capped at 5000 UIDs with a warning. ' +
+      'Archive folders are large — always include a date filter (since/before/on or relative tokens like "30d") ' +
+      'when searching them, otherwise results may be truncated.',
     {
       account: z.string().describe('Account name from list_accounts'),
       query: z
