@@ -166,7 +166,8 @@ export default class SmtpService {
     const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
 
     // Fetch attachment binaries from IMAP when requested (parallel downloads)
-    const fetchAttachment = async (filename: string) => this.imapService.downloadAttachment(
+    const fetchAttachment = async (filename: string) =>
+      this.imapService.downloadAttachment(
         accountName,
         options.emailId,
         options.mailbox ?? 'INBOX',
