@@ -11,6 +11,9 @@ import type RateLimiter from '../safety/rate-limiter.js';
 import type { AccountConfig, SendResult } from '../types/index.js';
 import type ImapService from './imap.service.js';
 
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const MailComposer = require('nodemailer/lib/mail-composer');
+
 // ---------------------------------------------------------------------------
 // Helpers (must be defined before SmtpService)
 // ---------------------------------------------------------------------------
@@ -124,6 +127,7 @@ export default class SmtpService {
       body: string;
       replyAll?: boolean;
       html?: boolean;
+      includeAttachments?: boolean;
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
@@ -161,7 +165,39 @@ export default class SmtpService {
 
     const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
 
-    const result = await transport.sendMail({
+    // Fetch attachment binaries from IMAP when requested (parallel downloads)
+    const attachments: { filename: string; content: Buffer; contentType: string }[] =
+      options.includeAttachments && original.attachments.length > 0
+        ? (
+            await Promise.allSettled(
+              original.attachments.map(async (meta) => this.imapService.downloadAttachment(
+                  accountName,
+                  options.emailId,
+                  options.mailbox ?? 'INBOX',
+                  meta.filename,
+                ),),
+            )
+          ).flatMap((result, i) => {
+            if (result.status === 'rejected') {
+              // eslint-disable-next-line no-console
+              console.warn(
+                `[reply_email] Skipping attachment "${original.attachments[i].filename}":`,
+                result.reason,
+              );
+              return [];
+            }
+            return [
+              {
+                filename: result.value.filename,
+                content: Buffer.from(result.value.contentBase64, 'base64'),
+                contentType: result.value.mimeType,
+              },
+            ];
+          })
+        : [];
+
+    // Build the raw message once — same bytes sent via SMTP and stored in Sent folder
+    const mailOptions = {
       from: fromAddr,
       to: to.join(', '),
       cc: cc.length > 0 ? cc.join(', ') : undefined,
@@ -169,22 +205,19 @@ export default class SmtpService {
       inReplyTo: original.messageId,
       references: references.join(' '),
       ...(options.html ? { html: options.body } : { text: options.body }),
+      ...(attachments.length > 0 ? { attachments } : {}),
+    };
+
+    const rawMessage = await new Promise<Buffer>((resolve, reject) => {
+      new MailComposer(mailOptions).compile().build((err: Error | null, buf: Buffer) => {
+        if (err) reject(err);
+        else resolve(buf);
+      });
     });
 
-    await this.appendToSentFolder(
-      accountName,
-      buildRawMessage({
-        from: fromAddr,
-        to: to.join(', '),
-        subject,
-        body: options.body,
-        cc: cc.length > 0 ? cc.join(', ') : undefined,
-        messageId: result.messageId ?? '',
-        inReplyTo: original.messageId,
-        references: references.join(' '),
-        html: options.html,
-      }),
-    );
+    const result = await transport.sendMail({ raw: rawMessage });
+
+    await this.appendToSentFolder(accountName, rawMessage);
 
     return {
       messageId: result.messageId ?? '',
