@@ -245,10 +245,9 @@ describe('SmtpService', () => {
         body: 'Reply body',
       });
 
-      expect(imapService.appendToSent).toHaveBeenCalledWith(
-        'test',
-        expect.stringContaining('Subject: Re: Original Subject'),
-      );
+      expect(imapService.appendToSent).toHaveBeenCalledWith('test', expect.any(Buffer));
+      const [[, rawMsg]] = vi.mocked(imapService.appendToSent).mock.calls;
+      expect((rawMsg as Buffer).toString()).toContain('Subject: Re: Original Subject');
     });
   });
 
