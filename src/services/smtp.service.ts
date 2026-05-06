@@ -166,35 +166,34 @@ export default class SmtpService {
     const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
 
     // Fetch attachment binaries from IMAP when requested (parallel downloads)
-    const attachments: { filename: string; content: Buffer; contentType: string }[] =
-      options.includeAttachments && original.attachments.length > 0
-        ? (
-            await Promise.allSettled(
-              original.attachments.map(async (meta) => this.imapService.downloadAttachment(
-                  accountName,
-                  options.emailId,
-                  options.mailbox ?? 'INBOX',
-                  meta.filename,
-                ),),
-            )
-          ).flatMap((result, i) => {
-            if (result.status === 'rejected') {
-              // eslint-disable-next-line no-console
-              console.warn(
-                `[reply_email] Skipping attachment "${original.attachments[i].filename}":`,
-                result.reason,
-              );
-              return [];
-            }
-            return [
-              {
-                filename: result.value.filename,
-                content: Buffer.from(result.value.contentBase64, 'base64'),
-                contentType: result.value.mimeType,
-              },
-            ];
-          })
-        : [];
+    const fetchAttachment = async (filename: string) => this.imapService.downloadAttachment(
+        accountName,
+        options.emailId,
+        options.mailbox ?? 'INBOX',
+        filename,
+      );
+
+    const attachments: { filename: string; content: Buffer; contentType: string }[] = [];
+    if (options.includeAttachments && original.attachments.length > 0) {
+      const results = await Promise.allSettled(
+        original.attachments.map(async (meta) => fetchAttachment(meta.filename)),
+      );
+      results.forEach((result, i) => {
+        if (result.status === 'rejected') {
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[reply_email] Skipping attachment "${original.attachments[i].filename}":`,
+            result.reason,
+          );
+        } else {
+          attachments.push({
+            filename: result.value.filename,
+            content: Buffer.from(result.value.contentBase64, 'base64'),
+            contentType: result.value.mimeType,
+          });
+        }
+      });
+    }
 
     // Build the raw message once — same bytes sent via SMTP and stored in Sent folder
     const mailOptions = {
