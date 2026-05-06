@@ -80,6 +80,10 @@ export default function registerSendTools(server: McpServer, smtpService: SmtpSe
       body: z.string().describe('Reply body content'),
       replyAll: z.boolean().default(false).describe('Reply to all recipients'),
       html: z.boolean().default(false).describe('Send as HTML'),
+      includeAttachments: z
+        .boolean()
+        .default(false)
+        .describe('Re-attach attachments from the original email to this reply'),
     },
     { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     async (params) => {
