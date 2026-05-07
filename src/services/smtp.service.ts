@@ -5,14 +5,11 @@
  */
 
 import { randomUUID } from 'node:crypto';
-
+import MailComposer from 'nodemailer/lib/mail-composer';
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
 import type { AccountConfig, SendResult } from '../types/index.js';
 import type ImapService from './imap.service.js';
-
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const MailComposer = require('nodemailer/lib/mail-composer');
 
 // ---------------------------------------------------------------------------
 // Helpers (must be defined before SmtpService)
