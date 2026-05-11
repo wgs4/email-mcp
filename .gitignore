@@ -223,6 +223,10 @@ web_modules/
 .env.production.local
 .env.local
 
+# email-mcp runtime config (the real one lives at ~/.config/email-mcp/config.toml;
+# this guards against a stray copy inside the repo dir leaking secrets)
+config.toml
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
