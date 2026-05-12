@@ -312,6 +312,94 @@ describe('ImapService', () => {
   });
 
   // -----------------------------------------------------------------------
+  // listEmails — malformed envelope dates (regression)
+  // -----------------------------------------------------------------------
+
+  describe('listEmails (malformed envelope dates)', () => {
+    it('does not throw when an envelope.date is malformed; falls back to internalDate', async () => {
+      // Three UIDs; the middle one carries a garbage Date header that would
+      // crash `new Date(...).toISOString()` if left unguarded. The poison
+      // message also carries internalDate, which the helper should prefer.
+      client.search.mockResolvedValue([1, 2, 3]);
+
+      const mockMessages = [
+        {
+          uid: 3,
+          envelope: { subject: 'good', from: [{ address: 'a@x' }], to: [], date: '2024-01-03' },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text', subtype: 'plain' },
+          source: Buffer.from(''),
+        },
+        {
+          uid: 2,
+          envelope: {
+            subject: 'poison',
+            from: [{ address: 'b@x' }],
+            to: [],
+            date: 'Tue, 32 Notamonth 9999 99:99:99',
+          },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text', subtype: 'plain' },
+          source: Buffer.from(''),
+          internalDate: new Date('2024-01-02'),
+        },
+        {
+          uid: 1,
+          envelope: {
+            subject: 'also good',
+            from: [{ address: 'c@x' }],
+            to: [],
+            date: '2024-01-01',
+          },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text', subtype: 'plain' },
+          source: Buffer.from(''),
+        },
+      ];
+      client.fetch.mockReturnValueOnce(
+        // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+        (async function* gen() {
+          for (const m of mockMessages) yield m;
+        })(),
+      );
+
+      const result = await service.listEmails('test', { mailbox: 'INBOX.spam', pageSize: 10 });
+
+      expect(result.items).toHaveLength(3);
+      const poison = result.items.find((m) => m.subject === 'poison');
+      expect(poison?.date).toBe('2024-01-02T00:00:00.000Z');
+    });
+
+    it('does not throw when envelope.date is missing entirely; produces a valid ISO string', async () => {
+      client.search.mockResolvedValue([1]);
+
+      const mockMessages = [
+        {
+          uid: 1,
+          envelope: { subject: 'no-date', from: [{ address: 'a@x' }], to: [], date: null },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text', subtype: 'plain' },
+          source: Buffer.from(''),
+        },
+      ];
+      client.fetch.mockReturnValueOnce(
+        // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+        (async function* gen() {
+          for (const m of mockMessages) yield m;
+        })(),
+      );
+
+      const result = await service.listEmails('test', { mailbox: 'INBOX', pageSize: 10 });
+
+      expect(result.items).toHaveLength(1);
+      const item = result.items[0];
+      expect(typeof item.date).toBe('string');
+      expect(item.date.length).toBeGreaterThan(0);
+      expect(new Date(item.date).toString()).not.toBe('Invalid Date');
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // appendToSent
   // -----------------------------------------------------------------------
 
