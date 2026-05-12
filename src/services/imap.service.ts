@@ -238,6 +238,28 @@ function findMimePartByFilename(
   return undefined;
 }
 
+/**
+ * Parse a value that may be an IMAP envelope Date header (RFC-2822 string,
+ * Date object, etc.) into an ISO-8601 string. Returns the fallback when the
+ * input is missing or malformed. Never throws.
+ */
+function safeIsoDate(raw: unknown, fallback?: string): string {
+  if (raw == null) return fallback ?? new Date().toISOString();
+  const d = raw instanceof Date ? raw : new Date(raw as string);
+  if (Number.isNaN(d.getTime())) return fallback ?? new Date().toISOString();
+  return d.toISOString();
+}
+
+/**
+ * Parse the same input into a Date, or return the fallback when missing/bad.
+ * Used where downstream code wants a real Date object (sorting, comparisons).
+ */
+function safeDate(raw: unknown, fallback: Date = new Date()): Date {
+  if (raw == null) return fallback;
+  const d = raw instanceof Date ? raw : new Date(raw as string);
+  return Number.isNaN(d.getTime()) ? fallback : d;
+}
+
 function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
   const envelope = (msg.envelope ?? {}) as Record<string, unknown>;
   const flags = new Set((msg.flags ?? []) as string[]);
@@ -270,9 +292,7 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
     subject: (envelope.subject as string) ?? '(no subject)',
     from: parseAddress((envelope.from as Record<string, string>[])?.[0]),
     to: parseAddresses(envelope.to as Record<string, string>[]),
-    date: envelope.date
-      ? new Date(envelope.date as string).toISOString()
-      : new Date().toISOString(),
+    date: safeIsoDate(envelope.date, safeIsoDate(msg.internalDate)),
     seen: flags.has('\\Seen'),
     flagged: flags.has('\\Flagged'),
     answered: flags.has('\\Answered'),
@@ -614,6 +634,7 @@ export default class ImapService {
           envelope: true,
           flags: true,
           bodyStructure: true,
+          internalDate: true,
           source: { start: 0, maxLength: 256 },
         },
         { uid: true },
@@ -658,7 +679,9 @@ export default class ImapService {
       }
 
       // Sort by date descending
-      items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      items.sort(
+        (a, b) => safeDate(b.date, new Date(0)).getTime() - safeDate(a.date, new Date(0)).getTime(),
+      );
 
       const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
       return {
@@ -759,7 +782,7 @@ export default class ImapService {
         labels,
         subject: (envelope.subject as string) ?? '(no subject)',
         from,
-        date: envelope.date ? new Date(envelope.date as string).toISOString() : '',
+        date: safeIsoDate(envelope.date, ''),
       };
     } finally {
       lock.release();
@@ -893,6 +916,7 @@ export default class ImapService {
           envelope: true,
           flags: true,
           bodyStructure: true,
+          internalDate: true,
           source: { start: 0, maxLength: 256 },
         },
         { uid: true },
@@ -935,7 +959,9 @@ export default class ImapService {
         if (items.length !== pageUids.length) totalApprox = true;
       }
 
-      items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      items.sort(
+        (a, b) => safeDate(b.date, new Date(0)).getTime() - safeDate(a.date, new Date(0)).getTime(),
+      );
 
       const warning = warnings.length > 0 ? warnings.join('; ') : undefined;
       return {
@@ -1140,7 +1166,9 @@ export default class ImapService {
     }
 
     // Merge + paginate the collected items.
-    collectedItems.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+    collectedItems.sort(
+      (a, b) => safeDate(b.date, new Date(0)).getTime() - safeDate(a.date, new Date(0)).getTime(),
+    );
     const start = (page - 1) * pageSize;
     const items = collectedItems.slice(start, start + pageSize);
 
@@ -1216,9 +1244,9 @@ export default class ImapService {
           }
         }
         if (result.year && env.date) {
-          const yr = new Date(env.date as string).getFullYear();
-          if (!Number.isNaN(yr)) {
-            const k = String(yr);
+          const parsed = safeDate(env.date, new Date(NaN));
+          if (!Number.isNaN(parsed.getTime())) {
+            const k = String(parsed.getFullYear());
             result.year[k] = (result.year[k] ?? 0) + 1;
           }
         }
@@ -2099,7 +2127,9 @@ export default class ImapService {
       }
 
       // Sort chronologically
-      messages.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+      messages.sort(
+        (a, b) => safeDate(a.date, new Date(0)).getTime() - safeDate(b.date, new Date(0)).getTime(),
+      );
 
       // Extract unique participants
       const participantMap = new Map<string, EmailAddress>();
@@ -2161,7 +2191,7 @@ export default class ImapService {
           string,
           unknown
         >;
-        const date = envelope.date ? new Date(envelope.date as string) : new Date();
+        const date = safeDate(envelope.date);
 
         const addressLists = [
           envelope.from as { name?: string; address?: string }[] | undefined,
@@ -2300,7 +2330,7 @@ export default class ImapService {
         }
 
         // Track daily volume
-        const date = envelope.date ? new Date(envelope.date as string) : new Date();
+        const date = safeDate(envelope.date);
         const dayKey = date.toISOString().split('T')[0];
         dailyMap.set(dayKey, (dailyMap.get(dayKey) ?? 0) + 1);
       }
@@ -2526,7 +2556,9 @@ export default class ImapService {
           if (outcome.value.truncated) anyTruncated = true;
         }
       });
-      merged.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      merged.sort(
+        (a, b) => safeDate(b.date, new Date(0)).getTime() - safeDate(a.date, new Date(0)).getTime(),
+      );
 
       if (merged.length > maxRows) {
         merged = merged.slice(0, maxRows);
@@ -2614,7 +2646,9 @@ export default class ImapService {
         items = items.filter((m) => (m.attachments ?? []).some((a) => re.test(a.mimeType)));
       }
 
-      items.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+      items.sort(
+        (a, b) => safeDate(b.date, new Date(0)).getTime() - safeDate(a.date, new Date(0)).getTime(),
+      );
       return { items, truncated };
     } finally {
       lock.release();
@@ -2809,7 +2843,7 @@ export default class ImapService {
           // Subfolder strategy
           let subfolder = input.destinationFolder;
           if (input.organizeBy === 'date') {
-            const d = new Date(email.date);
+            const d = safeDate(email.date, new Date(NaN));
             const ym = Number.isNaN(d.getTime())
               ? 'unknown-date'
               : `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;

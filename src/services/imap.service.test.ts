@@ -19,6 +19,7 @@ function createMockImapClient() {
     messageDelete: vi.fn().mockResolvedValue(true),
     messageFlagsAdd: vi.fn().mockResolvedValue(true),
     messageFlagsRemove: vi.fn().mockResolvedValue(true),
+    append: vi.fn().mockResolvedValue({ uid: 42 }),
     _releaseFn: releaseFn,
   };
 }
@@ -168,6 +169,59 @@ describe('ImapService', () => {
   });
 
   // -----------------------------------------------------------------------
+  // resolveSentFolder
+  // -----------------------------------------------------------------------
+
+  describe('resolveSentFolder', () => {
+    it('returns account config sentFolder override when set', async () => {
+      connections.getAccount.mockReturnValue({
+        name: 'test',
+        email: 'test@example.com',
+        username: 'test@example.com',
+        sentFolder: 'My Sent',
+        imap: { host: 'imap.example.com', port: 993, tls: true, starttls: false, verifySsl: true },
+        smtp: { host: 'smtp.example.com', port: 465, tls: true, starttls: false, verifySsl: true },
+      });
+
+      const result = await service.resolveSentFolder('test');
+
+      expect(result).toBe('My Sent');
+      // Should not call client.list() when override is set
+      expect(client.list).not.toHaveBeenCalled();
+    });
+
+    it('finds Sent folder via SPECIAL-USE attribute', async () => {
+      client.list.mockResolvedValue([
+        { name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' },
+        { name: 'Sent Messages', path: 'Sent Messages', specialUse: '\\Sent' },
+      ]);
+
+      const result = await service.resolveSentFolder('test');
+
+      expect(result).toBe('Sent Messages');
+    });
+
+    it('falls back to common folder names', async () => {
+      client.list.mockResolvedValue([
+        { name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' },
+        { name: 'Sent Items', path: 'Sent Items' },
+      ]);
+
+      const result = await service.resolveSentFolder('test');
+
+      expect(result).toBe('Sent Items');
+    });
+
+    it('throws when no Sent folder can be resolved', async () => {
+      client.list.mockResolvedValue([{ name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' }]);
+
+      await expect(service.resolveSentFolder('test')).rejects.toThrow(
+        'Cannot resolve Sent folder for "test"',
+      );
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // searchEmails — Power Search wiring (Phase A + B)
   // -----------------------------------------------------------------------
 
@@ -254,6 +308,134 @@ describe('ImapService', () => {
       await expect(service.searchEmails('test', '', { gmailRaw: 'from:foo' })).rejects.toThrow(
         /only valid on Gmail accounts/,
       );
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // listEmails — malformed envelope dates (regression)
+  // -----------------------------------------------------------------------
+
+  describe('listEmails (malformed envelope dates)', () => {
+    it('does not throw when an envelope.date is malformed; falls back to internalDate', async () => {
+      // Three UIDs; the middle one carries a garbage Date header that would
+      // crash `new Date(...).toISOString()` if left unguarded. The poison
+      // message also carries internalDate, which the helper should prefer.
+      client.search.mockResolvedValue([1, 2, 3]);
+
+      const mockMessages = [
+        {
+          uid: 3,
+          envelope: { subject: 'good', from: [{ address: 'a@x' }], to: [], date: '2024-01-03' },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text', subtype: 'plain' },
+          source: Buffer.from(''),
+        },
+        {
+          uid: 2,
+          envelope: {
+            subject: 'poison',
+            from: [{ address: 'b@x' }],
+            to: [],
+            date: 'Tue, 32 Notamonth 9999 99:99:99',
+          },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text', subtype: 'plain' },
+          source: Buffer.from(''),
+          internalDate: new Date('2024-01-02'),
+        },
+        {
+          uid: 1,
+          envelope: {
+            subject: 'also good',
+            from: [{ address: 'c@x' }],
+            to: [],
+            date: '2024-01-01',
+          },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text', subtype: 'plain' },
+          source: Buffer.from(''),
+        },
+      ];
+      client.fetch.mockReturnValueOnce(
+        // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+        (async function* gen() {
+          for (const m of mockMessages) yield m;
+        })(),
+      );
+
+      const result = await service.listEmails('test', { mailbox: 'INBOX.spam', pageSize: 10 });
+
+      expect(result.items).toHaveLength(3);
+      const poison = result.items.find((m) => m.subject === 'poison');
+      expect(poison?.date).toBe('2024-01-02T00:00:00.000Z');
+    });
+
+    it('does not throw when envelope.date is missing entirely; produces a valid ISO string', async () => {
+      client.search.mockResolvedValue([1]);
+
+      const mockMessages = [
+        {
+          uid: 1,
+          envelope: { subject: 'no-date', from: [{ address: 'a@x' }], to: [], date: null },
+          flags: new Set<string>(),
+          bodyStructure: { type: 'text', subtype: 'plain' },
+          source: Buffer.from(''),
+        },
+      ];
+      client.fetch.mockReturnValueOnce(
+        // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+        (async function* gen() {
+          for (const m of mockMessages) yield m;
+        })(),
+      );
+
+      const result = await service.listEmails('test', { mailbox: 'INBOX', pageSize: 10 });
+
+      expect(result.items).toHaveLength(1);
+      const item = result.items[0];
+      expect(typeof item.date).toBe('string');
+      expect(item.date.length).toBeGreaterThan(0);
+      expect(new Date(item.date).toString()).not.toBe('Invalid Date');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // appendToSent
+  // -----------------------------------------------------------------------
+
+  describe('appendToSent', () => {
+    it('appends message to resolved Sent folder with \\Seen flag', async () => {
+      client.list.mockResolvedValue([{ name: 'Sent', path: 'Sent', specialUse: '\\Sent' }]);
+
+      const rawMessage = 'From: test@example.com\r\nTo: a@b.com\r\n\r\nHello';
+
+      await service.appendToSent('test', rawMessage);
+
+      expect(client.append).toHaveBeenCalledWith('Sent', Buffer.from(rawMessage), ['\\Seen']);
+    });
+
+    it('uses custom flags when provided', async () => {
+      client.list.mockResolvedValue([{ name: 'Sent', path: 'Sent', specialUse: '\\Sent' }]);
+
+      await service.appendToSent('test', 'raw msg', ['\\Seen', '\\Flagged']);
+
+      expect(client.append).toHaveBeenCalledWith('Sent', Buffer.from('raw msg'), [
+        '\\Seen',
+        '\\Flagged',
+      ]);
+    });
+
+    it('retries append after creating mailbox on TRYCREATE error', async () => {
+      client.list.mockResolvedValue([{ name: 'Sent', path: 'Sent', specialUse: '\\Sent' }]);
+      client.append
+        .mockRejectedValueOnce(new Error('[TRYCREATE] Mailbox does not exist'))
+        .mockResolvedValueOnce({ uid: 42 });
+      (client as Record<string, unknown>).mailboxCreate = vi.fn().mockResolvedValue({});
+
+      await service.appendToSent('test', 'raw msg');
+
+      expect((client as Record<string, unknown>).mailboxCreate).toHaveBeenCalledWith('Sent');
+      expect(client.append).toHaveBeenCalledTimes(2);
     });
   });
 
