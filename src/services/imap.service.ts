@@ -5,6 +5,7 @@
  */
 
 import type { ImapFlow } from 'imapflow';
+import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type { IConnectionManager } from '../connections/types.js';
 import { sanitizeMailboxName } from '../safety/validation.js';
 import type {
@@ -24,6 +25,8 @@ import type {
   QuotaInfo,
   SenderStat,
 } from '../types/index.js';
+import type { AttachmentInput, ResolvedAttachment } from './attachment-resolver.js';
+import { resolveAttachments } from './attachment-resolver.js';
 import { assertSafeDestination, resolveUniquePath, sanitizeFilename } from './file-paths.js';
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
@@ -183,6 +186,28 @@ function hasAttachments(bodyStructure: unknown): boolean {
   // Delegate to the richer helper so legacy callers (e.g. getEmailStats) use
   // the same semantics as extractAttachmentMeta / EmailMeta.hasAttachments.
   return extractAttachmentMeta(bodyStructure).length > 0;
+}
+
+/**
+ * Extract `cid:` references from an HTML body. Returns unique CIDs in order
+ * of first appearance. Used by update_draft to warn callers when an HTML
+ * draft references inline images — v1 flattens those to plain attachments,
+ * which means the recipient's mail client will show broken image icons.
+ */
+export function extractCidReferences(html: string): string[] {
+  const re = /cid:([^"'\s>)]+)/gi;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  let match = re.exec(html);
+  while (match !== null) {
+    const cid = match[1];
+    if (!seen.has(cid)) {
+      seen.add(cid);
+      out.push(cid);
+    }
+    match = re.exec(html);
+  }
+  return out;
 }
 
 function extractAttachments(bodyStructure: unknown): AttachmentMeta[] {
@@ -1736,6 +1761,7 @@ export default class ImapService {
       bcc?: string[];
       html?: boolean;
       inReplyTo?: string;
+      attachments?: ResolvedAttachment[];
     },
   ): Promise<{ id: number; mailbox: string }> {
     const client = await this.connections.getImapClient(accountName);
@@ -1746,33 +1772,80 @@ export default class ImapService {
     const drafts = mailboxes.find((mb) => mb.specialUse === '\\Drafts');
     const draftsPath = drafts?.path ?? 'Drafts';
 
-    // Construct RFC 822 message
-    const headers = [
-      `From: ${account.fullName ? `"${account.fullName}" <${account.email}>` : account.email}`,
-      `To: ${options.to.join(', ')}`,
-      `Subject: ${options.subject}`,
-      `Date: ${new Date().toUTCString()}`,
-      `MIME-Version: 1.0`,
-    ];
+    const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
+    const hasDraftAttachments = !!options.attachments && options.attachments.length > 0;
 
-    if (options.cc?.length) headers.push(`Cc: ${options.cc.join(', ')}`);
-    if (options.bcc?.length) headers.push(`Bcc: ${options.bcc.join(', ')}`);
-    if (options.inReplyTo) headers.push(`In-Reply-To: ${options.inReplyTo}`);
+    const mailOptions = {
+      from: fromAddr,
+      to: options.to.length > 0 ? options.to.join(', ') : undefined,
+      cc: options.cc?.length ? options.cc.join(', ') : undefined,
+      bcc: options.bcc?.length ? options.bcc.join(', ') : undefined,
+      subject: options.subject,
+      inReplyTo: options.inReplyTo,
+      date: new Date(),
+      ...(options.html ? { html: options.body } : { text: options.body }),
+      ...(hasDraftAttachments ? { attachments: options.attachments } : {}),
+    };
 
-    const contentType = options.html ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8';
-    headers.push(`Content-Type: ${contentType}`);
+    const rawMessage = await new Promise<Buffer>((resolve, reject) => {
+      new MailComposer(mailOptions).compile().build((err: Error | null, buf: Buffer) => {
+        if (err) reject(err);
+        else resolve(buf);
+      });
+    });
 
-    const rawMessage = `${headers.join('\r\n')}\r\n\r\n${options.body}`;
-
-    const appendResult = await client.append(draftsPath, Buffer.from(rawMessage), [
-      '\\Draft',
-      '\\Seen',
-    ]);
+    const appendResult = await client.append(draftsPath, rawMessage, ['\\Draft', '\\Seen']);
 
     return {
       id: (appendResult as unknown as { uid?: number }).uid ?? 0,
       mailbox: draftsPath,
     };
+  }
+
+  /**
+   * Resolve and save a draft with polymorphic AttachmentInput entries. The
+   * resolver fetches binaries (from disk / base64 / source-message IMAP) and
+   * hands the in-memory bytes to {@link saveDraft}.
+   *
+   * Strict failure: if any attachment cannot be resolved, no draft is saved.
+   * This avoids silently producing a draft with missing attachments when the
+   * caller expected all of them. Use {@link saveDraft} directly if you need
+   * to provide already-resolved binaries.
+   */
+  async saveDraftWithAttachments(
+    accountName: string,
+    options: {
+      to: string[];
+      subject: string;
+      body: string;
+      cc?: string[];
+      bcc?: string[];
+      html?: boolean;
+      inReplyTo?: string;
+      attachments?: AttachmentInput[];
+    },
+  ): Promise<{ id: number; mailbox: string }> {
+    let resolved: ResolvedAttachment[] = [];
+
+    if (options.attachments && options.attachments.length > 0) {
+      const result = await resolveAttachments(this, accountName, options.attachments);
+      if (result.failures.length > 0) {
+        const summary = result.failures.map((f) => `${f.label}: ${f.reason}`).join('; ');
+        throw new Error(`Failed to resolve ${result.failures.length} attachment(s): ${summary}`);
+      }
+      resolved = result.resolved;
+    }
+
+    return this.saveDraft(accountName, {
+      to: options.to,
+      subject: options.subject,
+      body: options.body,
+      cc: options.cc,
+      bcc: options.bcc,
+      html: options.html,
+      inReplyTo: options.inReplyTo,
+      attachments: resolved,
+    });
   }
 
   /**
@@ -1810,6 +1883,169 @@ export default class ImapService {
     } finally {
       lock.release();
     }
+  }
+
+  /**
+   * Replace an existing draft. IMAP has no in-place edit primitive, so this
+   * fetches the old draft, rebuilds the MIME tree with the requested changes
+   * (merging unspecified fields from the existing draft), APPENDs the new
+   * copy to Drafts, and only then deletes the old UID. If APPEND fails the
+   * old draft is left intact. If DELETE-after-APPEND fails the new draft is
+   * still returned along with a warning — the user has two drafts to
+   * reconcile rather than zero.
+   */
+  async updateDraft(
+    accountName: string,
+    draftId: number,
+    options: {
+      mailbox?: string;
+      subject?: string;
+      body?: string;
+      html?: boolean;
+      to?: string[];
+      cc?: string[];
+      bcc?: string[];
+      inReplyTo?: string;
+      attachmentsKeep?: string[];
+      attachmentsAdd?: AttachmentInput[];
+      attachmentsRemove?: string[];
+    },
+  ): Promise<{
+    id: number;
+    mailbox: string;
+    oldId: number;
+    oldDraftDeleted: boolean;
+    warnings: string[];
+  }> {
+    const warnings: string[] = [];
+
+    // Fetch the existing draft so we know its current state.
+    const { email: existing, mailbox: draftsPath } = await this.fetchDraft(
+      accountName,
+      draftId,
+      options.mailbox,
+    );
+
+    // Determine which existing attachments to carry forward.
+    const existingFilenames = existing.attachments.map((a) => a.filename);
+    const existingSet = new Set(existingFilenames);
+
+    // Default keep set: ALL existing attachments. Explicit empty array drops everything.
+    let keepFilenames = options.attachmentsKeep ?? [...existingFilenames];
+
+    // Honor remove list (subtract from keep set).
+    if (options.attachmentsRemove && options.attachmentsRemove.length > 0) {
+      const removeSet = new Set(options.attachmentsRemove);
+      keepFilenames = keepFilenames.filter((f) => !removeSet.has(f));
+    }
+
+    // Intersect with what actually exists — defensive against typos in attachments_keep.
+    const requestedToKeep = new Set(keepFilenames);
+    keepFilenames = keepFilenames.filter((f) => existingSet.has(f));
+    requestedToKeep.forEach((f) => {
+      if (!existingSet.has(f)) {
+        warnings.push(
+          `attachments_keep included "${f}" but no such attachment exists on the draft`,
+        );
+      }
+    });
+
+    // Download the kept attachment bytes from the old draft (server-side, no MCP wire).
+    const kept = await this.fetchKeptAttachments(accountName, draftId, draftsPath, keepFilenames);
+
+    // Resolve the add list (path | base64 | source-message-reference).
+    let added: ResolvedAttachment[] = [];
+    if (options.attachmentsAdd && options.attachmentsAdd.length > 0) {
+      const result = await resolveAttachments(this, accountName, options.attachmentsAdd);
+      if (result.failures.length > 0) {
+        const summary = result.failures.map((f) => `${f.label}: ${f.reason}`).join('; ');
+        throw new Error(
+          `Failed to resolve ${result.failures.length} attachment(s) to add: ${summary}`,
+        );
+      }
+      added = result.resolved;
+    }
+
+    const allAttachments = [...kept, ...added];
+
+    // Merge: omitted fields keep the existing draft's value.
+    const html = options.html ?? !!existing.bodyHtml;
+    const body = options.body ?? (html ? (existing.bodyHtml ?? '') : (existing.bodyText ?? ''));
+    const subject = options.subject ?? existing.subject;
+    const to = options.to ?? existing.to.map((a) => a.address);
+    const cc = options.cc ?? existing.cc?.map((a) => a.address);
+    const bcc = options.bcc ?? existing.bcc?.map((a) => a.address);
+    const inReplyTo = options.inReplyTo ?? existing.inReplyTo;
+
+    // Inline image detection — warn when the body references cid: parts that
+    // won't survive the rebuild (v1 treats them as plain attachments only).
+    if (html && typeof body === 'string') {
+      const cidRefs = extractCidReferences(body);
+      if (cidRefs.length > 0) {
+        warnings.push(
+          `Body has ${cidRefs.length} cid: reference(s) (${cidRefs.slice(0, 3).join(', ')}${cidRefs.length > 3 ? ', …' : ''}). Inline images are flattened in v1 — recipient may see broken image icons.`,
+        );
+      }
+    }
+
+    // APPEND the new draft. On failure, the old draft stays intact.
+    const newId = await this.saveDraft(accountName, {
+      to,
+      subject,
+      body,
+      cc,
+      bcc,
+      html,
+      inReplyTo,
+      attachments: allAttachments,
+    });
+
+    // Only after confirmed APPEND, delete the old UID.
+    let oldDraftDeleted = false;
+    try {
+      await this.deleteDraft(accountName, draftId, draftsPath);
+      oldDraftDeleted = true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      warnings.push(
+        `New draft saved (UID ${newId.id}) but deleting the old draft (UID ${draftId}) failed: ${msg}. You now have two copies; clean up the old UID manually.`,
+      );
+    }
+
+    return {
+      id: newId.id,
+      mailbox: newId.mailbox,
+      oldId: draftId,
+      oldDraftDeleted,
+      warnings,
+    };
+  }
+
+  /**
+   * Download a subset of an existing message's attachments by filename.
+   * Strict: any per-file failure aborts the whole operation so we never
+   * silently produce a draft missing attachments the caller asked to keep.
+   */
+  private async fetchKeptAttachments(
+    accountName: string,
+    emailId: number,
+    mailbox: string,
+    filenames: string[],
+  ): Promise<ResolvedAttachment[]> {
+    if (filenames.length === 0) return [];
+    const inputs: AttachmentInput[] = filenames.map((filename) => ({
+      sourceEmailId: String(emailId),
+      sourceMailbox: mailbox,
+      filename,
+    }));
+    const result = await resolveAttachments(this, accountName, inputs);
+    if (result.failures.length > 0) {
+      const summary = result.failures.map((f) => `${f.label}: ${f.reason}`).join('; ');
+      throw new Error(
+        `Failed to carry ${result.failures.length} attachment(s) forward from the old draft: ${summary}. Old draft was NOT deleted.`,
+      );
+    }
+    return result.resolved;
   }
 
   // -------------------------------------------------------------------------
