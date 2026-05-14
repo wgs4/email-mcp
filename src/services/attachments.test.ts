@@ -2,8 +2,10 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { resolveAttachments } from './attachment-resolver.js';
 import { resolveUniquePath, sanitizeFilename } from './file-paths.js';
-import { extractAttachmentMeta } from './imap.service.js';
+import type ImapService from './imap.service.js';
+import { extractAttachmentMeta, extractCidReferences } from './imap.service.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures — shapes mirror imapflow's parsed bodyStructure (type as
@@ -279,5 +281,122 @@ describe('resolveUniquePath', () => {
     await expect(resolveUniquePath(join(tmp, 'README'), false)).resolves.toBe(
       join(tmp, 'README-1'),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// extractCidReferences — used by update_draft to warn on inline image flattening
+// ---------------------------------------------------------------------------
+
+describe('extractCidReferences', () => {
+  it('returns [] for body with no cid: refs', () => {
+    expect(extractCidReferences('<p>hello</p>')).toEqual([]);
+  });
+
+  it('extracts a single cid: reference', () => {
+    expect(extractCidReferences('<img src="cid:logo@example.com" />')).toEqual([
+      'logo@example.com',
+    ]);
+  });
+
+  it('deduplicates repeated references in order of first appearance', () => {
+    const html = '<img src="cid:a"><img src="cid:b"><img src="cid:a">';
+    expect(extractCidReferences(html)).toEqual(['a', 'b']);
+  });
+
+  it('handles single and double quotes', () => {
+    const html = `<img src='cid:single'><img src="cid:double">`;
+    expect(extractCidReferences(html)).toEqual(['single', 'double']);
+  });
+
+  it('does not match http: or other schemes', () => {
+    expect(extractCidReferences('<a href="http://example.com">x</a>')).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveAttachments — path + base64 variants without touching IMAP
+// ---------------------------------------------------------------------------
+
+describe('resolveAttachments', () => {
+  let tmp: string;
+  const stubImap = {} as ImapService; // not invoked for path / base64 inputs
+
+  beforeEach(() => {
+    tmp = mkdtempSync(join(tmpdir(), 'resolve-att-'));
+  });
+
+  afterEach(() => {
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('resolves a path entry by reading bytes from disk', async () => {
+    const filePath = join(tmp, 'note.txt');
+    writeFileSync(filePath, 'hello');
+
+    const result = await resolveAttachments(stubImap, 'acct', [{ path: filePath }]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.resolved).toHaveLength(1);
+    expect(result.resolved[0].filename).toBe('note.txt');
+    expect(result.resolved[0].content.toString()).toBe('hello');
+    expect(result.resolved[0].contentType).toBe('text/plain');
+  });
+
+  it('honors filename override on a path entry', async () => {
+    const filePath = join(tmp, 'orig.txt');
+    writeFileSync(filePath, 'x');
+
+    const result = await resolveAttachments(stubImap, 'acct', [
+      { path: filePath, filename: 'renamed.txt' },
+    ]);
+
+    expect(result.resolved[0].filename).toBe('renamed.txt');
+  });
+
+  it('decodes a base64 entry into bytes', async () => {
+    const result = await resolveAttachments(stubImap, 'acct', [
+      { contentBase64: Buffer.from('hi').toString('base64'), filename: 'hi.txt' },
+    ]);
+
+    expect(result.resolved[0].content.toString()).toBe('hi');
+    expect(result.resolved[0].filename).toBe('hi.txt');
+  });
+
+  it('collects failures rather than throwing — caller decides', async () => {
+    const result = await resolveAttachments(stubImap, 'acct', [
+      { path: join(tmp, 'does-not-exist.pdf') },
+      { contentBase64: 'aGVsbG8=', filename: 'good.txt' },
+    ]);
+
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0].label).toBe('does-not-exist.pdf');
+    expect(result.resolved).toHaveLength(1);
+    expect(result.resolved[0].filename).toBe('good.txt');
+  });
+
+  it('rejects a path entry that exceeds maxSizeBytes', async () => {
+    const filePath = join(tmp, 'big.txt');
+    writeFileSync(filePath, 'x'.repeat(1024));
+
+    const result = await resolveAttachments(
+      stubImap,
+      'acct',
+      [{ path: filePath }],
+      100, // 100-byte cap
+    );
+
+    expect(result.resolved).toEqual([]);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0].reason).toMatch(/exceeds/);
+  });
+
+  it('guesses MIME type from extension when omitted', async () => {
+    const filePath = join(tmp, 'doc.pdf');
+    writeFileSync(filePath, '%PDF');
+
+    const result = await resolveAttachments(stubImap, 'acct', [{ path: filePath }]);
+
+    expect(result.resolved[0].contentType).toBe('application/pdf');
   });
 });
