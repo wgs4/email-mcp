@@ -192,7 +192,19 @@ export const SearchPresetSchema = z
     message: "Use 'account' OR 'accounts', not both",
   });
 
+// ---------------------------------------------------------------------------
+// Database — `[database]` in config.toml (cross-account routing engine)
+// ---------------------------------------------------------------------------
+// Optional. Only the routing tools (cross_account_move, apply_routing_rules,
+// routing_rules_*) need it; the rest of email-mcp runs without it. The
+// EMAIL_MCP_DATABASE_URL env var overrides this at load time (see loader).
+
+export const DatabaseConfigSchema = z.object({
+  url: z.string().min(1, 'database.url must be a non-empty Postgres connection string'),
+});
+
 export const AppConfigFileSchema = z.object({
+  database: DatabaseConfigSchema.optional(),
   settings: SettingsSchema.default({
     rate_limit: 10,
     read_only: false,
@@ -228,3 +240,4 @@ export const AppConfigFileSchema = z.object({
 export type RawAccountConfig = z.infer<typeof AccountConfigSchema>;
 export type RawAppConfig = z.infer<typeof AppConfigFileSchema>;
 export type RawSearchPreset = z.infer<typeof SearchPresetSchema>;
+export type RawDatabaseConfig = z.infer<typeof DatabaseConfigSchema>;
