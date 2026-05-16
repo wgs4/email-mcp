@@ -237,4 +237,67 @@ read_only = true
       expect(template).toContain('rate_limit');
     });
   });
+
+  // -------------------------------------------------------------------------
+  // [database] section + EMAIL_MCP_DATABASE_URL precedence (D-Open-Q1 / D20)
+  // -------------------------------------------------------------------------
+
+  describe('database config', () => {
+    afterEach(() => {
+      delete process.env.EMAIL_MCP_DATABASE_URL;
+    });
+
+    it('is undefined when neither [database] nor env var is set', async () => {
+      const configPath = path.join(tmpDir, 'config.toml');
+      await fs.writeFile(configPath, MINIMAL_TOML, 'utf-8');
+
+      const config = await loadConfig(configPath);
+
+      expect(config.database).toBeUndefined();
+    });
+
+    it('reads [database].url from the TOML file', async () => {
+      const configPath = path.join(tmpDir, 'config.toml');
+      await fs.writeFile(
+        configPath,
+        `${MINIMAL_TOML}\n[database]\nurl = "postgresql://email_mcp:pw@192.168.1.200:5433/email_mcp"\n`,
+        'utf-8',
+      );
+
+      const config = await loadConfig(configPath);
+
+      expect(config.database?.url).toBe('postgresql://email_mcp:pw@192.168.1.200:5433/email_mcp');
+    });
+
+    it('EMAIL_MCP_DATABASE_URL overrides the TOML value', async () => {
+      const configPath = path.join(tmpDir, 'config.toml');
+      await fs.writeFile(
+        configPath,
+        `${MINIMAL_TOML}\n[database]\nurl = "postgresql://from-toml/db"\n`,
+        'utf-8',
+      );
+      process.env.EMAIL_MCP_DATABASE_URL = 'postgresql://from-env/db';
+
+      const config = await loadConfig(configPath);
+
+      expect(config.database?.url).toBe('postgresql://from-env/db');
+    });
+
+    it('EMAIL_MCP_DATABASE_URL applies even with no [database] section', async () => {
+      const configPath = path.join(tmpDir, 'config.toml');
+      await fs.writeFile(configPath, MINIMAL_TOML, 'utf-8');
+      process.env.EMAIL_MCP_DATABASE_URL = 'postgresql://env-only/db';
+
+      const config = await loadConfig(configPath);
+
+      expect(config.database?.url).toBe('postgresql://env-only/db');
+    });
+
+    it('rejects an empty [database].url', async () => {
+      const configPath = path.join(tmpDir, 'config.toml');
+      await fs.writeFile(configPath, `${MINIMAL_TOML}\n[database]\nurl = ""\n`, 'utf-8');
+
+      await expect(loadConfig(configPath)).rejects.toThrow();
+    });
+  });
 });

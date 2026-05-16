@@ -442,6 +442,55 @@ For single-account setups (overrides config file):
 | `MCP_EMAIL_SMTP_POOL_MAX_MESSAGES` | `100` | Max messages per pooled connection |
 | `MCP_EMAIL_RATE_LIMIT` | `10` | Max sends per minute |
 
+### Database & Routing Migrations
+
+The cross-account routing engine (`cross_account_move`, `apply_routing_rules`,
+`routing_rules_*`) is backed by a dedicated Postgres database. **Everything else in
+email-mcp runs without it** — if the database is unset or unreachable, only the
+routing tools are affected (they report `database_unavailable`), and the server
+boots and serves all other tools normally.
+
+**Connection string.** Provide it one of two ways (the env var wins if both are set):
+
+```toml
+# config.toml
+[database]
+url = "postgresql://email_mcp:PASSWORD@HOST:5433/email_mcp"
+```
+
+```bash
+# or environment variable (takes precedence over config.toml)
+export EMAIL_MCP_DATABASE_URL="postgresql://email_mcp:PASSWORD@HOST:5433/email_mcp"
+```
+
+`config.toml` is gitignored, so the credential is never committed. Use a dedicated,
+least-privilege Postgres role that can only reach the `email_mcp` database.
+
+**Provisioning (one-time, as a Postgres superuser):**
+
+```sql
+CREATE ROLE email_mcp WITH LOGIN PASSWORD 'CHOOSE_A_STRONG_PASSWORD';
+CREATE DATABASE email_mcp WITH OWNER email_mcp ENCODING 'UTF8';
+REVOKE ALL ON DATABASE email_mcp FROM PUBLIC;
+GRANT CONNECT ON DATABASE email_mcp TO email_mcp;
+```
+
+**Applying migrations:**
+
+```bash
+pnpm db:migrate            # apply all pending migrations
+pnpm db:migrate --status   # show applied + pending, change nothing
+pnpm db:migrate --dry-run  # list pending, apply nothing
+```
+
+Migrations are **forward-only** — there is no `down`. Applied filenames are tracked
+in a `schema_migrations` table, so re-running is idempotent and safe. Each migration
+is applied atomically (it either fully applies and is recorded, or rolls back).
+Dev reset: `DROP DATABASE email_mcp; CREATE DATABASE email_mcp OWNER email_mcp;`
+then re-run `pnpm db:migrate`. Production rollback is a Postgres backup plus a
+forward fix. Run `pnpm db:migrate` after pulling code that adds new
+`migrations/NNN_*.sql` files; the routing tools assume the schema is current.
+
 ### Email Scheduling
 
 The scheduler enables future email delivery with a layered architecture:
