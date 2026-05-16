@@ -148,4 +148,23 @@ describe('AppConfigFileSchema', () => {
       AppConfigFileSchema.parse({ accounts: [validAccount({ email: 'bad' })] }),
     ).toThrow();
   });
+
+  it('accepts an optional [database] section with a url', () => {
+    const result = AppConfigFileSchema.parse({
+      accounts: [validAccount()],
+      database: { url: 'postgresql://email_mcp:pw@192.168.1.200:5433/email_mcp' },
+    });
+    expect(result.database?.url).toBe('postgresql://email_mcp:pw@192.168.1.200:5433/email_mcp');
+  });
+
+  it('omits database when the section is absent', () => {
+    const result = AppConfigFileSchema.parse({ accounts: [validAccount()] });
+    expect(result.database).toBeUndefined();
+  });
+
+  it('rejects a [database] section with an empty url', () => {
+    expect(() =>
+      AppConfigFileSchema.parse({ accounts: [validAccount()], database: { url: '' } }),
+    ).toThrow();
+  });
 });

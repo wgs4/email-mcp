@@ -27,6 +27,7 @@
     "test:integration": "vitest run --config vitest.config.integration.ts",
     "test:all": "vitest run && vitest run --config vitest.config.integration.ts",
     "spike:uid-expunge": "tsx scripts/spike-uid-expunge.ts",
+    "db:migrate": "tsx bin/migrate.ts",
     "check": "biome check src/ && eslint src/",
     "report": "mkdir -p reports && biome check src/ --reporter=json > reports/biome.json 2>&1; eslint src/ -f json -o reports/eslint.json; actionlint -format '{{json .}}' > reports/actionlint.json 2>&1; pnpm test",
     "commit": "cog commit",
@@ -81,6 +82,7 @@
     "imapflow": "^1.2.9",
     "node-ical": "^0.25.2",
     "nodemailer": "^8.0.1",
+    "postgres": "^3.4.5",
     "smol-toml": "^1.6.0",
     "zod": "^4.3.6"
   },

@@ -253,8 +253,27 @@ function normalizeSearchPreset(raw: RawSearchPreset): SearchPreset {
   };
 }
 
+/**
+ * Resolve the routing-engine Postgres connection (D-Open-Q1 / D20).
+ * EMAIL_MCP_DATABASE_URL takes precedence over the `[database].url` TOML
+ * value. Returns undefined when neither is set — the routing tools then
+ * report `database_unavailable`/`database_misconfigured`; the rest of
+ * email-mcp is unaffected.
+ */
+function resolveDatabaseConfig(raw: RawAppConfig['database']): { url: string } | undefined {
+  const fromEnv = process.env.EMAIL_MCP_DATABASE_URL?.trim();
+  if (fromEnv) {
+    return { url: fromEnv };
+  }
+  if (raw?.url) {
+    return { url: raw.url };
+  }
+  return undefined;
+}
+
 function normalizeConfig(raw: RawAppConfig): AppConfig {
   return {
+    database: resolveDatabaseConfig(raw.database),
     settings: {
       rateLimit: raw.settings.rate_limit,
       readOnly: raw.settings.read_only,

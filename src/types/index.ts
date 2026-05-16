@@ -150,6 +150,13 @@ export interface AppConfig {
   accounts: AccountConfig[];
   /** Saved-search presets from `[[searches]]` in config.toml. Empty when none. */
   searches: SearchPreset[];
+  /**
+   * Postgres connection for the cross-account routing engine. Undefined when
+   * neither `[database].url` in config.toml nor EMAIL_MCP_DATABASE_URL is set.
+   * Only the routing tools require it; the rest of email-mcp runs without it.
+   * EMAIL_MCP_DATABASE_URL takes precedence over the TOML value.
+   */
+  database?: { url: string };
 }
 
 // ---------------------------------------------------------------------------
