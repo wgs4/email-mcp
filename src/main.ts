@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+
 /**
  * Email MCP Server — Main entry point.
  *
@@ -11,9 +12,9 @@
  *   scheduler Email scheduling management
  */
 
-import { createServer as createHttpServer } from 'node:http';
-import type { IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer as createHttpServer } from 'node:http';
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -212,6 +213,7 @@ async function runHttpServer(port: number): Promise<void> {
   const schedulerService = new SchedulerService(smtpService, imapService);
   const watcherService = new WatcherService(config.settings.watcher, config.accounts);
   const hooksService = new HooksService(config.settings.hooks, imapService);
+  const searchPresetRegistry = new SearchPresetRegistry(config.searches);
 
   // Per-session factory: tools share service instances but each MCP session
   // needs its own McpServer because the SDK binds one transport per server.
@@ -231,6 +233,7 @@ async function runHttpServer(port: number): Promise<void> {
       schedulerService,
       watcherService,
       hooksService,
+      searchPresetRegistry,
     );
     registerAllResources(server, connections, imapService, templateService, schedulerService);
     registerAllPrompts(server);
@@ -260,7 +263,13 @@ async function runHttpServer(port: number): Promise<void> {
           body = JSON.parse(raw.toString());
         } catch {
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null }));
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              error: { code: -32700, message: 'Parse error' },
+              id: null,
+            }),
+          );
           return;
         }
       }
@@ -285,12 +294,32 @@ async function runHttpServer(port: number): Promise<void> {
       };
       const mcpServer = buildMcpSession();
       await mcpServer.connect(transport);
+
+      const ls = mcpServer.server;
+      ls.oninitialized = () => {
+        markInitialized();
+        // eslint-disable-next-line no-void
+        void (async () => {
+          try {
+            const clientCaps = ls.getClientCapabilities?.() ?? {};
+            hooksService.start(ls, { sampling: clientCaps.sampling != null });
+            await mcpLog('info', 'server', 'Email MCP server ready (HTTP mode)');
+          } catch (err) {
+            process.stderr.write(
+              `[email-mcp] hooks init error: ${err instanceof Error ? err.message : String(err)}\n`,
+            );
+          }
+        })();
+      };
     } else {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
           jsonrpc: '2.0',
-          error: { code: -32000, message: 'Bad Request: provide mcp-session-id or send an initialize request' },
+          error: {
+            code: -32000,
+            message: 'Bad Request: provide mcp-session-id or send an initialize request',
+          },
           id: null,
         }),
       );

@@ -97,6 +97,8 @@ export default class HooksService {
 
   private rateResetTimer: ReturnType<typeof setInterval> | null = null;
 
+  private started = false;
+
   private readonly resolvedSystemPrompt: string;
 
   private readonly notifier: NotifierService;
@@ -134,6 +136,17 @@ export default class HooksService {
     this.lowLevelServer = lowLevelServer;
     this.samplingSupported = clientCapabilities.sampling === true;
 
+    if (this.started) {
+      // Client reconnected — server reference updated above, no need to re-register listeners.
+      mcpLog(
+        'info',
+        'hooks',
+        `Hooks reconnected: sampling=${this.samplingSupported ? 'yes' : 'no'}`,
+      ).catch(() => {});
+      return;
+    }
+    this.started = true;
+
     if (this.config.onNewEmail === 'none') return;
 
     eventBus.on('email:new', (event: NewEmailEvent) => {
@@ -155,6 +168,7 @@ export default class HooksService {
   }
 
   stop(): void {
+    this.started = false;
     if (this.batchTimer) {
       clearTimeout(this.batchTimer);
       this.batchTimer = null;
