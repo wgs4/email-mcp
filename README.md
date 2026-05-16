@@ -469,10 +469,22 @@ least-privilege Postgres role that can only reach the `email_mcp` database.
 **Provisioning (one-time, as a Postgres superuser):**
 
 ```sql
+-- Run while connected to the maintenance database (e.g. `postgres`):
 CREATE ROLE email_mcp WITH LOGIN PASSWORD 'CHOOSE_A_STRONG_PASSWORD';
 CREATE DATABASE email_mcp WITH OWNER email_mcp ENCODING 'UTF8';
 REVOKE ALL ON DATABASE email_mcp FROM PUBLIC;
 GRANT CONNECT ON DATABASE email_mcp TO email_mcp;
+```
+
+```sql
+-- Then RECONNECT to the email_mcp database and run this there.
+-- Required on hardened clusters (PG15+, or PG14 with template1 locked down):
+-- being the *database* owner does NOT grant CREATE on the pre-existing
+-- `public` *schema*, which is owned by `postgres`. Without this the first
+-- migration fails with "permission denied for schema public".
+-- DOUBLE-CHECK the Query Tool / psql is connected to `email_mcp`, NOT
+-- `postgres` — running it on the wrong database mis-owns that DB's schema.
+ALTER SCHEMA public OWNER TO email_mcp;
 ```
 
 **Applying migrations:**
