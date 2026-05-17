@@ -5,7 +5,12 @@ import { join } from 'node:path';
 import { resolveAttachments } from './attachment-resolver.js';
 import { resolveUniquePath, sanitizeFilename } from './file-paths.js';
 import type ImapService from './imap.service.js';
-import { extractAttachmentMeta, extractCidReferences } from './imap.service.js';
+import {
+  extractAttachmentMeta,
+  extractCidReferences,
+  findMimePartByFilename,
+  hasAttachments,
+} from './imap.service.js';
 
 // ---------------------------------------------------------------------------
 // Fixtures — shapes mirror imapflow's parsed bodyStructure (type as
@@ -182,6 +187,211 @@ describe('extractAttachmentMeta', () => {
     expect(extractAttachmentMeta(null)).toEqual([]);
     expect(extractAttachmentMeta('not an object')).toEqual([]);
     expect(extractAttachmentMeta({})).toEqual([]);
+  });
+
+  it('bounds recursion on a pathologically deep bodyStructure (no stack overflow)', () => {
+    // Build a 5000-level nested childNodes chain — far past MAX_MIME_DEPTH.
+    let node: Record<string, unknown> = {
+      type: 'application/pdf',
+      size: 10,
+      parameters: { name: 'deep.pdf' },
+    };
+    for (let i = 0; i < 5000; i++) {
+      node = { type: 'multipart/mixed', childNodes: [node] };
+    }
+    // Must return (capped) rather than throw RangeError.
+    expect(() => extractAttachmentMeta(node)).not.toThrow();
+    expect(() => findMimePartByFilename(node, 'deep.pdf')).not.toThrow();
+  });
+
+  // Regression: Outlook / forwarded mail emits attachment parts without an
+  // exact `Content-Disposition: attachment` (capitalized, or filename only on
+  // Content-Type name=). The metadata path tolerated this; the download/save
+  // paths did not, so search reported attachments that could never be pulled.
+  it('detects an attachment with capitalized Content-Disposition: Attachment', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { type: 'text/plain', size: 50 },
+        {
+          type: 'application/pdf',
+          size: 9000,
+          disposition: 'Attachment',
+          dispositionParameters: { filename: 'quote.pdf' },
+        },
+      ],
+    };
+    const result = extractAttachmentMeta(struct);
+    expect(result).toHaveLength(1);
+    expect(result[0].filename).toBe('quote.pdf');
+  });
+
+  it('finds attachments inside a forwarded message/rfc822 wrapper', () => {
+    const forwarded = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { type: 'text/plain', size: 80 },
+        {
+          type: 'message/rfc822',
+          part: '2',
+          childNodes: [
+            {
+              type: 'multipart/mixed',
+              childNodes: [
+                { type: 'text/html', size: 300 },
+                {
+                  type: 'application/pdf',
+                  size: 51200,
+                  // Forwarded by Outlook: name= param only, no disposition.
+                  parameters: { name: 'SM482_quotation.pdf' },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const result = extractAttachmentMeta(forwarded);
+    expect(result).toHaveLength(1);
+    expect(result[0].filename).toBe('SM482_quotation.pdf');
+    expect(hasAttachments(forwarded)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findMimePartByFilename — must address exactly the parts the metadata path
+// reports (no divergence), including forwarded message/rfc822 nesting.
+// ---------------------------------------------------------------------------
+
+describe('findMimePartByFilename', () => {
+  it('prefers imapflow node.part when present', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { type: 'text/plain', size: 50, part: '1' },
+        {
+          type: 'application/pdf',
+          size: 9000,
+          part: '2',
+          disposition: 'attachment',
+          dispositionParameters: { filename: 'doc.pdf' },
+        },
+      ],
+    };
+    expect(findMimePartByFilename(struct, 'doc.pdf')).toBe('2');
+  });
+
+  it('resolves a name=-param-only attachment (no Content-Disposition)', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { type: 'text/plain', size: 50 },
+        { type: 'application/pdf', size: 4096, parameters: { name: 'invoice.pdf' } },
+      ],
+    };
+    // No node.part on children → synthesized fallback path.
+    expect(findMimePartByFilename(struct, 'invoice.pdf')).toBe('2');
+  });
+
+  it('resolves a part inside a forwarded message/rfc822 (node.part)', () => {
+    const forwarded = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { type: 'text/plain', size: 80, part: '1' },
+        {
+          type: 'message/rfc822',
+          part: '2',
+          childNodes: [
+            {
+              type: 'multipart/mixed',
+              childNodes: [
+                { type: 'text/html', size: 300, part: '2.1' },
+                {
+                  type: 'application/pdf',
+                  size: 51200,
+                  part: '2.2',
+                  parameters: { name: 'SM482_quotation.pdf' },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(findMimePartByFilename(forwarded, 'SM482_quotation.pdf')).toBe('2.2');
+  });
+
+  it('synthesizes the rfc822 fallback without an extra numbering level', () => {
+    // Same shape but imapflow did NOT populate node.part → fallback must not
+    // add a spurious level for the message/rfc822 wrapper.
+    const forwarded = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { type: 'text/plain', size: 80 },
+        {
+          type: 'message/rfc822',
+          childNodes: [
+            {
+              type: 'multipart/mixed',
+              childNodes: [
+                { type: 'text/html', size: 300 },
+                {
+                  type: 'application/pdf',
+                  size: 51200,
+                  parameters: { name: 'nested.pdf' },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    // wrapper = part 2; embedded message root inherits 2; pdf = 2.2
+    expect(findMimePartByFilename(forwarded, 'nested.pdf')).toBe('2.2');
+  });
+
+  it('does not resolve an inline image skipped by the metadata path (parity)', () => {
+    const struct = {
+      type: 'multipart/related',
+      childNodes: [
+        { type: 'text/html', size: 400, part: '1' },
+        {
+          type: 'image/png',
+          size: 8000,
+          part: '2',
+          id: '<logo@example.com>',
+          disposition: 'inline',
+          dispositionParameters: { filename: 'logo.png' },
+        },
+      ],
+    };
+    expect(extractAttachmentMeta(struct)).toEqual([]);
+    expect(findMimePartByFilename(struct, 'logo.png')).toBeUndefined();
+  });
+
+  it('metadata/part parity: every reported attachment resolves to a part', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        { type: 'text/plain', size: 50, part: '1' },
+        {
+          type: 'application/pdf',
+          size: 9000,
+          part: '2',
+          disposition: 'Attachment',
+          dispositionParameters: { filename: 'a.pdf' },
+        },
+        {
+          type: 'image/jpeg',
+          size: 7000,
+          part: '3',
+          parameters: { name: 'b.jpg' },
+        },
+      ],
+    };
+    for (const att of extractAttachmentMeta(struct)) {
+      expect(findMimePartByFilename(struct, att.filename)).toBeDefined();
+    }
   });
 });
 

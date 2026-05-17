@@ -145,70 +145,95 @@ function parseAddresses(addrs: { name?: string; address?: string }[] | undefined
  * `type` as the combined `type/subtype` string (e.g. `"application/pdf"`),
  * `dispositionParameters` and `parameters` for filename/name.
  */
+/**
+ * Lenient classification of a SINGLE bodyStructure node. Returns the
+ * attachment metadata for a leaf that should be treated as an attachment,
+ * or `null` otherwise (multipart container, inline HTML resource, plain
+ * body part, non-attachment). This is the single source of truth shared by
+ * `extractAttachmentMeta`, `findMimePartByFilename`, and the watcher's
+ * has-attachment heuristic. Keeping all detection on one predicate is what
+ * prevents the metadata/download divergence that this routine was written
+ * to fix — do not reintroduce a second, stricter check elsewhere.
+ */
+export function classifyAttachmentNode(node: unknown): AttachmentMeta | null {
+  if (!node || typeof node !== 'object') return null;
+  const n = node as Record<string, unknown>;
+
+  const rawType = typeof n.type === 'string' ? n.type : '';
+  const lowerType = rawType.toLowerCase();
+  if (lowerType.startsWith('multipart/')) return null;
+
+  const disposition = typeof n.disposition === 'string' ? n.disposition.toLowerCase() : undefined;
+  const dispParams = (n.dispositionParameters ?? {}) as Record<string, string>;
+  const typeParams = (n.parameters ?? {}) as Record<string, string>;
+  const filename = dispParams.filename ?? dispParams.name ?? typeParams.name ?? undefined;
+  const contentId = typeof n.id === 'string' ? n.id : undefined;
+
+  // Skip inline resources that have a Content-ID (embedded HTML images).
+  if (disposition === 'inline' && contentId) return null;
+
+  let isAttachment = false;
+  if (disposition === 'attachment') {
+    isAttachment = true;
+  } else if (filename) {
+    // No explicit disposition but a filename is present — treat as attachment
+    // unless it's a plain text/html body.
+    if (lowerType !== 'text/plain' && lowerType !== 'text/html') {
+      isAttachment = true;
+    }
+  }
+
+  if (!isAttachment) return null;
+
+  // mimeType — imapflow's `type` is already `"maintype/subtype"`. Fall back
+  // gracefully if only `subtype` is set (older shapes).
+  let mimeType = lowerType;
+  if (!mimeType) {
+    const sub = typeof n.subtype === 'string' ? n.subtype.toLowerCase() : '';
+    mimeType = sub ? `application/${sub}` : 'application/octet-stream';
+  }
+
+  return {
+    filename: filename ?? 'unnamed',
+    mimeType,
+    size: typeof n.size === 'number' ? n.size : 0,
+  };
+}
+
+/**
+ * Hard cap on MIME nesting depth. Real-world structures are shallow
+ * (forwarded chains rarely exceed single digits); this only exists to
+ * bound recursion against a malformed/adversarial bodyStructure (deep or
+ * self-referential `childNodes`) so the server can't be stack-overflowed.
+ */
+const MAX_MIME_DEPTH = 100;
+
 export function extractAttachmentMeta(bodyStructure: unknown): AttachmentMeta[] {
   const out: AttachmentMeta[] = [];
 
-  const walk = (node: unknown): void => {
-    if (!node || typeof node !== 'object') return;
+  const walk = (node: unknown, depth: number): void => {
+    if (depth > MAX_MIME_DEPTH || !node || typeof node !== 'object') return;
     const n = node as Record<string, unknown>;
-
-    const rawType = typeof n.type === 'string' ? n.type : '';
-    const lowerType = rawType.toLowerCase();
-    const isMultipart = lowerType.startsWith('multipart/');
 
     // Recurse first so we cover every branch.
     if (Array.isArray(n.childNodes)) {
       n.childNodes.forEach((child) => {
-        walk(child);
+        walk(child, depth + 1);
       });
     }
 
-    if (isMultipart) return;
-
-    const disposition = typeof n.disposition === 'string' ? n.disposition.toLowerCase() : undefined;
-    const dispParams = (n.dispositionParameters ?? {}) as Record<string, string>;
-    const typeParams = (n.parameters ?? {}) as Record<string, string>;
-    const filename = dispParams.filename ?? dispParams.name ?? typeParams.name ?? undefined;
-    const contentId = typeof n.id === 'string' ? n.id : undefined;
-
-    // Skip inline resources that have a Content-ID (embedded HTML images).
-    if (disposition === 'inline' && contentId) return;
-
-    let isAttachment = false;
-    if (disposition === 'attachment') {
-      isAttachment = true;
-    } else if (filename) {
-      // No explicit disposition but a filename is present — treat as attachment
-      // unless it's a plain text body.
-      if (lowerType !== 'text/plain' && lowerType !== 'text/html') {
-        isAttachment = true;
-      }
-    }
-
-    if (!isAttachment) return;
-
-    // mimeType — imapflow's `type` is already `"maintype/subtype"`. Fall back
-    // gracefully if only `subtype` is set (older shapes).
-    let mimeType = lowerType;
-    if (!mimeType) {
-      const sub = typeof n.subtype === 'string' ? n.subtype.toLowerCase() : '';
-      mimeType = sub ? `application/${sub}` : 'application/octet-stream';
-    }
-
-    out.push({
-      filename: filename ?? 'unnamed',
-      mimeType,
-      size: typeof n.size === 'number' ? n.size : 0,
-    });
+    const classified = classifyAttachmentNode(n);
+    if (classified) out.push(classified);
   };
 
-  walk(bodyStructure);
+  walk(bodyStructure, 0);
   return out;
 }
 
-function hasAttachments(bodyStructure: unknown): boolean {
-  // Delegate to the richer helper so legacy callers (e.g. getEmailStats) use
-  // the same semantics as extractAttachmentMeta / EmailMeta.hasAttachments.
+export function hasAttachments(bodyStructure: unknown): boolean {
+  // Delegate to the richer helper so legacy callers (e.g. getEmailStats,
+  // WatcherService) use the same semantics as extractAttachmentMeta /
+  // EmailMeta.hasAttachments.
   return extractAttachmentMeta(bodyStructure).length > 0;
 }
 
@@ -234,52 +259,52 @@ export function extractCidReferences(html: string): string[] {
   return out;
 }
 
-function extractAttachments(bodyStructure: unknown): AttachmentMeta[] {
-  const attachments: AttachmentMeta[] = [];
-  if (!bodyStructure || typeof bodyStructure !== 'object') return attachments;
-
-  const bs = bodyStructure as Record<string, unknown>;
-  if (bs.disposition === 'attachment') {
-    const params = (bs.dispositionParameters ?? bs.parameters ?? {}) as Record<string, string>;
-    attachments.push({
-      filename: params.filename ?? params.name ?? 'unnamed',
-      mimeType: `${bs.type ?? 'application'}/${bs.subtype ?? 'octet-stream'}`,
-      size: (bs.size as number) ?? 0,
-    });
-  }
-
-  if (Array.isArray(bs.childNodes)) {
-    (bs.childNodes as unknown[]).forEach((child) => {
-      attachments.push(...extractAttachments(child));
-    });
-  }
-
-  return attachments;
-}
-
-/** Find the MIME part number for an attachment by filename. */
-function findMimePartByFilename(
+/**
+ * Find the IMAP MIME part number for an attachment by filename.
+ *
+ * Detection uses the exact same lenient predicate as
+ * `extractAttachmentMeta` (`classifyAttachmentNode`) so the set of parts
+ * this can address is identical to the set the metadata path reports —
+ * the previous divergence (a stricter `disposition === 'attachment'`
+ * check here) made forwarded / Outlook mail report attachments that
+ * could never be downloaded.
+ *
+ * imapflow already populates `node.part` with the correct IMAP section
+ * spec, including the extra addressing level a `message/rfc822` wrapper
+ * introduces, so that is preferred. The synthesized fallback (used only
+ * when `part` is absent) accounts for `message/rfc822`: the embedded
+ * message's root keeps the wrapper's section number rather than gaining
+ * an extra `.1` level.
+ */
+export function findMimePartByFilename(
   bodyStructure: unknown,
   targetFilename: string,
   partPath = '',
+  depth = 0,
 ): string | undefined {
-  if (!bodyStructure || typeof bodyStructure !== 'object') return undefined;
+  if (depth > MAX_MIME_DEPTH || !bodyStructure || typeof bodyStructure !== 'object') {
+    return undefined;
+  }
 
   const bs = bodyStructure as Record<string, unknown>;
-  const currentPart = bs.part as string | undefined;
+  const currentPart = typeof bs.part === 'string' ? bs.part : undefined;
   const effectivePath = currentPart ?? partPath;
+  const lowerType = (typeof bs.type === 'string' ? bs.type : '').toLowerCase();
 
-  if (bs.disposition === 'attachment') {
-    const params = (bs.dispositionParameters ?? bs.parameters ?? {}) as Record<string, string>;
-    const filename = params.filename ?? params.name ?? 'unnamed';
-    if (filename === targetFilename) return effectivePath;
+  const classified = classifyAttachmentNode(bs);
+  if (classified?.filename === targetFilename) {
+    return effectivePath || undefined;
   }
 
   if (Array.isArray(bs.childNodes)) {
+    const isRfc822 = lowerType === 'message/rfc822';
     // eslint-disable-next-line no-plusplus
     for (let i = 0; i < bs.childNodes.length; i++) {
-      const childPart = effectivePath ? `${effectivePath}.${i + 1}` : String(i + 1);
-      const found = findMimePartByFilename(bs.childNodes[i], targetFilename, childPart);
+      // A message/rfc822 wrapper does not add a numbering level: its single
+      // embedded-message child inherits the wrapper's section number.
+      const indexed = effectivePath ? `${effectivePath}.${i + 1}` : String(i + 1);
+      const childPart = isRfc822 ? effectivePath || String(i + 1) : indexed;
+      const found = findMimePartByFilename(bs.childNodes[i], targetFilename, childPart, depth + 1);
       if (found) return found;
     }
   }
@@ -415,7 +440,7 @@ async function messageToEmail(
     messageId: (envelope.messageId as string) ?? '',
     inReplyTo: (envelope.inReplyTo as string) ?? undefined,
     references: headers.references?.split(/\s+/).filter(Boolean),
-    attachments: extractAttachments(msg.bodyStructure),
+    attachments: extractAttachmentMeta(msg.bodyStructure),
     headers,
   };
 }
@@ -2406,7 +2431,7 @@ export default class ImapService {
         throw new Error(`Email ${emailId} not found in ${mailbox}`);
       }
 
-      const attachments = extractAttachments(msg.bodyStructure);
+      const attachments = extractAttachmentMeta(msg.bodyStructure);
       const attachment = attachments.find((a) => a.filename === filename);
       if (!attachment) {
         throw new Error(
@@ -2491,7 +2516,7 @@ export default class ImapService {
       );
       if (!msg) return [];
       // biome-ignore format: line too long; eslint implicit-arrow-linebreak prevents multi-line implicit return
-      attachmentMetas = extractAttachments(msg.bodyStructure).filter((a) => a.size <= maxSizeBytes && !a.mimeType.includes('calendar') && !a.filename.toLowerCase().endsWith('.ics'));
+      attachmentMetas = extractAttachmentMeta(msg.bodyStructure).filter((a) => a.size <= maxSizeBytes && !a.mimeType.includes('calendar') && !a.filename.toLowerCase().endsWith('.ics'));
     } finally {
       lock.release();
     }
@@ -3014,8 +3039,8 @@ export default class ImapService {
   /**
    * Recursively find body parts with text/calendar content type.
    */
-  private findCalendarParts(structure: unknown, prefix = ''): string[] {
-    if (!structure || typeof structure !== 'object') return [];
+  private findCalendarParts(structure: unknown, prefix = '', depth = 0): string[] {
+    if (depth > MAX_MIME_DEPTH || !structure || typeof structure !== 'object') return [];
     const s = structure as Record<string, unknown>;
     const parts: string[] = [];
 
@@ -3045,7 +3070,7 @@ export default class ImapService {
     if (Array.isArray(s.childNodes)) {
       s.childNodes.forEach((child: unknown, i: number) => {
         const childPrefix = prefix ? `${prefix}.${i + 1}` : `${i + 1}`;
-        parts.push(...this.findCalendarParts(child, childPrefix));
+        parts.push(...this.findCalendarParts(child, childPrefix, depth + 1));
       });
     }
 
