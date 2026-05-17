@@ -600,9 +600,23 @@ export default class ImapService {
     > => {
       const e = await connections.createEphemeralImapClient(accountName);
       eph = e;
+      // [P1] If the caller already gave up while connect was in flight, close
+      // the just-opened connection NOW and bail — do NOT proceed into SELECT
+      // (which on a huge folder can itself stall forever, leaving an orphan
+      // connection + server-side work running long after we returned timeout).
+      if (timedOut) {
+        closeEph();
+        return { ok: false, status: timeoutStatus(timeoutMs) };
+      }
       // (a) the ephemeral connection must SELECT its own mailbox or SEARCH
       // returns false (a manufactured false-negative).
       const elock = await e.getMailboxLock(mailbox);
+      // Same guard after the (potentially slow) SELECT resumes.
+      if (timedOut) {
+        elock.release();
+        closeEph();
+        return { ok: false, status: timeoutStatus(timeoutMs) };
+      }
       try {
         return await ImapService.runSearch(e, criteria);
       } finally {

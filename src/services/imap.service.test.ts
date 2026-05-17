@@ -642,6 +642,40 @@ describe('ImapService', () => {
         vi.useRealTimers();
       }
     });
+
+    it('R3/D3 [P1]: a CONNECT resolving after timeout, then a stalled SELECT, still closes the orphan', async () => {
+      vi.useFakeTimers();
+      try {
+        client.mailbox = { exists: 50_000 };
+        const ephemeral = createMockImapClient();
+        // SELECT stalls forever — so `work` would NEVER settle on its own.
+        ephemeral.getMailboxLock.mockReturnValue(new Promise(() => {}));
+        // Connect resolves only when we say so — AFTER the bounded timeout.
+        let resolveConnect: () => void = () => {};
+        connections.createEphemeralImapClient.mockReturnValue(
+          new Promise((res) => {
+            resolveConnect = () => res(ephemeral);
+          }),
+        );
+
+        const p = service.searchEmails('test', 'needle', {});
+        await vi.advanceTimersByTimeAsync(120_000); // timeout fires; caller returns
+        const result = await p;
+        expect(result.searchStatus?.kind).toBe('timeout');
+
+        // Connect now completes LATE. The late connection must be closed
+        // immediately (timedOut already true) — NOT left open while a SELECT
+        // it can never complete stalls forever (the leak codex flagged).
+        resolveConnect();
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(ephemeral.close).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   // -----------------------------------------------------------------------
