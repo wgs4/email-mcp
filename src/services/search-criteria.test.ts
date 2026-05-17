@@ -13,6 +13,7 @@ describe('buildSearchCriteria', () => {
           facets: undefined,
         },
         gmailRawUsed: false,
+        bodyScan: false,
         warnings: [],
       });
     });
@@ -32,12 +33,10 @@ describe('buildSearchCriteria', () => {
         { isGmail: false },
       );
 
-      // R2: free-text `query` is HEADER-ONLY (subject/from) — the {body:q} OR
-      // member was removed (it forced a pathological non-FTS BODY scan that
-      // the server NO'd → the silent false-negative). body:/text: are the
-      // explicit deep-search opt-in.
+      // query is deep-by-default (subject/from/body OR). PR-2 makes the
+      // big-folder body scan bounded + warned rather than disabling it.
       expect(result.criteria).toEqual({
-        or: [{ subject: 'invoice' }, { from: 'invoice' }],
+        or: [{ subject: 'invoice' }, { from: 'invoice' }, { body: 'invoice' }],
         to: 'billing@example.com',
         larger: 10 * 1024,
         smaller: 1000 * 1024,
@@ -46,6 +45,8 @@ describe('buildSearchCriteria', () => {
       // hasAttachment stays in postFilters, NOT in criteria
       expect(result.postFilters.hasAttachment).toBe(true);
       expect(result.gmailRawUsed).toBe(false);
+      // A free-text query touches the body → flagged for the R5 at-risk gate.
+      expect(result.bodyScan).toBe(true);
     });
 
     it('answered: false becomes answered: false in criteria (imapflow handles UN- prefix)', () => {
@@ -54,36 +55,58 @@ describe('buildSearchCriteria', () => {
     });
   });
 
-  describe('R2 — query is header-only; body:/text: are the explicit deep opt-in', () => {
-    it('query builds {or:[subject,from]} with NO body member', () => {
+  describe('query is deep-by-default (subject/from/body); bodyScan flag drives the R5 gate', () => {
+    it('query builds {or:[subject,from,body]} (deep by default)', () => {
       const result = buildSearchCriteria({ query: 'Order #29804' }, { isGmail: false });
       expect(result.criteria).toEqual({
-        or: [{ subject: 'Order #29804' }, { from: 'Order #29804' }],
+        or: [{ subject: 'Order #29804' }, { from: 'Order #29804' }, { body: 'Order #29804' }],
       });
-      // Explicitly assert no body OR member sneaks back in.
-      const or = (result.criteria as { or?: Record<string, unknown>[] }).or ?? [];
-      expect(or.some((m) => 'body' in m)).toBe(false);
+      expect(result.bodyScan).toBe(true);
     });
 
-    it('body: filter still performs a body search (explicit deep opt-in)', () => {
+    it('body: filter performs a body search and sets bodyScan', () => {
       const result = buildSearchCriteria({ body: 'invoice total' }, { isGmail: false });
       expect(result.criteria).toEqual({ body: 'invoice total' });
+      expect(result.bodyScan).toBe(true);
     });
 
-    it('text: filter still performs a full-text search (explicit deep opt-in)', () => {
+    it('text: filter performs a full-text search and sets bodyScan', () => {
       const result = buildSearchCriteria({ text: 'invoice total' }, { isGmail: false });
       expect(result.criteria).toEqual({ text: 'invoice total' });
+      expect(result.bodyScan).toBe(true);
     });
 
-    it('query + body: combine — header OR plus the explicit body condition', () => {
+    it('query + body: combine — deep OR plus the explicit body condition', () => {
       const result = buildSearchCriteria(
         { query: 'refund', body: 'wire transfer' },
         { isGmail: false },
       );
       expect(result.criteria).toEqual({
-        or: [{ subject: 'refund' }, { from: 'refund' }],
+        or: [{ subject: 'refund' }, { from: 'refund' }, { body: 'refund' }],
         body: 'wire transfer',
       });
+      expect(result.bodyScan).toBe(true);
+    });
+
+    it('pure header/date filters (no query/body/text) do NOT set bodyScan', () => {
+      const result = buildSearchCriteria(
+        { from: 'green.jonadam@gmail.com', subject: 'Order', since: '2024-01-01' },
+        { isGmail: false },
+      );
+      expect(result.bodyScan).toBe(false);
+      // sanity: this is a cheap header/date search, no OR-body, no body/text
+      expect(JSON.stringify(result.criteria)).not.toContain('"body"');
+    });
+
+    it('empty params → bodyScan false', () => {
+      const result = buildSearchCriteria({}, { isGmail: false });
+      expect(result.bodyScan).toBe(false);
+    });
+
+    it('gmail_raw short-circuit → bodyScan false (Gmail searches natively)', () => {
+      const result = buildSearchCriteria({ gmailRaw: 'from:x' }, { isGmail: true });
+      expect(result.gmailRawUsed).toBe(true);
+      expect(result.bodyScan).toBe(false);
     });
   });
 
