@@ -5,6 +5,7 @@
  */
 
 import type { ImapFlow } from 'imapflow';
+import { simpleParser } from 'mailparser';
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type { IConnectionManager } from '../connections/types.js';
 import { sanitizeMailboxName } from '../safety/validation.js';
@@ -26,6 +27,7 @@ import type {
   SearchStatus,
   SenderStat,
 } from '../types/index.js';
+import { nonEmpty, RAW_CAP } from '../utils/body-format.js';
 import type { AttachmentInput, ResolvedAttachment } from './attachment-resolver.js';
 import { resolveAttachments } from './attachment-resolver.js';
 import { assertSafeDestination, resolveUniquePath, sanitizeFilename } from './file-paths.js';
@@ -45,6 +47,16 @@ import {
 // ---------------------------------------------------------------------------
 // Limits
 // ---------------------------------------------------------------------------
+
+/**
+ * Upper bound on RFC822 `source` size we will hand to `simpleParser`.
+ * `simpleParser` buffers + decodes the whole message; a pathological
+ * multi-hundred-MB message (huge base64 attachment) would pin CPU/memory.
+ * Above this we skip the parse, emit a visible extraction marker, and fall
+ * back to the capped raw source. 25 MB comfortably covers real mail
+ * (typical attachment ceilings are 10–25 MB) while bounding the worst case.
+ */
+const MAX_PARSE_SOURCE_BYTES = 25 * 1024 * 1024;
 
 /** Maximum UIDs retained after the server SEARCH before pagination. */
 const MAX_SEARCH_UIDS = 5000;
@@ -377,58 +389,125 @@ function messageToEmailMeta(msg: Record<string, unknown>): EmailMeta {
   };
 }
 
-async function messageToEmail(
-  msg: Record<string, unknown>,
-  client: ImapFlow,
-  uid: number,
-): Promise<Email> {
+/**
+ * True for the embedded-message attachment `simpleParser` emits for
+ * forwarded mail (`message/rfc822`). Extracted as a named predicate so the
+ * `.find()` call stays a single readable line (and to dodge the
+ * biome/eslint arrow-formatting tug-of-war on a 3-clause inline arrow).
+ */
+function isRfc822Attachment(a: { contentType?: string; content?: unknown }): boolean {
+  return (
+    typeof a?.contentType === 'string' &&
+    a.contentType.toLowerCase() === 'message/rfc822' &&
+    Buffer.isBuffer(a.content)
+  );
+}
+
+/**
+ * Build the full `Email` (incl. body) from a fetched message.
+ *
+ * Body extraction is MIME-aware: it parses the already-fetched RFC822
+ * `source` ONCE with `simpleParser`. That single walk correctly handles
+ * nested multipart, Content-Transfer-Encoding (base64/quoted-printable),
+ * non-UTF-8 charsets, and embedded `message/rfc822` (forwarded mail) —
+ * replacing the old two-stage hack (a top-level Content-Type substring
+ * sniff that dumped the raw multipart blob into `bodyText`, then an
+ * unconditional `download(uid,'1')` that clobbered it with "" whenever
+ * Gmail's empty text/plain alternative was part 1). The old code returned
+ * a blank body for essentially all Gmail/forwarded/HTML mail.
+ *
+ * Pipeline:
+ *
+ *   msg.source (RFC822 Buffer)
+ *     │  size > MAX_PARSE_SOURCE_BYTES ─────► bodyWarning, skip parse
+ *     │
+ *     ▼  simpleParser(source)
+ *   parsed.text / parsed.html ──(trim-empty?)──► bodyText / bodyHtml
+ *     │  both empty + message/rfc822 attachment ─► recurse into forwarded
+ *     │  parse threw ──────────────────────────► bodyWarning
+ *     ▼
+ *   still nothing ► raw = capped source + bodyWarning  (format=full hatch)
+ *
+ * `source: true` is part of the get_email / get_thread fetch shape only —
+ * search/list paths use `messageToEmailMeta` and never reach here.
+ * Attachment metadata still comes from the shared `bodyStructure` walk
+ * (#14) so this fix does not regress attachment detection.
+ */
+async function messageToEmail(msg: Record<string, unknown>): Promise<Email> {
   const meta = messageToEmailMeta(msg);
   const envelope = (msg.envelope ?? {}) as Record<string, unknown>;
 
-  // Parse full source for body content
   let bodyText: string | undefined;
   let bodyHtml: string | undefined;
+  let raw: string | undefined;
+  let bodyWarning: string | undefined;
+  let parsedReferences: string[] | undefined;
   const headers: Record<string, string> = {};
 
-  if (msg.source && Buffer.isBuffer(msg.source)) {
-    const raw = msg.source.toString('utf-8');
-    const headerEnd = raw.indexOf('\r\n\r\n');
+  const { source } = msg;
+  if (Buffer.isBuffer(source)) {
+    const oversize = source.length > MAX_PARSE_SOURCE_BYTES;
+    // When oversized, NEVER materialize the full (possibly hundreds-of-MB)
+    // buffer as a JS string — that would defeat the parse cap and pin memory
+    // on attacker-controlled mail. Decode only a RAW_CAP-bounded prefix,
+    // which still covers the header block + the raw fallback sample. Within
+    // the cap, decode in full (25 MB is the accepted upper bound).
+    const decodeBuf = oversize ? source.subarray(0, RAW_CAP) : source;
+    const rawStr = decodeBuf.toString('utf-8');
+    const headerEnd = rawStr.indexOf('\r\n\r\n');
     if (headerEnd >= 0) {
-      // Parse headers
-      const headerSection = raw.slice(0, headerEnd);
-      headerSection.split('\r\n').forEach((line) => {
-        const colonIdx = line.indexOf(':');
-        if (colonIdx > 0 && !line.startsWith(' ') && !line.startsWith('\t')) {
-          const key = line.slice(0, colonIdx).trim().toLowerCase();
-          const value = line.slice(colonIdx + 1).trim();
-          headers[key] = value;
+      rawStr
+        .slice(0, headerEnd)
+        .split('\r\n')
+        .forEach((line) => {
+          const colonIdx = line.indexOf(':');
+          if (colonIdx > 0 && !line.startsWith(' ') && !line.startsWith('\t')) {
+            headers[line.slice(0, colonIdx).trim().toLowerCase()] = line.slice(colonIdx + 1).trim();
+          }
+        });
+    }
+
+    if (oversize) {
+      bodyWarning = `source too large to parse (${Math.round(
+        source.length / 1024 / 1024,
+      )} MB > ${MAX_PARSE_SOURCE_BYTES / 1024 / 1024} MB cap)`;
+    } else {
+      try {
+        const parsed = await simpleParser(source);
+        bodyText = nonEmpty(parsed.text);
+        bodyHtml = nonEmpty(typeof parsed.html === 'string' ? parsed.html : undefined);
+        // mailparser's reference extraction handles header folding and
+        // LF-only line endings that the lightweight CRLF header scan above
+        // does not — prefer it for the threading-critical references list.
+        if (Array.isArray(parsed.references)) {
+          parsedReferences = parsed.references.filter(Boolean);
+        } else if (typeof parsed.references === 'string') {
+          parsedReferences = parsed.references.split(/\s+/).filter(Boolean);
         }
-      });
 
-      const body = raw.slice(headerEnd + 4);
-      // Simple content type detection
-      const contentType = headers['content-type'] ?? '';
-      if (contentType.includes('text/html')) {
-        bodyHtml = body;
-      } else {
-        bodyText = body;
+        // Forwarded mail: simpleParser surfaces the embedded message as a
+        // message/rfc822 attachment instead of merging it into .text.
+        // Recurse so the forwarded body is not lost (AC6).
+        if (!bodyText && !bodyHtml && Array.isArray(parsed.attachments)) {
+          const fwd = parsed.attachments.find(isRfc822Attachment);
+          if (fwd) {
+            const inner = await simpleParser(fwd.content);
+            bodyText = nonEmpty(inner.text);
+            bodyHtml = nonEmpty(typeof inner.html === 'string' ? inner.html : undefined);
+          }
+        }
+      } catch (err) {
+        bodyWarning = `MIME parse error: ${err instanceof Error ? err.message : String(err)}`;
       }
     }
-  }
 
-  // Try to get text/html parts via download if body parsing was simple
-  try {
-    const textPart = await client.download(String(uid), '1', { uid: true });
-    if (textPart?.content) {
-      const chunks: Buffer[] = [];
-      // eslint-disable-next-line no-restricted-syntax
-      for await (const chunk of textPart.content) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-      }
-      bodyText = Buffer.concat(chunks).toString('utf-8');
+    // Escape hatch: nothing decodable (parse failure, oversized,
+    // whitespace-only, or genuinely empty) → expose capped raw source so
+    // `format=full` is never a silent blank, and record why.
+    if (!bodyText && !bodyHtml) {
+      raw = rawStr.length > RAW_CAP ? rawStr.slice(0, RAW_CAP) : rawStr;
+      bodyWarning ??= 'no decodable text or HTML part';
     }
-  } catch {
-    // Part may not exist
   }
 
   return {
@@ -437,9 +516,11 @@ async function messageToEmail(
     bcc: parseAddresses(envelope.bcc as Record<string, string>[]),
     bodyText,
     bodyHtml,
+    ...(raw !== undefined ? { raw } : {}),
+    ...(bodyWarning !== undefined ? { bodyWarning } : {}),
     messageId: (envelope.messageId as string) ?? '',
     inReplyTo: (envelope.inReplyTo as string) ?? undefined,
-    references: headers.references?.split(/\s+/).filter(Boolean),
+    references: parsedReferences ?? headers.references?.split(/\s+/).filter(Boolean),
     attachments: extractAttachmentMeta(msg.bodyStructure),
     headers,
   };
@@ -997,7 +1078,7 @@ export default class ImapService {
         throw new Error(`Email ${emailId} not found in ${mailbox}`);
       }
 
-      return await messageToEmail(msg as unknown as Record<string, unknown>, client, uid);
+      return await messageToEmail(msg as unknown as Record<string, unknown>);
     } finally {
       lock.release();
     }
@@ -2698,8 +2779,7 @@ export default class ImapService {
         { uid: true },
       )) {
         const raw = msg as unknown as Record<string, unknown>;
-        const uid = raw.uid as number;
-        messages.push(await messageToEmail(raw, client, uid));
+        messages.push(await messageToEmail(raw));
       }
 
       // Sort chronologically

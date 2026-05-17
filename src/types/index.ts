@@ -259,6 +259,19 @@ export interface Email extends EmailMeta {
   bcc?: EmailAddress[];
   bodyText?: string;
   bodyHtml?: string;
+  /**
+   * Capped raw RFC822 source. Populated by `messageToEmail` ONLY when no
+   * decodable text/html body part was recovered, so `get_email format=full`
+   * still has an escape hatch instead of returning a blank section.
+   * Undefined on the normal path to keep thread fetches memory-bounded.
+   */
+  raw?: string;
+  /**
+   * One-line reason body extraction produced nothing (oversized source,
+   * MIME parse error, or no decodable part). Surfaced as a visible marker
+   * so an extraction failure is never presented as a clean empty body.
+   */
+  bodyWarning?: string;
   messageId: string;
   inReplyTo?: string;
   references?: string[];
