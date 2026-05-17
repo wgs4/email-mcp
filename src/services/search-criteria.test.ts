@@ -32,9 +32,12 @@ describe('buildSearchCriteria', () => {
         { isGmail: false },
       );
 
-      // Legacy inline code merged conditions via Object.assign — same shape expected here:
+      // R2: free-text `query` is HEADER-ONLY (subject/from) — the {body:q} OR
+      // member was removed (it forced a pathological non-FTS BODY scan that
+      // the server NO'd → the silent false-negative). body:/text: are the
+      // explicit deep-search opt-in.
       expect(result.criteria).toEqual({
-        or: [{ subject: 'invoice' }, { from: 'invoice' }, { body: 'invoice' }],
+        or: [{ subject: 'invoice' }, { from: 'invoice' }],
         to: 'billing@example.com',
         larger: 10 * 1024,
         smaller: 1000 * 1024,
@@ -48,6 +51,39 @@ describe('buildSearchCriteria', () => {
     it('answered: false becomes answered: false in criteria (imapflow handles UN- prefix)', () => {
       const result = buildSearchCriteria({ answered: false }, { isGmail: false });
       expect(result.criteria).toEqual({ answered: false });
+    });
+  });
+
+  describe('R2 — query is header-only; body:/text: are the explicit deep opt-in', () => {
+    it('query builds {or:[subject,from]} with NO body member', () => {
+      const result = buildSearchCriteria({ query: 'Order #29804' }, { isGmail: false });
+      expect(result.criteria).toEqual({
+        or: [{ subject: 'Order #29804' }, { from: 'Order #29804' }],
+      });
+      // Explicitly assert no body OR member sneaks back in.
+      const or = (result.criteria as { or?: Record<string, unknown>[] }).or ?? [];
+      expect(or.some((m) => 'body' in m)).toBe(false);
+    });
+
+    it('body: filter still performs a body search (explicit deep opt-in)', () => {
+      const result = buildSearchCriteria({ body: 'invoice total' }, { isGmail: false });
+      expect(result.criteria).toEqual({ body: 'invoice total' });
+    });
+
+    it('text: filter still performs a full-text search (explicit deep opt-in)', () => {
+      const result = buildSearchCriteria({ text: 'invoice total' }, { isGmail: false });
+      expect(result.criteria).toEqual({ text: 'invoice total' });
+    });
+
+    it('query + body: combine — header OR plus the explicit body condition', () => {
+      const result = buildSearchCriteria(
+        { query: 'refund', body: 'wire transfer' },
+        { isGmail: false },
+      );
+      expect(result.criteria).toEqual({
+        or: [{ subject: 'refund' }, { from: 'refund' }],
+        body: 'wire transfer',
+      });
     });
   });
 

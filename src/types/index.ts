@@ -275,6 +275,43 @@ export interface SendResult {
   status: 'sent' | 'failed';
 }
 
+/**
+ * IMAP SEARCH failure classification (R1 — search false-negatives).
+ *
+ * const-object-derived union mirroring ERROR_KIND/WARNING_KIND. Lives here in
+ * the shared-contract leaf because `PaginatedResult` carries it; the runtime
+ * error class + status builders live in `src/services/search-status.ts`.
+ *
+ * D8 (revised, locked): only three honest kinds. imapflow's `SearchCommand`
+ * collapses a server `NO`, a swallowed socket-timeout, AND a local command
+ * failure all into a single `false` — they are NOT distinguishable on the
+ * shared client path. Fabricating a finer label (e.g. `server_no`) would be
+ * the same silent-misclassification class this feature exists to fix.
+ */
+export const SEARCH_FAIL_KIND = {
+  /** `client.search()` resolved non-array (`false`) — imapflow swallowed the cause. */
+  SEARCH_FAILED: 'search_failed',
+  /** `client.search()` rejected — a connection error that escaped SearchCommand. */
+  CONNECTION_ERROR: 'connection_error',
+  /** Our own bounded-wait expiry on an ephemeral connection (PR-2/R3). Reserved. */
+  TIMEOUT: 'timeout',
+} as const;
+
+export type SearchFailKind = (typeof SEARCH_FAIL_KIND)[keyof typeof SEARCH_FAIL_KIND];
+
+export interface SearchStatus {
+  kind: SearchFailKind;
+  /** Human-readable explanation of what failed (never implies "zero matches"). */
+  message: string;
+  /**
+   * Set by the R6 windowed fallback (PR-3) when a narrowed retry was applied.
+   * Reserved here so the contract is stable across the PR sequence.
+   */
+  windowed?: { applied: true; sinceDays: number };
+  /** Actionable next step for the caller (narrow the query, retry, etc.). */
+  suggestion: string;
+}
+
 export interface PaginatedResult<T> {
   items: T[];
   total: number;
@@ -288,6 +325,14 @@ export interface PaginatedResult<T> {
    * returned more UIDs than the cap and results were truncated before counting.
    */
   totalApprox?: boolean;
+  /**
+   * Set when the underlying IMAP SEARCH failed (R1). Distinguishes a failure
+   * from a genuine zero-match so callers never read an empty page as
+   * authoritative. Always accompanied by `searchStatus` + `warning`.
+   */
+  searchFailed?: true;
+  /** Structured failure detail when `searchFailed` is set. */
+  searchStatus?: SearchStatus;
   /** Optional bucketed counts across the full match set (capped). */
   facets?: FacetResult;
 }
