@@ -9,62 +9,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
 import type ImapService from '../services/imap.service.js';
-
-// ---------------------------------------------------------------------------
-// Inline body helpers (avoids cross-tool import)
-// ---------------------------------------------------------------------------
-
-function stripHtml(html: string): string {
-  return html
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n\n')
-    .replace(/<\/div>/gi, '\n')
-    .replace(/<li\b[^>]*>/gi, '\n• ')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function stripReplyChain(text: string): string {
-  const lines = text.split('\n');
-  const stopIdx = lines.findIndex((l) => /^--\s*$/.test(l) || /^_{3,}\s*$/.test(l));
-  const relevant = stopIdx === -1 ? lines : lines.slice(0, stopIdx);
-  return relevant
-    .filter((l) => !l.startsWith('>'))
-    .join('\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function applyBodyFormat(
-  bodyText: string | undefined,
-  bodyHtml: string | undefined,
-  format: 'full' | 'text' | 'stripped',
-  maxLength?: number,
-): string {
-  let body: string;
-  if (format === 'full') {
-    body = bodyText ?? bodyHtml ?? '(no content)';
-  } else {
-    const base = bodyText ?? (bodyHtml ? stripHtml(bodyHtml) : undefined) ?? '(no content)';
-    body = format === 'stripped' ? stripReplyChain(base) : base;
-  }
-  if (maxLength !== undefined && maxLength > 0 && body.length > maxLength) {
-    const remaining = body.length - maxLength;
-    body = `${body.slice(0, maxLength)}\n\n… (${remaining} more characters — increase maxLength to read the full body)`;
-  }
-  return body;
-}
-
-// ---------------------------------------------------------------------------
+import type { BodyFormat } from '../utils/body-format.js';
+import { applyBodyFormat } from '../utils/body-format.js';
 
 export default function registerThreadTools(server: McpServer, imapService: ImapService): void {
   server.tool(
@@ -82,7 +28,7 @@ export default function registerThreadTools(server: McpServer, imapService: Imap
         .enum(['full', 'text', 'stripped'])
         .default('full')
         .describe(
-          'Body format: full=raw (default), text=plain text (strips HTML), stripped=plain text without quoted replies or signatures',
+          'Body format: full=full decoded body — text preferred, else HTML; falls back to a visible marker + capped raw RFC822 source if nothing is decodable (default). text=plain text (strips HTML). stripped=plain text without quoted replies or signatures.',
         ),
       maxLength: z
         .number()
@@ -153,7 +99,7 @@ export default function registerThreadTools(server: McpServer, imapService: Imap
             parts.push('(body omitted — use get_email to read this message)');
           } else {
             parts.push('');
-            parts.push(applyBodyFormat(email.bodyText, email.bodyHtml, format, maxLength));
+            parts.push(applyBodyFormat(email, format as BodyFormat, maxLength));
           }
 
           parts.push('');

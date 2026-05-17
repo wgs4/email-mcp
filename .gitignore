@@ -167,6 +167,9 @@ coverage
 reports/*
 !reports/.gitkeep
 
+# Local AI tooling state (gstack security reports, analytics) — must stay local
+.gstack/
+
 # nyc test coverage
 .nyc_output
 

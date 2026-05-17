@@ -1,5 +1,6 @@
 /* eslint-disable n/no-sync -- tests use sync fs helpers for setup/teardown */
 import type { IConnectionManager } from '../connections/types.js';
+import { applyBodyFormat } from '../utils/body-format.js';
 import ImapService from './imap.service.js';
 import { SearchFailedError } from './search-status.js';
 
@@ -21,6 +22,13 @@ function createMockImapClient() {
     list: vi.fn().mockResolvedValue([]),
     status: vi.fn().mockResolvedValue({ messages: 5, unseen: 2 }),
     fetch: vi.fn().mockReturnValue((async function* fetchMock() {})()),
+    // `fetchOne`/`download` default to null (not absent). Absent methods
+    // throw "is not a function" which the OLD silent `catch {}` in
+    // messageToEmail swallowed — making a missing mock a false-positive
+    // green test. A null default makes "not primed" an explicit, visible
+    // outcome instead.
+    fetchOne: vi.fn().mockResolvedValue(null),
+    download: vi.fn().mockResolvedValue(null),
     search: vi.fn().mockResolvedValue([]),
     messageMove: vi.fn().mockResolvedValue(true),
     messageDelete: vi.fn().mockResolvedValue(true),
@@ -1315,6 +1323,295 @@ describe('ImapService', () => {
       } finally {
         rmSync(tmp, { recursive: true, force: true });
       }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // messageToEmail body extraction — the empty-body-multipart fix.
+  //
+  // Every case here returns EMPTY on pre-fix `main` (top-level Content-Type
+  // sniff + hardcoded download('1') clobber + `??`-vs-"" defect). The fix is
+  // a single MIME-aware simpleParser walk of the already-fetched source.
+  // -------------------------------------------------------------------------
+
+  describe('messageToEmail body extraction (multipart/Gmail/forwarded)', () => {
+    const CRLF = '\r\n';
+    /** Joins lines with CRLF (RFC822 wire format mailparser expects). */
+    const mime = (lines: string[]): Buffer => Buffer.from(lines.join(CRLF), 'utf-8');
+
+    /** Primes client.fetchOne (the getEmail path) with a raw source + optional bodyStructure. */
+    function primeEmail(source: Buffer, bodyStructure?: unknown): void {
+      (client as unknown as { fetchOne: ReturnType<typeof vi.fn> }).fetchOne = vi
+        .fn()
+        .mockResolvedValue({
+          uid: 21557,
+          envelope: { subject: 'International Order', from: [], to: [] },
+          flags: [],
+          ...(bodyStructure !== undefined ? { bodyStructure } : {}),
+          source,
+        });
+    }
+
+    it('multipart/alternative with EMPTY text/plain → body comes from HTML (exact repro)', async () => {
+      primeEmail(
+        mime([
+          'Subject: International Order',
+          'Message-ID: <CAFvpQ=repro@mail.gmail.com>',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/alternative; boundary="b1"',
+          '',
+          '--b1',
+          'Content-Type: text/plain; charset="UTF-8"',
+          '',
+          '',
+          '--b1',
+          'Content-Type: text/html; charset="UTF-8"',
+          '',
+          '<div>Hello, I would like to place an <b>International Order</b>.</div>',
+          '--b1--',
+          '',
+        ]),
+      );
+
+      const email = await service.getEmail('test', '21557', 'INBOX');
+
+      expect(email.bodyText).toBeUndefined();
+      expect(email.bodyHtml).toContain('International Order');
+      // Pre-fix main returns '' here for all three formats.
+      expect(applyBodyFormat(email, 'full')).toContain('International Order');
+      expect(applyBodyFormat(email, 'text')).toContain('International Order');
+      expect(applyBodyFormat(email, 'stripped')).toContain('International Order');
+    });
+
+    it('single-part text/plain still renders (no regression)', async () => {
+      primeEmail(
+        mime([
+          'Subject: Plain',
+          'Content-Type: text/plain; charset=utf-8',
+          '',
+          'Just a plain body line.',
+          '',
+        ]),
+      );
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      expect(email.bodyText).toContain('Just a plain body line.');
+      expect(applyBodyFormat(email, 'text')).toContain('Just a plain body line.');
+    });
+
+    it('top-level text/html still renders (no regression)', async () => {
+      primeEmail(
+        mime(['Content-Type: text/html; charset=utf-8', '', '<p>HTML <i>only</i> body</p>', '']),
+      );
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      expect(email.bodyHtml).toContain('HTML');
+      expect(applyBodyFormat(email, 'text')).toMatch(/HTML.*only.*body/s);
+    });
+
+    it('multipart/mixed + nested alternative + PDF: body AND attachment (no #14 regression)', async () => {
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          {
+            type: 'multipart/alternative',
+            childNodes: [{ type: 'text/plain' }, { type: 'text/html' }],
+          },
+          {
+            type: 'application/pdf',
+            part: '2',
+            size: 1234,
+            disposition: 'attachment',
+            dispositionParameters: { filename: 'lease.pdf' },
+          },
+        ],
+      };
+      primeEmail(
+        mime([
+          'Content-Type: multipart/mixed; boundary="m1"',
+          '',
+          '--m1',
+          'Content-Type: multipart/alternative; boundary="a1"',
+          '',
+          '--a1',
+          'Content-Type: text/plain',
+          '',
+          'Mixed body text here.',
+          '--a1',
+          'Content-Type: text/html',
+          '',
+          '<p>Mixed body text here.</p>',
+          '--a1--',
+          '--m1',
+          'Content-Type: application/pdf; name="lease.pdf"',
+          'Content-Disposition: attachment; filename="lease.pdf"',
+          'Content-Transfer-Encoding: base64',
+          '',
+          'JVBERi0xLjQK',
+          '--m1--',
+          '',
+        ]),
+        bodyStructure,
+      );
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      expect(email.bodyText).toContain('Mixed body text here.');
+      expect(email.attachments.map((a) => a.filename)).toContain('lease.pdf');
+    });
+
+    it('quoted-printable is decoded', async () => {
+      primeEmail(
+        mime([
+          'Content-Type: text/plain; charset=utf-8',
+          'Content-Transfer-Encoding: quoted-printable',
+          '',
+          'Caf=C3=A9 m=C3=BCnchen line=',
+          ' continued',
+          '',
+        ]),
+      );
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      expect(email.bodyText).toContain('Café münchen line continued');
+    });
+
+    it('base64 is decoded', async () => {
+      primeEmail(
+        mime([
+          'Content-Type: text/plain; charset=utf-8',
+          'Content-Transfer-Encoding: base64',
+          '',
+          'SGVsbG8gQmFzZTY0IGJvZHk=',
+          '',
+        ]),
+      );
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      expect(email.bodyText).toContain('Hello Base64 body');
+    });
+
+    it('non-UTF-8 charset (ISO-8859-1) is transcoded', async () => {
+      const header = Buffer.from(
+        ['Content-Type: text/plain; charset=ISO-8859-1', '', ''].join(CRLF),
+        'ascii',
+      );
+      // 0xE9 = é, 0xFC = ü in Latin-1 (invalid as UTF-8 — proves transcoding).
+      const body = Buffer.from([0x43, 0x61, 0x66, 0xe9, 0x20, 0x6d, 0xfc, 0x6e]); // "Café mün"
+      primeEmail(Buffer.concat([header, body]));
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      expect(email.bodyText).toContain('Café mün');
+    });
+
+    it('forwarded message/rfc822 returns the forwarded body', async () => {
+      primeEmail(
+        mime([
+          'Content-Type: multipart/mixed; boundary="f1"',
+          '',
+          '--f1',
+          'Content-Type: text/plain',
+          '',
+          '',
+          '--f1',
+          'Content-Type: message/rfc822',
+          '',
+          'Subject: Fwd inner',
+          'Content-Type: text/plain',
+          '',
+          'This is the forwarded inner body.',
+          '--f1--',
+          '',
+        ]),
+      );
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      const rendered = `${email.bodyText ?? ''}${email.bodyHtml ?? ''}${applyBodyFormat(
+        email,
+        'full',
+      )}`;
+      expect(rendered).toContain('This is the forwarded inner body.');
+    });
+
+    it('whitespace-only body → undefined + raw fallback + visible marker (never silent)', async () => {
+      primeEmail(mime(['Content-Type: text/plain; charset=utf-8', '', '   ', ' ', '\t', '']));
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      expect(email.bodyText).toBeUndefined();
+      expect(email.bodyHtml).toBeUndefined();
+      expect(email.raw).toBeDefined();
+      expect(email.bodyWarning).toBe('no decodable text or HTML part');
+      expect(applyBodyFormat(email, 'full')).toContain('⚠️ body extraction failed');
+      expect(applyBodyFormat(email, 'full')).toContain('--- Raw source ---');
+      expect(applyBodyFormat(email, 'text')).toContain('⚠️ body extraction failed');
+      expect(applyBodyFormat(email, 'text')).not.toContain('--- Raw source ---');
+    });
+
+    it('oversized source skips the parse, caps raw, and warns', async () => {
+      const header = Buffer.from(
+        ['Content-Type: text/plain; charset=utf-8', '', ''].join(CRLF),
+        'ascii',
+      );
+      // 26 MB > MAX_PARSE_SOURCE_BYTES (25 MB).
+      const huge = Buffer.concat([header, Buffer.alloc(26 * 1024 * 1024, 0x61)]);
+      primeEmail(huge);
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      expect(email.bodyText).toBeUndefined();
+      expect(email.bodyWarning).toMatch(/source too large/);
+      expect(email.raw).toBeDefined();
+      // Hard cap: never dump the 26 MB blob.
+      expect((email.raw ?? '').length).toBeLessThanOrEqual(256 * 1024);
+      expect(applyBodyFormat(email, 'full')).toMatch(/body extraction failed/);
+    });
+
+    it('malformed MIME is never a silent empty body', async () => {
+      // Declared boundary that never closes — mailparser is lenient; assert
+      // we surface SOMETHING (content or marker), never a blank.
+      primeEmail(
+        mime([
+          'Content-Type: multipart/alternative; boundary="never-closed"',
+          '',
+          '--never-closed',
+          'Content-Type: text/plain',
+          '',
+          'salvageable text',
+        ]),
+      );
+      const email = await service.getEmail('test', '21557', 'INBOX');
+      const full = applyBodyFormat(email, 'full');
+      expect(full.length).toBeGreaterThan(0);
+      expect(full).not.toBe('(no content)');
+    });
+
+    it('get_thread path renders the body via the same extractor (repro fixture)', async () => {
+      const src = mime([
+        'Subject: International Order',
+        'Message-ID: <thread-repro@mail.gmail.com>',
+        'Content-Type: multipart/alternative; boundary="t1"',
+        '',
+        '--t1',
+        'Content-Type: text/plain',
+        '',
+        '',
+        '--t1',
+        'Content-Type: text/html',
+        '',
+        '<div>Thread body: <b>International Order</b></div>',
+        '--t1--',
+        '',
+      ]);
+      client.search.mockResolvedValue([7]);
+      (client as unknown as { fetchOne: ReturnType<typeof vi.fn> }).fetchOne = vi
+        .fn()
+        .mockResolvedValue({ uid: 7, envelope: { subject: 'International Order' }, source: src });
+      client.fetch.mockReturnValue(
+        // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+        (async function* gen() {
+          yield {
+            uid: 7,
+            envelope: { subject: 'International Order', from: [], to: [] },
+            flags: [],
+            source: src,
+          };
+        })(),
+      );
+
+      const thread = await service.getThread('test', '<thread-repro@mail.gmail.com>', 'INBOX');
+
+      expect(thread.messageCount).toBeGreaterThan(0);
+      expect(thread.messages[0].bodyText).toBeUndefined();
+      expect(thread.messages[0].bodyHtml).toContain('International Order');
     });
   });
 });
