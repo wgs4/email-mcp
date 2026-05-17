@@ -11,6 +11,12 @@ function createMockImapClient() {
   const releaseFn = vi.fn();
   return {
     usable: true,
+    // imapflow sets `mailbox` to the selected-folder object after a lock;
+    // `.exists` = message count (R5/R8 read it FREE under the lock). Default
+    // small so existing tests are never "at-risk" (shared path unchanged).
+    mailbox: { exists: 5 },
+    // imapflow exposes capabilities as a Map post-connect. Empty = no FTS.
+    capabilities: new Map<string, boolean>(),
     getMailboxLock: vi.fn().mockResolvedValue({ release: releaseFn }),
     list: vi.fn().mockResolvedValue([]),
     status: vi.fn().mockResolvedValue({ messages: 5, unseen: 2 }),
@@ -21,6 +27,7 @@ function createMockImapClient() {
     messageFlagsAdd: vi.fn().mockResolvedValue(true),
     messageFlagsRemove: vi.fn().mockResolvedValue(true),
     append: vi.fn().mockResolvedValue({ uid: 42 }),
+    close: vi.fn(),
     _releaseFn: releaseFn,
   };
 }
@@ -36,6 +43,9 @@ function createMockConnectionManager(mockClient: ReturnType<typeof createMockIma
     }),
     getAccountNames: vi.fn().mockReturnValue(['test']),
     getImapClient: vi.fn().mockResolvedValue(mockClient),
+    // Default ephemeral = same mock client; PR-2 tests override per-case to
+    // assert the bounded-wait / close-on-timeout / no-poisoning behavior.
+    createEphemeralImapClient: vi.fn().mockResolvedValue(mockClient),
     getSmtpTransport: vi.fn(),
     closeAll: vi.fn(),
   } satisfies IConnectionManager;
@@ -421,6 +431,114 @@ describe('ImapService', () => {
       // no-sort regression would retain/serve 1..5000 (the oldest) instead.
       expect(client.fetch).toHaveBeenCalledTimes(1);
       expect(client.fetch.mock.calls[0][0]).toBe('6000,5999,5998,5997,5996');
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // PR-2 — bounded deep search: R5 (FTS/size gate) + R3/D3 (ephemeral
+  // bounded wait) + R8 (folder-size hint). Body is deep-by-default again;
+  // these make the big-folder body scan safe instead of disabling it.
+  // -----------------------------------------------------------------------
+
+  describe('searchEmails — PR-2 bounded deep search (R3/R5/R8)', () => {
+    function hit(uid: number, subject: string) {
+      return {
+        uid,
+        envelope: { subject, from: [{ address: 'a@x' }], to: [], date: '2024-01-01T00:00:00Z' },
+        flags: new Set<string>(),
+        bodyStructure: { type: 'text', subtype: 'plain' },
+        source: Buffer.from(''),
+      };
+    }
+
+    it('R8: result carries folderSize from the opened mailbox', async () => {
+      client.mailbox = { exists: 1234 };
+      client.search.mockResolvedValueOnce([]);
+
+      // header-only ⇒ not at-risk ⇒ shared path
+      const result = await service.searchEmails('test', '', { from: 'x@y.com' });
+
+      expect(result.folderSize).toBe(1234);
+    });
+
+    it('R5: a body scan on a large non-FTS folder attaches a cost warning', async () => {
+      client.mailbox = { exists: 50_000 };
+
+      const result = await service.searchEmails('test', 'invoice', {});
+
+      expect(result.warning).toMatch(/large|slow|bounded|narrow/i);
+      expect(result.folderSize).toBe(50_000);
+    });
+
+    it('R5: an FTS-capable server is NOT at-risk — shared path, no cost warning', async () => {
+      client.mailbox = { exists: 50_000 };
+      client.capabilities = new Map([['SEARCH=FUZZY', true]]);
+      client.search.mockResolvedValueOnce([]);
+
+      const result = await service.searchEmails('test', 'invoice', {});
+
+      expect(result.warning).toBeUndefined();
+      expect(client.search).toHaveBeenCalled();
+      expect(connections.createEphemeralImapClient).not.toHaveBeenCalled();
+    });
+
+    it('R5: a header-only query on a huge folder is NOT at-risk (no body scan)', async () => {
+      client.mailbox = { exists: 50_000 };
+      client.search.mockResolvedValueOnce([]);
+
+      const result = await service.searchEmails('test', '', { from: 'a@b.com' });
+
+      expect(result.warning).toBeUndefined();
+      expect(client.search).toHaveBeenCalled();
+      expect(connections.createEphemeralImapClient).not.toHaveBeenCalled();
+    });
+
+    it('R3: an at-risk search runs on the EPHEMERAL connection and returns results', async () => {
+      client.mailbox = { exists: 50_000 };
+      const ephemeral = createMockImapClient();
+      ephemeral.search.mockResolvedValue([7]);
+      connections.createEphemeralImapClient.mockResolvedValue(ephemeral);
+      // page fetch happens on the SHARED client after re-acquiring its lock
+      client.fetch.mockReturnValueOnce(
+        // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+        (async function* gen() {
+          yield hit(7, 'DeepHit');
+        })(),
+      );
+
+      const result = await service.searchEmails('test', 'needle', { pageSize: 10 });
+
+      expect(ephemeral.search).toHaveBeenCalled();
+      expect(ephemeral.getMailboxLock).toHaveBeenCalled(); // D3(a): ephemeral SELECTs its own mailbox
+      expect(result.searchFailed).toBeUndefined();
+      expect(result.items.map((i) => i.subject)).toEqual(['DeepHit']);
+      expect(result.warning).toMatch(/large|slow|bounded|narrow/i);
+      expect(result.folderSize).toBe(50_000);
+    });
+
+    it('R3/D3: a bounded-wait timeout flags kind=timeout, closes the ephemeral conn, never touches the shared client', async () => {
+      vi.useFakeTimers();
+      try {
+        client.mailbox = { exists: 50_000 };
+        const ephemeral = createMockImapClient();
+        // The ephemeral SEARCH hangs forever ⇒ the bounded wait must fire.
+        ephemeral.search.mockReturnValue(new Promise(() => {}));
+        connections.createEphemeralImapClient.mockResolvedValue(ephemeral);
+
+        const p = service.searchEmails('test', 'needle', {});
+        await vi.advanceTimersByTimeAsync(120_000); // well past the budget
+        const result = await p;
+
+        expect(result.searchFailed).toBe(true);
+        expect(result.searchStatus?.kind).toBe('timeout');
+        expect(ephemeral.close).toHaveBeenCalled(); // D3(c): close() not logout()
+        // D3(b)/(d): the shared client is never used for the deep scan.
+        expect(client.search).not.toHaveBeenCalled();
+        expect(client._releaseFn).toHaveBeenCalled(); // shared lock released before slow search
+        expect(result.folderSize).toBe(50_000);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -813,6 +931,11 @@ describe('ImapService', () => {
           if (name === 'account-b') return clientB;
           throw new Error(`unknown account ${name}`);
         }),
+        createEphemeralImapClient: vi.fn().mockImplementation(async (name: string) => {
+          if (name === 'account-a') return clientA;
+          if (name === 'account-b') return clientB;
+          throw new Error(`unknown account ${name}`);
+        }),
         getSmtpTransport: vi.fn(),
         closeAll: vi.fn(),
       } satisfies IConnectionManager;
@@ -876,6 +999,11 @@ describe('ImapService', () => {
         })),
         getAccountNames: vi.fn().mockReturnValue(['account-a', 'account-b']),
         getImapClient: vi.fn().mockImplementation(async (name: string) => {
+          if (name === 'account-a') return clientA;
+          if (name === 'account-b') return clientB;
+          throw new Error(`unknown account ${name}`);
+        }),
+        createEphemeralImapClient: vi.fn().mockImplementation(async (name: string) => {
           if (name === 'account-a') return clientA;
           if (name === 'account-b') return clientB;
           throw new Error(`unknown account ${name}`);

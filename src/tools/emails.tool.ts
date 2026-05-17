@@ -124,9 +124,13 @@ export function formatSearchResult(
   if (failure) return failure;
 
   const warningPrefix = result.warning ? `⚠️ ${result.warning}\n` : '';
+  // R8: surface the opened folder's size so callers can judge
+  // truncation/timeout risk on huge folders (osTicket/Archive).
+  const folderNote =
+    result.folderSize !== undefined ? `📂 folder holds ${result.folderSize} messages\n` : '';
 
   if (result.items.length === 0) {
-    return `${warningPrefix}${emptyMessage}`;
+    return `${warningPrefix}${folderNote}${emptyMessage}`;
   }
 
   const emails = result.items.map(formatEmailMeta).join('\n\n');
@@ -162,7 +166,7 @@ export function formatSearchResult(
     }
   }
 
-  return `${warningPrefix}${header}\n${emails}${facetsBlock}${accountWarningsBlock}`;
+  return `${warningPrefix}${folderNote}${header}\n${emails}${facetsBlock}${accountWarningsBlock}`;
 }
 
 /** Strips HTML markup and decodes common entities to produce readable plain text. */
@@ -654,9 +658,10 @@ export default function registerEmailsTools(
   server.tool(
     'search_emails',
     'Search emails with server-side filters. Omit query (or pass an empty string) to use pure filters. ' +
-      'Free-text `query` is HEADER-ONLY (matches subject + from). For a full message-body search use the ' +
-      'explicit `body:` or `text:` filters — these are slower and, on a non-FTS server over a large folder, ' +
-      'can be very expensive, so prefer narrowing by subject:/from:/date instead. ' +
+      'Free-text `query` searches subject + from + body (deep by default). On a very large folder whose ' +
+      'server has no full-text index, a body scan is expensive: it is run on a bounded connection and, ' +
+      'if it cannot complete, returns an explicitly flagged failure (never a silent zero) with a cost ' +
+      'warning suggesting you narrow by date (since/before/on) or subject:/from:. ' +
       'Supports date ranges (since/before/on, including "7d" / "yesterday"), subject/from/to/cc/bcc/body/text ' +
       'filters, read/flag/answered state, keywords/labels, header matches, UID ranges, size limits, and attachments. ' +
       "On Gmail accounts, pass gmail_raw (e.g. 'from:foo has:attachment older_than:30d') for a dramatically " +
@@ -673,8 +678,9 @@ export default function registerEmailsTools(
         .optional()
         .default('')
         .describe(
-          'Search keyword — HEADER-ONLY (subject + from). Omit to use filters only. ' +
-            'For a full message-body search use the body: or text: filter instead.',
+          'Search keyword across subject + from + body (deep by default; omit to use filters only). ' +
+            'On a very large non-indexed folder a body scan is bounded and, if it cannot complete, ' +
+            'returns a flagged failure (never a silent zero) — narrow by date or subject:/from: and retry.',
         ),
       mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
       page: z.number().int().min(1).default(1).describe('Page number'),
@@ -835,8 +841,9 @@ export default function registerEmailsTools(
         .optional()
         .default('')
         .describe(
-          'Search keyword — HEADER-ONLY (subject + from). Omit to use filters only. ' +
-            'For a full message-body search use the body: or text: filter instead.',
+          'Search keyword across subject + from + body (deep by default; omit to use filters only). ' +
+            'On a very large non-indexed folder a body scan is bounded and, if it cannot complete, ' +
+            'returns a flagged failure (never a silent zero) — narrow by date or subject:/from: and retry.',
         ),
       accounts: z
         .array(z.string())

@@ -41,6 +41,21 @@ export function searchFailedStatus(): SearchStatus {
   };
 }
 
+/**
+ * Build the SearchStatus for our OWN bounded-wait expiry on an ephemeral
+ * connection (R3/D3). The abandoned SEARCH dies with that connection; the
+ * account's shared client is untouched. NOT a zero-match result.
+ */
+export function timeoutStatus(timeoutMs: number): SearchStatus {
+  return {
+    kind: SEARCH_FAIL_KIND.TIMEOUT,
+    message:
+      `IMAP SEARCH exceeded the ${timeoutMs}ms bounded-wait budget on an ` +
+      'isolated connection and was abandoned. This is NOT a zero-match result.',
+    suggestion: NARROW_SUGGESTION,
+  };
+}
+
 /** Build the SearchStatus for a rejected `client.search()` (connection error). */
 export function connectionErrorStatus(err: unknown): SearchStatus {
   const detail = err instanceof Error ? err.message : String(err);

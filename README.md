@@ -703,19 +703,19 @@ Features:
 
 ## Power Search
 
-`list_emails` and `search_emails` support a rich set of server-side filters translated to native IMAP search criteria. All filters combine with AND; free-text `query` matches as OR across `subject`/`from` (**header-only** — see below). Snake_case at the tool layer, camelCase in the service layer.
+`list_emails` and `search_emails` support a rich set of server-side filters translated to native IMAP search criteria. All filters combine with AND; free-text `query` matches as OR across `subject`/`from`/`body` (**deep by default**). Snake_case at the tool layer, camelCase in the service layer.
 
-> **`query` is header-only.** Free-text `query` searches `SUBJECT` + `FROM` only. A full message-body search is the explicit opt-in via the `body:` or `text:` filters. On a server without a full-text-search (FTS) index, a `BODY` scan over a large folder is pathologically expensive — the server typically aborts it — so prefer narrowing by `subject:`/`from:`/date.
+> **`query` is deep by default — bounded and warned on huge folders.** Free-text `query` searches `SUBJECT` + `FROM` + `BODY`. On a server with no full-text-search (FTS) index, a `BODY` scan over a very large folder is expensive, so when the target folder is large, lacks FTS, and the search touches the body, email-mcp runs it on a **bounded, isolated connection** and attaches a **cost warning** suggesting you narrow by date (`since`/`before`/`on`) or `subject:`/`from:`. If the bounded scan can't finish it returns an explicitly flagged failure — never a silent zero. Truly fast deep search over giant folders requires enabling an FTS index on the IMAP server itself (an infrastructure change, out of scope here).
 >
-> **A failed search is never a silent zero.** If an IMAP `SEARCH` fails, times out, or is aborted by the server, the result is flagged explicitly (`searchFailed: true` + a `searchStatus` + a warning) instead of an indistinguishable empty result. `search_all_accounts` surfaces a failed account as a loud per-account warning, never as a clean zero participant. Treat a flagged failure as "unknown, narrow and retry" — the messages may still exist.
+> **A failed search is never a silent zero.** If an IMAP `SEARCH` fails, times out (including the bounded-scan budget), or is aborted by the server, the result is flagged explicitly (`searchFailed: true` + a `searchStatus` + a warning) instead of an indistinguishable empty result. `search_all_accounts` surfaces a failed account as a loud per-account warning, never as a clean zero participant. Treat a flagged failure as "unknown, narrow and retry" — the messages may still exist.
 >
-> **Large folders.** Archive folders and osTicket-ingested mailboxes (e.g. `INBOX.osTicket` on `support@…` addresses, which accumulate tens of thousands of messages) are very large. Always include a date filter (`since`/`before`/`on`) or narrow by `subject:`/`from:`; an unscoped search there may be slow or truncated.
+> **Large folders.** Archive folders and osTicket-ingested mailboxes (e.g. `INBOX.osTicket` on `support@…` addresses, which accumulate tens of thousands of messages) are very large. The opened folder's message count is reported in the result so you can judge truncation/timeout risk; prefer a date filter (`since`/`before`/`on`) or `subject:`/`from:` there.
 
 ### Supported filters
 
 | Tool param        | Service option  | Type             | IMAP term / behavior                                                                                  |
 |-------------------|-----------------|------------------|-------------------------------------------------------------------------------------------------------|
-| `query`           | `query`         | string           | OR across `SUBJECT` / `FROM` (header-only; use `body:`/`text:` for a full-body search)                 |
+| `query`           | `query`         | string           | OR across `SUBJECT` / `FROM` / `BODY` (deep by default; bounded + cost-warned on huge non-FTS folders) |
 | `from`            | `from`          | string           | `FROM` substring                                                                                      |
 | `to`              | `to`            | string           | `TO` substring                                                                                        |
 | `cc`              | `cc`            | string           | `CC` substring                                                                                        |
@@ -983,7 +983,7 @@ Default destination is `~/Downloads/email-attachments-<ISO-ts>/`. Per-email erro
 | `get_email` | Read full email content with attachment metadata |
 | `get_emails` | Fetch full content of multiple emails in a single call (max 20) |
 | `get_email_status` | Get read/flag/label state of an email without fetching the body |
-| `search_emails` | Search by keyword across subject and sender (header-only; `body:`/`text:` for full-body); failed searches are flagged, never a silent zero |
+| `search_emails` | Search by keyword across subject, sender, and body (deep by default; bounded + cost-warned on huge non-FTS folders); failed searches are flagged, never a silent zero |
 | `search_all_accounts` | Fan a search across multiple accounts in parallel; merges + date-sorts results and tags each with its account |
 | `run_preset` | Run a saved search preset defined under `[[searches]]` in config.toml |
 | `export_search` | Run a search and stream the result set to a CSV or NDJSON file under `~/Downloads/` (bypasses MCP response byte budget) |

@@ -333,6 +333,11 @@ export interface PaginatedResult<T> {
   searchFailed?: true;
   /** Structured failure detail when `searchFailed` is set. */
   searchStatus?: SearchStatus;
+  /**
+   * Message count of the opened mailbox (R8). Free under the search lock —
+   * lets callers judge truncation/timeout risk on huge folders.
+   */
+  folderSize?: number;
   /** Optional bucketed counts across the full match set (capped). */
   facets?: FacetResult;
 }

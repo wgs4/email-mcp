@@ -82,4 +82,48 @@ describe('formatSearchResult — R4 first-class failure branch', () => {
     expect(text).toContain('Hello');
     expect(text).not.toMatch(/SEARCH did not complete/);
   });
+
+  it('R8: renders the opened folder size when present (truncation/timeout-risk hint)', () => {
+    const result: PaginatedResult<EmailMeta> = {
+      items: [
+        {
+          id: '1',
+          subject: 'Hello',
+          from: { name: 'Alice', address: 'alice@example.com' },
+          to: [{ address: 'bob@example.com' }],
+          date: '2024-03-15T12:00:00.000Z',
+          seen: true,
+          flagged: false,
+          answered: false,
+          hasAttachments: false,
+          labels: [],
+          attachments: [],
+        },
+      ],
+      total: 1,
+      page: 1,
+      pageSize: 20,
+      hasMore: false,
+      folderSize: 18127,
+    };
+
+    const text = formatSearchResult(result, '🔍 [INBOX.osTicket] 1 result\n', 'No emails found.');
+    expect(text).toContain('18127');
+    expect(text).toMatch(/folder/i);
+  });
+
+  it('R8: renders the folder size on an empty (non-failed) result too', () => {
+    const result: PaginatedResult<EmailMeta> = {
+      items: [],
+      total: 0,
+      page: 1,
+      pageSize: 20,
+      hasMore: false,
+      folderSize: 79000,
+    };
+
+    const text = formatSearchResult(result, 'hdr', 'No emails found matching the filters.');
+    expect(text).toContain('No emails found matching the filters.');
+    expect(text).toContain('79000');
+  });
 });

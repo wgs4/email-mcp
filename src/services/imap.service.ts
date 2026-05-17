@@ -35,7 +35,12 @@ import type { MailboxRef } from './mailbox-resolver.js';
 import { resolveMailboxForAccount } from './mailbox-resolver.js';
 import type { SearchParams } from './search-criteria.js';
 import { buildSearchCriteria, chunkUids } from './search-criteria.js';
-import { connectionErrorStatus, SearchFailedError, searchFailedStatus } from './search-status.js';
+import {
+  connectionErrorStatus,
+  SearchFailedError,
+  searchFailedStatus,
+  timeoutStatus,
+} from './search-status.js';
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -46,6 +51,23 @@ const MAX_SEARCH_UIDS = 5000;
 
 /** Maximum match-set size for which we'll envelope-fetch to compute facets. */
 const MAX_FACET_UIDS = 10000;
+
+/**
+ * R5: folders larger than this are "big enough that a non-FTS BODY scan is a
+ * resource risk". Chosen at the MAX_SEARCH_UIDS cap — below it the result set
+ * is fully servable anyway; above it (osTicket ~18k, Archive ~79k) a body
+ * scan on a server without a full-text index is the abortable/expensive case.
+ */
+const LARGE_FOLDER_THRESHOLD = 5000;
+
+/**
+ * R3/D3: bounded-wait budget for an at-risk body scan run on an ephemeral
+ * connection. Long enough for a legitimately large-but-OK search; short
+ * enough that an agent never hangs. On expiry the ephemeral socket is closed
+ * and the result is flagged `searchStatus.kind='timeout'` (never a silent
+ * zero). Tunable later from R7 telemetry (PR-3).
+ */
+const EPHEMERAL_SEARCH_TIMEOUT_MS = 20_000;
 
 /**
  * Per-account fetch cap for `searchAcrossAccounts`. Each account is queried
@@ -408,6 +430,15 @@ export default class ImapService {
   private labelStrategyPending = new Map<string, Promise<LabelStrategy>>();
 
   /**
+   * R5: memoized per-account full-text-search capability. imapflow exposes
+   * `client.capabilities` (a Map) post-connect; `SEARCH=FUZZY` (RFC 6203) is
+   * the standard advertisement for a real server-side text index (Dovecot FTS
+   * plugin). Capabilities don't change within a connection lifetime, so this
+   * is computed once per account — no extra round-trip.
+   */
+  private ftsByAccount = new Map<string, boolean>();
+
+  /**
    * Per-account mailbox-list cache keyed by account name. Populated lazily
    * during `searchAcrossAccounts` fan-out to avoid issuing a `LIST` on every
    * cross-account call. TTL'd at `MAILBOX_CACHE_TTL_MS`.
@@ -475,6 +506,98 @@ export default class ImapService {
       return { ok: false, status: searchFailedStatus() };
     } catch (err) {
       return { ok: false, status: connectionErrorStatus(err) };
+    }
+  }
+
+  /**
+   * R5/R8: the opened mailbox's message count. FREE under the search lock —
+   * imapflow sets `client.mailbox` to the selected folder (with `.exists`)
+   * after `getMailboxLock`; no STATUS round-trip, no cache.
+   */
+  private static readMailboxSize(client: ImapFlow): number | undefined {
+    const mb = (client as { mailbox?: unknown }).mailbox;
+    if (mb && typeof mb === 'object' && typeof (mb as { exists?: unknown }).exists === 'number') {
+      return (mb as { exists: number }).exists;
+    }
+    return undefined;
+  }
+
+  /** R5: memoized per-account FTS capability (see `ftsByAccount`). */
+  private accountHasFts(accountName: string, client: ImapFlow): boolean {
+    const cached = this.ftsByAccount.get(accountName);
+    if (cached !== undefined) return cached;
+    const caps = (client as { capabilities?: unknown }).capabilities;
+    const hasFts = caps instanceof Map && caps.has('SEARCH=FUZZY');
+    this.ftsByAccount.set(accountName, hasFts);
+    return hasFts;
+  }
+
+  /**
+   * R3/D3: run a search on a throwaway, isolated connection with a bounded
+   * wait. The shared client is never touched (D3: never poisoned). Codex
+   * corrections, all applied here:
+   *  (a) the ephemeral client MUST open its own mailbox lock/SELECT — an
+   *      AUTHENTICATED-not-SELECTED imapflow client returns `false` for
+   *      SEARCH, which would manufacture a fresh false-negative;
+   *  (b) the caller releases the shared mailbox lock BEFORE calling this, so
+   *      the slow scan never serializes behind the shared lock;
+   *  (c) on timeout use `close()` (not `logout()`, which queues behind the
+   *      stuck command) to tear the socket down;
+   *  (d) server-side resource release is best-effort — closing the socket
+   *      abandons the local request; the server may still spend CPU.
+   */
+  private static async runSearchEphemeral(
+    connections: IConnectionManager,
+    accountName: string,
+    mailbox: string,
+    criteria: Record<string, unknown>,
+    timeoutMs: number,
+  ): Promise<{ ok: true; uids: number[] } | { ok: false; status: SearchStatus }> {
+    let eph: ImapFlow;
+    try {
+      eph = await connections.createEphemeralImapClient(accountName);
+    } catch (err) {
+      return { ok: false, status: connectionErrorStatus(err) };
+    }
+
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // (a) the ephemeral connection must SELECT its own mailbox.
+      const elock = await eph.getMailboxLock(mailbox);
+      try {
+        const raced = await Promise.race([
+          ImapService.runSearch(eph, criteria),
+          new Promise<'__ephemeral_timeout__'>((resolve) => {
+            timer = setTimeout(() => {
+              timedOut = true;
+              resolve('__ephemeral_timeout__');
+            }, timeoutMs);
+          }),
+        ]);
+        if (raced === '__ephemeral_timeout__') {
+          return { ok: false, status: timeoutStatus(timeoutMs) };
+        }
+        return raced;
+      } finally {
+        // On timeout the SEARCH is still in flight; releasing the lock would
+        // queue behind the stuck command. close() (below) tears the socket
+        // down regardless — (c)/(d): best-effort.
+        if (!timedOut) {
+          elock.release();
+        }
+      }
+    } catch (err) {
+      return { ok: false, status: connectionErrorStatus(err) };
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+      try {
+        eph.close();
+      } catch {
+        /* (c)/(d): best-effort socket teardown */
+      }
     }
   }
 
@@ -915,12 +1038,51 @@ export default class ImapService {
     const page = options.page ?? 1;
     const pageSize = options.pageSize ?? 20;
 
-    const lock = await client.getMailboxLock(mailbox);
+    let activeLock: { release: () => void } | null = await client.getMailboxLock(mailbox);
+    const releaseLock = () => {
+      if (activeLock) {
+        activeLock.release();
+        activeLock = null;
+      }
+    };
     try {
       const params: SearchParams = { ...(options as SearchParams), query };
-      const { criteria, postFilters, warnings } = buildSearchCriteria(params, { isGmail });
+      const { criteria, postFilters, warnings, bodyScan } = buildSearchCriteria(params, {
+        isGmail,
+      });
 
-      const searchOutcome = await ImapService.runSearch(client, criteria);
+      // R5/R8: folder size is FREE under the lock (no STATUS round-trip). A
+      // body scan over a large folder on a server with no full-text index is
+      // the expensive, server-abortable case — run it bounded on an isolated
+      // connection so it fails loudly/cleanly instead of silently (R3/D3),
+      // and tell the caller how to make it fast.
+      const folderSize = ImapService.readMailboxSize(client);
+      const atRisk =
+        bodyScan &&
+        folderSize !== undefined &&
+        folderSize > LARGE_FOLDER_THRESHOLD &&
+        !this.accountHasFts(accountName, client);
+
+      let searchOutcome: { ok: true; uids: number[] } | { ok: false; status: SearchStatus };
+      if (atRisk) {
+        warnings.push(
+          `Large folder (${folderSize} messages) with no server-side full-text index — ` +
+            'a full-body search is slow. Running it on a bounded isolated connection; ' +
+            'narrow with a date filter (since/before/on) or subject:/from: to make it fast.',
+        );
+        // D3(b): never hold the shared mailbox lock across the slow scan.
+        releaseLock();
+        searchOutcome = await ImapService.runSearchEphemeral(
+          this.connections,
+          accountName,
+          mailbox,
+          criteria,
+          EPHEMERAL_SEARCH_TIMEOUT_MS,
+        );
+      } else {
+        searchOutcome = await ImapService.runSearch(client, criteria);
+      }
+
       if (!searchOutcome.ok) {
         // R1/R4: a failed SEARCH must never read as a clean zero. Surface the
         // structured status AND fold it into `warning` so it always reaches
@@ -939,8 +1101,17 @@ export default class ImapService {
           searchFailed: true,
           searchStatus: searchOutcome.status,
           warning,
+          ...(folderSize !== undefined ? { folderSize } : {}),
         };
       }
+
+      // The at-risk path released the shared lock for the slow SEARCH;
+      // re-acquire it for the cheap page FETCH / facet scan below (identical
+      // to the non-at-risk path from here on).
+      if (!activeLock) {
+        activeLock = await client.getMailboxLock(mailbox);
+      }
+
       let uids: number[] = searchOutcome.uids;
       let totalApprox = false;
 
@@ -964,6 +1135,7 @@ export default class ImapService {
           hasMore: false,
           ...(warning ? { warning } : {}),
           ...(totalApprox ? { totalApprox } : {}),
+          ...(folderSize !== undefined ? { folderSize } : {}),
         };
       }
 
@@ -996,6 +1168,7 @@ export default class ImapService {
           ...(warning ? { warning } : {}),
           ...(totalApprox ? { totalApprox } : {}),
           ...(facets ? { facets } : {}),
+          ...(folderSize !== undefined ? { folderSize } : {}),
         };
       }
 
@@ -1067,9 +1240,10 @@ export default class ImapService {
         ...(warning ? { warning } : {}),
         ...(totalApprox ? { totalApprox } : {}),
         ...(facets ? { facets } : {}),
+        ...(folderSize !== undefined ? { folderSize } : {}),
       };
     } finally {
-      lock.release();
+      releaseLock();
     }
   }
 

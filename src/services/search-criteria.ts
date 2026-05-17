@@ -54,6 +54,13 @@ export interface BuildResult {
     facets?: ('sender' | 'year' | 'mailbox')[];
   };
   gmailRawUsed: boolean;
+  /**
+   * True when the built criteria will make the server scan message BODIES —
+   * a free-text `query` (deep by default: subject/from/body OR), or an
+   * explicit `body:`/`text:` filter. Drives PR-2's R5 at-risk gate (a body
+   * scan over a large non-FTS folder is the expensive/abortable case).
+   */
+  bodyScan: boolean;
   warnings: string[];
 }
 
@@ -79,6 +86,8 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
       criteria: { gmailRaw: params.gmailRaw },
       postFilters: {},
       gmailRawUsed: true,
+      // Gmail searches natively server-side — our at-risk gate does not apply.
+      bodyScan: false,
       warnings,
     };
   }
@@ -88,16 +97,16 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
   // ---------------------------------------------------------------------------
   const andConditions: Record<string, unknown>[] = [];
 
-  // R2: free-text `query` is HEADER-ONLY (SUBJECT/FROM). The {body:q} OR
-  // member was removed — on a non-FTS server a BODY scan over a large folder
-  // is pathologically expensive, the server NO's it, and imapflow collapses
-  // that to `false` → the silent false-negative this feature fixes. Full-body
-  // search is the explicit opt-in via the `body:`/`text:` passthrough filters
-  // below (search-criteria.ts handles them as first-class conditions).
+  // Free-text `query` is DEEP BY DEFAULT — subject/from/body OR (the behavior
+  // users expect). The big-folder body-scan risk this used to create is now
+  // handled by PR-2: a body scan over a large non-FTS folder is detected
+  // (R5), warned about, and run on a bounded ephemeral connection (R3) so it
+  // fails loudly/cleanly instead of silently. `bodyScan` (below) flags this
+  // path for that gate.
   if (params.query && params.query.length > 0) {
     const q = sanitizeSearchQuery(params.query);
     andConditions.push({
-      or: [{ subject: q }, { from: q }],
+      or: [{ subject: q }, { from: q }, { body: q }],
     });
   }
 
@@ -169,6 +178,14 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
     criteria = Object.assign({}, ...andConditions);
   }
 
+  // A free-text query (now body-inclusive) or an explicit body:/text: filter
+  // makes the server scan message bodies — the expensive/abortable case the
+  // R5 at-risk gate guards. TEXT covers headers+body, so it counts too.
+  // (Boolean sub-expressions: an empty string is "no value", and `||` here is
+  // a true logical-OR of booleans — not a nullish-default, hence not `??`.)
+  const nonEmpty = (v: string | undefined): boolean => v !== undefined && v.length > 0;
+  const bodyScan = nonEmpty(params.query) || nonEmpty(params.body) || nonEmpty(params.text);
+
   return {
     criteria,
     postFilters: {
@@ -178,6 +195,7 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
       facets: params.facets,
     },
     gmailRawUsed: false,
+    bodyScan,
     warnings,
   };
 }

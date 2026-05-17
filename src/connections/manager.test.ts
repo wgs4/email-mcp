@@ -59,3 +59,41 @@ describe('ConnectionManager.getImapClient — R1c default error handler (F2)', (
     expect(client2).not.toBe(client1);
   });
 });
+
+describe('ConnectionManager.createEphemeralImapClient (D3 — bounded deep search)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns a connected client that is NOT the cached shared client', async () => {
+    const manager = new ConnectionManager([account]);
+    const shared = await manager.getImapClient('test');
+
+    const ephemeral = await manager.createEphemeralImapClient('test');
+
+    expect(ephemeral).not.toBe(shared);
+    expect(
+      (ephemeral as unknown as { connect: ReturnType<typeof vi.fn> }).connect,
+    ).toHaveBeenCalled();
+
+    // It is NOT cached: getImapClient still returns the original shared client,
+    // and a second ephemeral is yet another distinct instance.
+    expect(await manager.getImapClient('test')).toBe(shared);
+    const ephemeral2 = await manager.createEphemeralImapClient('test');
+    expect(ephemeral2).not.toBe(ephemeral);
+  });
+
+  it('an ephemeral client error cannot crash the process and does not evict the shared client', async () => {
+    const manager = new ConnectionManager([account]);
+    const shared = await manager.getImapClient('test');
+    const ephemeral = await manager.createEphemeralImapClient('test');
+
+    expect(() =>
+      (ephemeral as unknown as EventEmitter).emit('error', new Error('ephemeral boom')),
+    ).not.toThrow();
+    expect(mcpLog).toHaveBeenCalledWith('error', 'imap', expect.stringContaining('ephemeral boom'));
+
+    // D3: the ephemeral connection must never poison the shared one.
+    expect(await manager.getImapClient('test')).toBe(shared);
+  });
+});

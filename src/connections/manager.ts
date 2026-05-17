@@ -58,6 +58,36 @@ export default class ConnectionManager implements IConnectionManager {
   // IMAP
   // -------------------------------------------------------------------------
 
+  /**
+   * Build an UNCONNECTED ImapFlow for an account (auth/OAuth + transport
+   * options). Single source of truth for client construction — shared by the
+   * cached `getImapClient` and the throwaway `createEphemeralImapClient` (D3
+   * infra: do NOT reimplement auth elsewhere).
+   */
+  private async buildImapClient(accountName: string): Promise<ImapFlow> {
+    const account = this.getAccount(accountName);
+
+    // Build auth config based on auth type
+    let auth: { user: string; pass?: string; accessToken?: string };
+    if (account.oauth2 && this.oauthService) {
+      const accessToken = await this.oauthService.getAccessToken(account.oauth2);
+      auth = { user: account.username, accessToken };
+    } else {
+      auth = { user: account.username, pass: account.password };
+    }
+
+    return new ImapFlow({
+      host: account.imap.host,
+      port: account.imap.port,
+      secure: account.imap.tls,
+      tls: {
+        rejectUnauthorized: account.imap.verifySsl,
+      },
+      auth,
+      logger: false,
+    });
+  }
+
   async getImapClient(accountName: string): Promise<ImapFlow> {
     const existing = this.imapClients.get(accountName);
     if (existing?.usable) {
@@ -75,26 +105,7 @@ export default class ConnectionManager implements IConnectionManager {
     }
 
     const account = this.getAccount(accountName);
-
-    // Build auth config based on auth type
-    let auth: { user: string; pass?: string; accessToken?: string };
-    if (account.oauth2 && this.oauthService) {
-      const accessToken = await this.oauthService.getAccessToken(account.oauth2);
-      auth = { user: account.username, accessToken };
-    } else {
-      auth = { user: account.username, pass: account.password };
-    }
-
-    const client = new ImapFlow({
-      host: account.imap.host,
-      port: account.imap.port,
-      secure: account.imap.tls,
-      tls: {
-        rejectUnauthorized: account.imap.verifySsl,
-      },
-      auth,
-      logger: false,
-    });
+    const client = await this.buildImapClient(accountName);
 
     // R1c/D6/F2: a socket-timeout emitError() on a client with NO 'error'
     // listener crashes the whole process. Attach a default handler at creation
@@ -117,6 +128,38 @@ export default class ConnectionManager implements IConnectionManager {
       `Connected to ${account.imap.host}:${account.imap.port} for "${accountName}"`,
     );
     this.imapClients.set(accountName, client);
+    return client;
+  }
+
+  /**
+   * Create a throwaway, UNCACHED IMAP connection for a bounded deep search
+   * (D3/R3). The caller owns its lifecycle and MUST `close()` it (e.g. on a
+   * bounded-wait timeout). It is never stored in `imapClients`, so its
+   * failure can never poison the account's shared client. It still gets a
+   * log-and-swallow `'error'` listener so a socket-timeout emitError on the
+   * ephemeral socket cannot crash the process (F2), but — unlike the cached
+   * client's handler — it does NOT touch the shared-client map.
+   */
+  async createEphemeralImapClient(accountName: string): Promise<ImapFlow> {
+    const account = this.getAccount(accountName);
+    const client = await this.buildImapClient(accountName);
+
+    client.on('error', (err: Error) => {
+      mcpLog(
+        'error',
+        'imap',
+        `Ephemeral IMAP client error for "${accountName}": ${err instanceof Error ? err.message : String(err)}`,
+      ).catch(() => {});
+      // Intentionally NOT touching this.imapClients — the ephemeral client is
+      // not cached; the caller closes it. D3: never poison the shared client.
+    });
+
+    await client.connect();
+    await mcpLog(
+      'info',
+      'imap',
+      `Ephemeral connection to ${account.imap.host}:${account.imap.port} for "${accountName}"`,
+    );
     return client;
   }
 
