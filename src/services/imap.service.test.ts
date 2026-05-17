@@ -540,6 +540,108 @@ describe('ImapService', () => {
         vi.useRealTimers();
       }
     });
+
+    it('R3/D3 [P1]: a stalled ephemeral CONNECT is bounded too (not only the SEARCH)', async () => {
+      vi.useFakeTimers();
+      try {
+        client.mailbox = { exists: 50_000 };
+        // createEphemeralImapClient never resolves — connect/login stalls.
+        // The bounded wait must cover connect, not just the SEARCH.
+        connections.createEphemeralImapClient.mockReturnValue(new Promise(() => {}));
+
+        const p = service.searchEmails('test', 'needle', {});
+        await vi.advanceTimersByTimeAsync(120_000);
+        const result = await p;
+
+        expect(result.searchFailed).toBe(true);
+        expect(result.searchStatus?.kind).toBe('timeout');
+        expect(client.search).not.toHaveBeenCalled();
+        // shared lock was released before the (stalled) ephemeral op
+        expect(client._releaseFn).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('R3/D3 [P1]: a stalled ephemeral SELECT (getMailboxLock) is bounded too', async () => {
+      vi.useFakeTimers();
+      try {
+        client.mailbox = { exists: 50_000 };
+        const ephemeral = createMockImapClient();
+        // SELECT on a huge folder stalls — exactly the PR-2 target case.
+        ephemeral.getMailboxLock.mockReturnValue(new Promise(() => {}));
+        connections.createEphemeralImapClient.mockResolvedValue(ephemeral);
+
+        const p = service.searchEmails('test', 'needle', {});
+        await vi.advanceTimersByTimeAsync(120_000);
+        const result = await p;
+
+        expect(result.searchFailed).toBe(true);
+        expect(result.searchStatus?.kind).toBe('timeout');
+        // orphan guard: the ephemeral conn that opened post-timeout is closed
+        expect(ephemeral.close).toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('R5 [P2]: FTS is NOT cached when capabilities are absent — re-checked once available', async () => {
+      client.mailbox = { exists: 50_000 };
+
+      // First call: capabilities not yet populated → treated as no-FTS →
+      // at-risk → ephemeral bounded path.
+      client.search.mockResolvedValueOnce([]);
+      await service.searchEmails('test', 'invoice', {});
+      const afterFirst = connections.createEphemeralImapClient.mock.calls.length;
+      expect(afterFirst).toBeGreaterThan(0);
+
+      // Server now advertises FTS (capabilities populated, e.g. after a
+      // reconnect). A poisoned cache would keep treating it as no-FTS.
+      client.capabilities = new Map([['SEARCH=FUZZY', true]]);
+      client.search.mockResolvedValueOnce([]);
+      await service.searchEmails('test', 'invoice', {});
+
+      // FTS now detected → shared path, NO new ephemeral connection.
+      expect(connections.createEphemeralImapClient.mock.calls.length).toBe(afterFirst);
+    });
+
+    it('R3/D3 [P2]: a search resolving AFTER the timeout — no unhandled rejection, conn closed', async () => {
+      vi.useFakeTimers();
+      const unhandled: unknown[] = [];
+      const onUnhandled = (e: unknown): void => {
+        unhandled.push(e);
+      };
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        client.mailbox = { exists: 50_000 };
+        const ephemeral = createMockImapClient();
+        let resolveSearch: (v: number[]) => void = () => {};
+        ephemeral.search.mockReturnValue(
+          new Promise<number[]>((res) => {
+            resolveSearch = res;
+          }),
+        );
+        connections.createEphemeralImapClient.mockResolvedValue(ephemeral);
+
+        const p = service.searchEmails('test', 'needle', {});
+        await vi.advanceTimersByTimeAsync(120_000); // timeout wins the race
+        const result = await p;
+        expect(result.searchStatus?.kind).toBe('timeout');
+
+        // The abandoned search settles LATE — orphan guard must still close
+        // the ephemeral conn and the late settle must not be unhandled.
+        resolveSearch([1, 2, 3]);
+        await vi.advanceTimersByTimeAsync(0);
+        await Promise.resolve();
+        await Promise.resolve();
+
+        expect(ephemeral.close).toHaveBeenCalled();
+        expect(unhandled).toHaveLength(0);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+        vi.useRealTimers();
+      }
+    });
   });
 
   // -----------------------------------------------------------------------

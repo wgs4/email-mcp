@@ -527,7 +527,23 @@ export default class ImapService {
     const cached = this.ftsByAccount.get(accountName);
     if (cached !== undefined) return cached;
     const caps = (client as { capabilities?: unknown }).capabilities;
-    const hasFts = caps instanceof Map && caps.has('SEARCH=FUZZY');
+    // [P2] Only memoize a DEFINITIVE reading. If capabilities aren't
+    // populated yet (not a Map, or an empty Map — pre-connect / pre-CAPABILITY
+    // / a freshly-reconnected client), do NOT cache: a cached `false` here
+    // would permanently misclassify the account as non-FTS even after the
+    // server later advertises it. Conservative direction — undecided →
+    // false → the bounded ephemeral path (safe; never a false-negative).
+    if (!(caps instanceof Map) || caps.size === 0) {
+      return false;
+    }
+    // [P2] Detection is deliberately narrow: `SEARCH=FUZZY` (RFC 6203) is the
+    // standard advertisement for a real server-side text index, and the WGS
+    // target (Dovecot, no FTS plugin) is precisely why this feature exists.
+    // A server that does efficient body search via a non-standard capability
+    // just gets the bounded ephemeral path — slower, but SAFE: the only cost
+    // is an unnecessary bounded search, never a false-negative. Broaden or
+    // make configurable only if a deployment with non-standard FTS appears.
+    const hasFts = caps.has('SEARCH=FUZZY');
     this.ftsByAccount.set(accountName, hasFts);
     return hasFts;
   }
@@ -553,51 +569,71 @@ export default class ImapService {
     criteria: Record<string, unknown>,
     timeoutMs: number,
   ): Promise<{ ok: true; uids: number[] } | { ok: false; status: SearchStatus }> {
-    let eph: ImapFlow;
-    try {
-      eph = await connections.createEphemeralImapClient(accountName);
-    } catch (err) {
-      return { ok: false, status: connectionErrorStatus(err) };
-    }
+    let eph: ImapFlow | undefined;
+    let closed = false;
+    const closeEph = (): void => {
+      if (eph && !closed) {
+        closed = true;
+        try {
+          eph.close();
+        } catch {
+          /* (c)/(d): best-effort socket teardown */
+        }
+      }
+    };
 
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-      // (a) the ephemeral connection must SELECT its own mailbox.
-      const elock = await eph.getMailboxLock(mailbox);
+    const timeoutPromise = new Promise<'__ephemeral_timeout__'>((resolve) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        resolve('__ephemeral_timeout__');
+      }, timeoutMs);
+    });
+
+    // [P1] The bounded wait must cover the ENTIRE ephemeral op — connect +
+    // SELECT + SEARCH — not just the SEARCH. A stalled connect/login or a
+    // slow SELECT on a huge folder (the exact PR-2 target) would otherwise
+    // hang the request AFTER the shared lock was released.
+    const work = (async (): Promise<
+      { ok: true; uids: number[] } | { ok: false; status: SearchStatus }
+    > => {
+      const e = await connections.createEphemeralImapClient(accountName);
+      eph = e;
+      // (a) the ephemeral connection must SELECT its own mailbox or SEARCH
+      // returns false (a manufactured false-negative).
+      const elock = await e.getMailboxLock(mailbox);
       try {
-        const raced = await Promise.race([
-          ImapService.runSearch(eph, criteria),
-          new Promise<'__ephemeral_timeout__'>((resolve) => {
-            timer = setTimeout(() => {
-              timedOut = true;
-              resolve('__ephemeral_timeout__');
-            }, timeoutMs);
-          }),
-        ]);
-        if (raced === '__ephemeral_timeout__') {
-          return { ok: false, status: timeoutStatus(timeoutMs) };
-        }
-        return raced;
+        return await ImapService.runSearch(e, criteria);
       } finally {
-        // On timeout the SEARCH is still in flight; releasing the lock would
-        // queue behind the stuck command. close() (below) tears the socket
+        // On timeout the SEARCH may still be in flight; releasing the lock
+        // would queue behind the stuck command. closeEph() tears the socket
         // down regardless — (c)/(d): best-effort.
         if (!timedOut) {
           elock.release();
         }
       }
+    })();
+
+    try {
+      const raced = await Promise.race([work, timeoutPromise]);
+      if (raced === '__ephemeral_timeout__') {
+        // Orphan guard: connect/SELECT may still be pending (eph not set yet).
+        // Close the connection whenever `work` finally settles so a late
+        // connection cannot leak. work resolves to {ok:false} or rejects;
+        // both just close. Trailing .catch keeps the chain non-floating.
+        work.then(closeEph, closeEph).catch(() => {});
+        closeEph();
+        return { ok: false, status: timeoutStatus(timeoutMs) };
+      }
+      return raced;
     } catch (err) {
       return { ok: false, status: connectionErrorStatus(err) };
     } finally {
       if (timer) {
         clearTimeout(timer);
       }
-      try {
-        eph.close();
-      } catch {
-        /* (c)/(d): best-effort socket teardown */
-      }
+      closeEph();
     }
   }
 
