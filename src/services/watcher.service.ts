@@ -14,6 +14,7 @@ import { ImapFlow } from 'imapflow';
 import { mcpLog } from '../logging.js';
 import type { AccountConfig, EmailMeta, WatcherConfig } from '../types/index.js';
 import eventBus from './event-bus.js';
+import { hasAttachments as hasAttachmentsLenient } from './imap.service.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -314,9 +315,9 @@ export default class WatcherService {
   }
 
   private static hasAttachments(bodyStructure: unknown): boolean {
-    if (!bodyStructure || typeof bodyStructure !== 'object') return false;
-    const bs = bodyStructure as { disposition?: string; childNodes?: unknown[] };
-    if (bs.disposition === 'attachment') return true;
-    return bs.childNodes?.some((child) => WatcherService.hasAttachments(child)) ?? false;
+    // Single source of truth — same lenient detection as the IMAP metadata
+    // and download paths. A stricter local recursion here previously
+    // under-reported attachments on forwarded / Outlook mail.
+    return hasAttachmentsLenient(bodyStructure);
   }
 }
