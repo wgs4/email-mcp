@@ -8,7 +8,13 @@ import { z } from 'zod';
 
 import type ConnectionManager from '../connections/manager.js';
 import type ImapService from '../services/imap.service.js';
-import type { Email, EmailMeta, FacetResult, PaginatedResult } from '../types/index.js';
+import type {
+  Email,
+  EmailMeta,
+  FacetResult,
+  PaginatedResult,
+  SearchStatus,
+} from '../types/index.js';
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -80,6 +86,31 @@ export function formatFacetsBlock(facets: FacetResult | undefined): string {
  * Format a paginated search result (single- or cross-account) for MCP text
  * output. Used by `search_emails`, `search_all_accounts`, and `run_preset`.
  */
+/**
+ * R4 (Codex-critical): render a failed search as a first-class, unmissable
+ * failure — NEVER the plain "No emails found" empty message. Returns null when
+ * the search did not fail (caller proceeds with normal rendering). Shared by
+ * `formatSearchResult` and the `list_emails` handler so neither presentation
+ * path can regress to a silent zero on a failed search (the bug reproduces at
+ * the formatter if this branch is missed).
+ */
+export function formatSearchFailure(result: {
+  searchFailed?: true;
+  searchStatus?: SearchStatus;
+}): string | null {
+  if (!result.searchFailed) return null;
+  const s = result.searchStatus;
+  const lines = [
+    '⚠️ SEARCH FAILED — this is NOT a zero-result. The matching messages may still exist.',
+    s?.message ?? 'The IMAP SEARCH did not complete.',
+  ];
+  if (s?.suggestion) lines.push(`Suggestion: ${s.suggestion}`);
+  if (s?.windowed?.applied) {
+    lines.push(`(A ${s.windowed.sinceDays}-day windowed retry was applied.)`);
+  }
+  return lines.join('\n');
+}
+
 export function formatSearchResult(
   result: PaginatedResult<EmailMeta> & {
     warnings?: { account: string; error: string }[];
@@ -87,6 +118,11 @@ export function formatSearchResult(
   header: string,
   emptyMessage: string,
 ): string {
+  // R4: a failed search must be flagged BEFORE the zero-items path — otherwise
+  // it renders as the indistinguishable "No emails found" silent zero.
+  const failure = formatSearchFailure(result);
+  if (failure) return failure;
+
   const warningPrefix = result.warning ? `⚠️ ${result.warning}\n` : '';
 
   if (result.items.length === 0) {
@@ -330,6 +366,14 @@ export default function registerEmailsTools(
           attachmentMimetype: params.attachment_mimetype,
           gmailRaw: params.gmail_raw,
         });
+
+        // R4: list_emails has its OWN inline empty path (it does not use
+        // formatSearchResult) — flag a failed search here too, BEFORE the
+        // zero-items message, or the silent zero reproduces on this surface.
+        const failure = formatSearchFailure(result);
+        if (failure) {
+          return { content: [{ type: 'text' as const, text: failure }] };
+        }
 
         const warningPrefix = result.warning ? `⚠️ ${result.warning}\n` : '';
 
@@ -610,19 +654,28 @@ export default function registerEmailsTools(
   server.tool(
     'search_emails',
     'Search emails with server-side filters. Omit query (or pass an empty string) to use pure filters. ' +
+      'Free-text `query` is HEADER-ONLY (matches subject + from). For a full message-body search use the ' +
+      'explicit `body:` or `text:` filters — these are slower and, on a non-FTS server over a large folder, ' +
+      'can be very expensive, so prefer narrowing by subject:/from:/date instead. ' +
       'Supports date ranges (since/before/on, including "7d" / "yesterday"), subject/from/to/cc/bcc/body/text ' +
       'filters, read/flag/answered state, keywords/labels, header matches, UID ranges, size limits, and attachments. ' +
       "On Gmail accounts, pass gmail_raw (e.g. 'from:foo has:attachment older_than:30d') for a dramatically " +
       'faster native Gmail search. Results are paginated; large result sets are capped at 5000 UIDs with a warning. ' +
-      'Archive folders are large — always include a date filter (since/before/on or relative tokens like "30d") ' +
-      'when searching them, otherwise results may be truncated.',
+      'A failed or timed-out SEARCH is reported explicitly (searchFailed + a warning) and is NEVER returned as a ' +
+      'silent zero-result — if you see it, narrow the query and retry; the messages may still exist. ' +
+      'Archive folders and osTicket-ingested mailboxes (e.g. INBOX.osTicket on support@ addresses accumulate ' +
+      'tens of thousands of messages) are very large — always include a date filter (since/before/on or relative ' +
+      'tokens like "30d") or narrow by subject:/from:, otherwise the search may be slow or truncated.',
     {
       account: z.string().describe('Account name from list_accounts'),
       query: z
         .string()
         .optional()
         .default('')
-        .describe('Search keyword across subject/from/body (omit to use filters only)'),
+        .describe(
+          'Search keyword — HEADER-ONLY (subject + from). Omit to use filters only. ' +
+            'For a full message-body search use the body: or text: filter instead.',
+        ),
       mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
       page: z.number().int().min(1).default(1).describe('Page number'),
       pageSize: z.number().int().min(1).max(100).default(20).describe('Results per page'),
@@ -781,7 +834,10 @@ export default function registerEmailsTools(
         .string()
         .optional()
         .default('')
-        .describe('Search keyword across subject/from/body (omit to use filters only)'),
+        .describe(
+          'Search keyword — HEADER-ONLY (subject + from). Omit to use filters only. ' +
+            'For a full message-body search use the body: or text: filter instead.',
+        ),
       accounts: z
         .array(z.string())
         .optional()

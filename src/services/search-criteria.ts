@@ -88,11 +88,16 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
   // ---------------------------------------------------------------------------
   const andConditions: Record<string, unknown>[] = [];
 
-  // Base full-text OR query (matches current search_emails behavior)
+  // R2: free-text `query` is HEADER-ONLY (SUBJECT/FROM). The {body:q} OR
+  // member was removed — on a non-FTS server a BODY scan over a large folder
+  // is pathologically expensive, the server NO's it, and imapflow collapses
+  // that to `false` → the silent false-negative this feature fixes. Full-body
+  // search is the explicit opt-in via the `body:`/`text:` passthrough filters
+  // below (search-criteria.ts handles them as first-class conditions).
   if (params.query && params.query.length > 0) {
     const q = sanitizeSearchQuery(params.query);
     andConditions.push({
-      or: [{ subject: q }, { from: q }, { body: q }],
+      or: [{ subject: q }, { from: q }],
     });
   }
 

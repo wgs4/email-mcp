@@ -1,6 +1,7 @@
 /* eslint-disable n/no-sync -- tests use sync fs helpers for setup/teardown */
 import type { IConnectionManager } from '../connections/types.js';
 import ImapService from './imap.service.js';
+import { SearchFailedError } from './search-status.js';
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -312,6 +313,118 @@ describe('ImapService', () => {
   });
 
   // -----------------------------------------------------------------------
+  // search false-negatives — R1: a failed SEARCH must never be a silent zero
+  // -----------------------------------------------------------------------
+
+  describe('search false-negatives (R1 — failed search ≠ clean zero)', () => {
+    it('searchEmails: client.search → false is flagged searchFailed, not a clean total:0', async () => {
+      // imapflow collapses a server NO / swallowed socket-timeout / local
+      // command failure all into `false` (never a reject). The pre-fix code
+      // did `Array.isArray(false) ? r : []` → a clean, indistinguishable zero.
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+
+      const result = await service.searchEmails('test', 'Order #29804', {});
+
+      expect(result.searchFailed).toBe(true);
+      expect(result.searchStatus?.kind).toBe('search_failed');
+      expect(result.items).toEqual([]);
+      expect(result.total).toBe(0);
+      // Must be distinguishable from a genuine empty match — a warning surfaces.
+      expect(result.warning).toBeDefined();
+    });
+
+    it('searchEmails: a genuine empty match ([]) is NOT flagged as failed', async () => {
+      client.search.mockResolvedValueOnce([]);
+
+      const result = await service.searchEmails('test', 'nothing-matches', {});
+
+      expect(result.searchFailed).toBeUndefined();
+      expect(result.total).toBe(0);
+      expect(result.items).toEqual([]);
+    });
+
+    it('searchEmails: a rejected client.search is classified connection_error (AC1)', async () => {
+      client.search.mockRejectedValueOnce(new Error('socket hang up'));
+
+      const result = await service.searchEmails('test', 'anything', {});
+
+      expect(result.searchFailed).toBe(true);
+      expect(result.searchStatus?.kind).toBe('connection_error');
+      expect(result.searchStatus?.message).toMatch(/socket hang up/);
+      expect(result.total).toBe(0);
+    });
+
+    it('listEmails: client.search → false is flagged searchFailed, not a clean zero', async () => {
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+
+      const result = await service.listEmails('test', { pageSize: 10 });
+
+      expect(result.searchFailed).toBe(true);
+      expect(result.searchStatus?.kind).toBe('search_failed');
+      expect(result.items).toEqual([]);
+      expect(result.total).toBe(0);
+      expect(result.warning).toBeDefined();
+    });
+
+    it('extractContacts: a failed search throws SearchFailedError (batch UX, no carrier)', async () => {
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+
+      const err = await service.extractContacts('test', {}).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SearchFailedError);
+      expect((err as SearchFailedError).status.kind).toBe('search_failed');
+    });
+
+    it('extractContacts: a genuine empty mailbox still returns [] (not flagged)', async () => {
+      client.search.mockResolvedValueOnce([]);
+
+      await expect(service.extractContacts('test', {})).resolves.toEqual([]);
+    });
+
+    it('searchForExport: a failed search throws SearchFailedError (D2 REFINED — isError UX)', async () => {
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+
+      const err = await service
+        .searchForExport(null, 'test', '', { maxRows: 100 })
+        .catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(SearchFailedError);
+      expect((err as SearchFailedError).status.kind).toBe('search_failed');
+    });
+
+    it('searchForExport: a genuine empty match still returns { items: [], truncated: false }', async () => {
+      client.search.mockResolvedValueOnce([]);
+
+      await expect(service.searchForExport(null, 'test', '', { maxRows: 100 })).resolves.toEqual({
+        items: [],
+        truncated: false,
+      });
+    });
+
+    // AC5 — MANDATORY REGRESSION RULE. The R1 refactor edits the same lines as
+    // the MAX_SEARCH_UIDS cap. A regression that retains the OLDEST instead of
+    // the NEWEST UIDs would silently drop fresh mail — the worst possible
+    // outcome of this fix. This test fails if the cap's descending sort is
+    // flipped to ascending or removed.
+    it('AC5 (regression): MAX_SEARCH_UIDS cap retains the NEWEST UIDs, served newest-first', async () => {
+      // 6000 UIDs in ASCENDING order; the cap keeps 5000. Correct behavior
+      // keeps the highest (newest) 5000 and serves page 1 newest-first.
+      const ascending = Array.from({ length: 6000 }, (_, i) => i + 1); // 1..6000
+      client.search.mockResolvedValueOnce(ascending);
+      client.fetch.mockReturnValueOnce((async function* gen() {})());
+
+      const result = await service.searchEmails('test', '', { pageSize: 5 });
+
+      expect(result.total).toBe(5000);
+      expect(result.totalApprox).toBe(true);
+      // Page 1 must be the 5 NEWEST UIDs, descending. An ascending-sort or
+      // no-sort regression would retain/serve 1..5000 (the oldest) instead.
+      expect(client.fetch).toHaveBeenCalledTimes(1);
+      expect(client.fetch.mock.calls[0][0]).toBe('6000,5999,5998,5997,5996');
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // listEmails — malformed envelope dates (regression)
   // -----------------------------------------------------------------------
 
@@ -554,6 +667,44 @@ describe('ImapService', () => {
       await expect(service.searchAcrossAccounts(['a', 'b'], '', { pageSize: 5 })).rejects.toThrow(
         /All 2 accounts failed/,
       );
+    });
+
+    it('R1b: a per-account searchFailed surfaces as a loud warning, not a clean zero (F1/D4)', async () => {
+      // account-a: a genuine hit. account-b: client.search → false (failed).
+      // Pre-fix the fan-out only treated REJECTED promises as failures, so a
+      // fulfilled { searchFailed:true, total:0 } silently counted as a clean
+      // zero participant (F1 one layer up).
+      client.search
+        .mockResolvedValueOnce([10]) // account-a uids
+        .mockResolvedValueOnce(false as unknown as number[]); // account-b FAILED
+      client.fetch.mockReturnValueOnce(
+        makeAsyncGen([makeMessage(10, 'A1', '2024-01-01T00:00:00Z', 'a@example.com')]),
+      );
+      connections.getAccount.mockImplementation((name: string) => ({
+        name,
+        email: `${name}@example.com`,
+        username: name,
+        imap: { host: 'imap.example.com', port: 993, tls: true, starttls: false, verifySsl: true },
+        smtp: { host: 'smtp.example.com', port: 465, tls: true, starttls: false, verifySsl: true },
+      }));
+
+      const result = await service.searchAcrossAccounts(['account-a', 'account-b'], '', {
+        pageSize: 10,
+      });
+
+      // Healthy account still merges — one bad folder cannot nuke the search.
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].account).toBe('account-a');
+      expect(result.total).toBe(1);
+
+      // The failed account is surfaced LOUDLY in per-account warnings — it is
+      // NOT silently counted as a zero-result participant.
+      expect(result.warnings).toBeDefined();
+      const bWarn = result.warnings?.find((w) => w.account === 'account-b');
+      expect(bWarn).toBeDefined();
+      expect(bWarn?.error).toMatch(/SEARCH did not complete|not a zero-match/i);
+      // Human-readable summary mentions the failed account.
+      expect(result.warning).toMatch(/account-b/);
     });
 
     it('unions facets across accounts and re-keys mailbox facet by account', async () => {

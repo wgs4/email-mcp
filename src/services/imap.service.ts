@@ -23,6 +23,7 @@ import type {
   Mailbox,
   PaginatedResult,
   QuotaInfo,
+  SearchStatus,
   SenderStat,
 } from '../types/index.js';
 import type { AttachmentInput, ResolvedAttachment } from './attachment-resolver.js';
@@ -34,6 +35,7 @@ import type { MailboxRef } from './mailbox-resolver.js';
 import { resolveMailboxForAccount } from './mailbox-resolver.js';
 import type { SearchParams } from './search-criteria.js';
 import { buildSearchCriteria, chunkUids } from './search-criteria.js';
+import { connectionErrorStatus, SearchFailedError, searchFailedStatus } from './search-status.js';
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -450,6 +452,33 @@ export default class ImapService {
   constructor(private connections: IConnectionManager) {}
 
   /**
+   * Single choke point for every interactive `client.search()` call (D7/R1).
+   *
+   * imapflow's SearchCommand collapses a server `NO`, a swallowed
+   * socket-timeout, AND a local command failure all into a non-array `false`
+   * (it does NOT reject). A genuine connection error that escaped SearchCommand
+   * rejects instead. Both must be classified as a failed search so callers
+   * never coerce `false` into a clean `total:0` (the silent false-negative).
+   *
+   * The thread-reconstruction searches in `getThread` are an intentional
+   * documented exception — best-effort, loop-tolerant; a failed header search
+   * there degrades to a partial thread, never a false "email lost" — so they
+   * deliberately do NOT route through this helper.
+   */
+  private static async runSearch(
+    client: ImapFlow,
+    criteria: Record<string, unknown>,
+  ): Promise<{ ok: true; uids: number[] } | { ok: false; status: SearchStatus }> {
+    try {
+      const result = await client.search(criteria, { uid: true });
+      if (Array.isArray(result)) return { ok: true, uids: result };
+      return { ok: false, status: searchFailedStatus() };
+    } catch (err) {
+      return { ok: false, status: connectionErrorStatus(err) };
+    }
+  }
+
+  /**
    * Fetch (and cache) the lightweight mailbox reference list for an account.
    * Used by `searchAcrossAccounts` to resolve mailbox aliases via SPECIAL-USE
    * flags without issuing `LIST` on every fan-out call.
@@ -599,8 +628,28 @@ export default class ImapService {
         isGmail,
       });
 
-      const searchResult = await client.search(criteria, { uid: true });
-      let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      const searchOutcome = await ImapService.runSearch(client, criteria);
+      if (!searchOutcome.ok) {
+        // R1/R4: a failed SEARCH must never read as a clean zero. Surface the
+        // structured status AND fold it into `warning` so it always reaches
+        // the tool response (the formatter renders `warning`).
+        const warning = [
+          ...warnings,
+          searchOutcome.status.message,
+          searchOutcome.status.suggestion,
+        ].join('; ');
+        return {
+          items: [],
+          total: 0,
+          page,
+          pageSize,
+          hasMore: false,
+          searchFailed: true,
+          searchStatus: searchOutcome.status,
+          warning,
+        };
+      }
+      let uids: number[] = searchOutcome.uids;
       let totalApprox = false;
 
       // Cap pre-pagination UIDs so huge folders don't balloon later work.
@@ -871,8 +920,28 @@ export default class ImapService {
       const params: SearchParams = { ...(options as SearchParams), query };
       const { criteria, postFilters, warnings } = buildSearchCriteria(params, { isGmail });
 
-      const searchResult = await client.search(criteria, { uid: true });
-      let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      const searchOutcome = await ImapService.runSearch(client, criteria);
+      if (!searchOutcome.ok) {
+        // R1/R4: a failed SEARCH must never read as a clean zero. Surface the
+        // structured status AND fold it into `warning` so it always reaches
+        // the tool response (the formatter renders `warning`).
+        const warning = [
+          ...warnings,
+          searchOutcome.status.message,
+          searchOutcome.status.suggestion,
+        ].join('; ');
+        return {
+          items: [],
+          total: 0,
+          page,
+          pageSize,
+          hasMore: false,
+          searchFailed: true,
+          searchStatus: searchOutcome.status,
+          warning,
+        };
+      }
+      let uids: number[] = searchOutcome.uids;
       let totalApprox = false;
 
       if (uids.length > MAX_SEARCH_UIDS) {
@@ -1148,6 +1217,20 @@ export default class ImapService {
       }
 
       const res = outcome.value;
+
+      // R1b/F1/D4: a fulfilled-but-failed search must be surfaced as a LOUD
+      // per-account failure — never silently merged as a clean zero-result
+      // participant. Branch on the fulfilled `searchFailed`, not only on
+      // rejected promises. This also counts toward the all-failed throw.
+      if (res.searchFailed) {
+        warnings.push({
+          account: name,
+          error: res.searchStatus
+            ? `${res.searchStatus.message} ${res.searchStatus.suggestion}`
+            : 'IMAP SEARCH failed',
+        });
+        return;
+      }
 
       // Stamp every item with its account so downstream callers know where
       // the match came from.
@@ -2245,6 +2328,14 @@ export default class ImapService {
       // Collect all Message-IDs in the thread
       const targetMsgIds = new Set<string>([messageId]);
 
+      // DOCUMENTED EXCEPTION to R1/runSearch (D7): thread reconstruction is
+      // intentionally best-effort and loop-tolerant. Each header SEARCH below
+      // keeps its `Array.isArray` guard so a failed/`false` lookup degrades to
+      // a partial thread — it never manufactures a false "email lost" because
+      // getThread is keyed by an explicit Message-ID, not the silent-zero
+      // incident surface. Routing these through runSearch would turn a benign
+      // partial thread into a hard failure. Do NOT "fix" these to runSearch.
+
       // First, find the root message to get its References chain
       const rootSearch = await client.search(
         { header: { 'Message-ID': messageId } },
@@ -2406,9 +2497,12 @@ export default class ImapService {
 
     const lock = await client.getMailboxLock(mailbox);
     try {
-      // Search for all messages, take the latest N
-      const searchResult = await client.search({ all: true }, { uid: true });
-      const uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      // Search for all messages, take the latest N. A failed SEARCH here would
+      // otherwise silently return zero contacts — throw instead (batch op, no
+      // discriminated-result carrier; isError is the correct UX — D2 REFINED).
+      const searchOutcome = await ImapService.runSearch(client, { all: true });
+      if (!searchOutcome.ok) throw new SearchFailedError(searchOutcome.status);
+      const uids: number[] = searchOutcome.uids;
 
       if (uids.length === 0) return [];
 
@@ -2820,8 +2914,11 @@ export default class ImapService {
     try {
       const params: SearchParams = { ...(searchOpts as SearchParams), query };
       const { criteria, postFilters } = buildSearchCriteria(params, { isGmail });
-      const searchResult = await client.search(criteria, { uid: true });
-      let uids: number[] = Array.isArray(searchResult) ? searchResult : [];
+      // A failed SEARCH must not yield an empty export silently — throw so the
+      // export tool surfaces isError (batch op; D2 REFINED).
+      const searchOutcome = await ImapService.runSearch(client, criteria);
+      if (!searchOutcome.ok) throw new SearchFailedError(searchOutcome.status);
+      let uids: number[] = searchOutcome.uids;
       let truncated = false;
 
       if (uids.length === 0) {

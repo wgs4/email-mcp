@@ -96,6 +96,20 @@ export default class ConnectionManager implements IConnectionManager {
       logger: false,
     });
 
+    // R1c/D6/F2: a socket-timeout emitError() on a client with NO 'error'
+    // listener crashes the whole process. Attach a default handler at creation
+    // — before connect(), so connection-phase errors are caught too. Log it and
+    // drop the client so the next getImapClient reconnects. The watcher attaches
+    // its own additional 'error' listener; EventEmitter listeners are additive.
+    client.on('error', (err: Error) => {
+      mcpLog(
+        'error',
+        'imap',
+        `IMAP client error for "${accountName}": ${err instanceof Error ? err.message : String(err)}`,
+      ).catch(() => {});
+      this.imapClients.delete(accountName);
+    });
+
     await client.connect();
     await mcpLog(
       'info',
