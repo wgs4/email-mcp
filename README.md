@@ -354,6 +354,7 @@ email-mcp [command]
 
 Commands:
   stdio                     Run as MCP server over stdio (default)
+  http                      Run as MCP server over Streamable HTTP
   account list              List all configured accounts
   account add               Add a new email account interactively
   account edit [name]       Edit an existing account
