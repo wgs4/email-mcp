@@ -100,7 +100,7 @@ docker build -t ghcr.io/codefuturist/email-mcp .
 
 > **Tag convention:** Tags follow bare semver (no `v` prefix), matching Docker ecosystem standards (e.g. `node:24`, `nginx:1.25`). The `latest` tag is only updated on stable releases, never pre-releases.
 
-> **Note:** The server uses stdio transport. Config must be created on the host first
+> **Note:** The server supports both stdio (default) and Streamable HTTP transport modes. Config must be created on the host first
 > (via `npx @codefuturist/email-mcp setup` or manually) and mounted into the container.
 
 ## Usage
@@ -303,6 +303,27 @@ For MCP client configuration (e.g. Claude Desktop):
   }
 }
 ```
+</details>
+
+<details>
+<summary><strong>Docker (HTTP mode)</strong></summary>
+
+Switch from stdio to HTTP transport using a Docker Compose override:
+
+```bash
+# Activate HTTP mode
+cp docker-compose.override.example.yml docker-compose.override.yml
+
+# Start (binds to 127.0.0.1:8080)
+docker compose up
+```
+
+The HTTP transport exposes the MCP endpoint at `http://127.0.0.1:8080/mcp` and a health check at `http://127.0.0.1:8080/health`.
+
+To switch back to stdio: `rm docker-compose.override.yml`
+
+> **Note:** SSE is not supported — this server uses Streamable HTTP.
+
 </details>
 
 <details>

@@ -4,4 +4,4 @@ services:
     image: codefuturist/email-mcp:latest
     stdin_open: true # required for stdio transport
     volumes:
-      - ${EMAIL_MCP_CONFIG:-~/.config/email-mcp}:/home/node/.config/email-mcp:ro
+- ${EMAIL_MCP_CONFIG:-~/.config/email-mcp}:/home/node/.config/email-mcp:ro
