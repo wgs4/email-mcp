@@ -36,7 +36,7 @@ post_bump_hooks = [
     "jq --arg v {{version}} '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json",
     "git add server.json",
     "git push origin HEAD",
-    "git push origin {{version}}",
+    "git push origin v{{version}}",
 ]
 
 # ------------------------------------------------------------------------------
@@ -87,7 +87,7 @@ post_bump_hooks = [
     "jq --arg v {{version}} '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json",
     "git add server.json",
     "git push origin HEAD",
-    "git push origin {{version}}",
+    "git push origin v{{version}}",
 ]
 
 [bump_profiles.hotfix]
@@ -98,5 +98,5 @@ post_bump_hooks = [
     "jq --arg v {{version}} '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json",
     "git add server.json",
     "git push origin HEAD",
-    "git push origin {{version}}",
+    "git push origin v{{version}}",
 ]
