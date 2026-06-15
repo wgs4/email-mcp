@@ -214,7 +214,14 @@ export default class SmtpService {
       });
     });
 
-    const result = await transport.sendMail({ raw: rawMessage });
+    // When sending a pre-composed raw message, nodemailer cannot derive the SMTP
+    // envelope from the (opaque) raw bytes — it would compute an empty recipient
+    // list and throw "No recipients defined". Pass the envelope explicitly so the
+    // RCPT TO list covers every To + Cc recipient.
+    const result = await transport.sendMail({
+      envelope: { from: account.email, to: [...to, ...cc] },
+      raw: rawMessage,
+    });
 
     await this.appendToSentFolder(accountName, rawMessage);
 

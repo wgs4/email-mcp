@@ -250,6 +250,48 @@ describe('SmtpService', () => {
       const [[, rawMsg]] = vi.mocked(imapService.appendToSent).mock.calls;
       expect((rawMsg as Buffer).toString()).toContain('Subject: Re: Original Subject');
     });
+
+    // Regression: a raw-only sendMail({ raw }) gives nodemailer an empty SMTP
+    // envelope ("No recipients defined"). The envelope must be passed explicitly
+    // and must carry the original sender as a recipient.
+    it('sends with an explicit, non-empty envelope addressed to the original sender', async () => {
+      await service.replyToEmail('test', {
+        emailId: '42',
+        body: 'Reply body',
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.raw).toBeInstanceOf(Buffer);
+      expect(call.envelope).toBeDefined();
+      expect(call.envelope.from).toBe('test@example.com');
+      expect(call.envelope.to).toEqual(['sender@example.com']);
+    });
+
+    it('includes To and Cc recipients (minus self) in the envelope on replyAll', async () => {
+      imapService.getEmail = vi.fn().mockResolvedValue(
+        createMockEmail({
+          to: [
+            { name: 'Test User', address: 'test@example.com' }, // us — must be dropped
+            { name: 'Other', address: 'other@example.com' },
+          ],
+          cc: [{ name: 'CC One', address: 'cc1@example.com' }],
+        }),
+      );
+
+      await service.replyToEmail('test', {
+        emailId: '42',
+        body: 'Reply body',
+        replyAll: true,
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.envelope.to).toEqual([
+        'sender@example.com',
+        'other@example.com',
+        'cc1@example.com',
+      ]);
+      expect(call.envelope.to).not.toContain('test@example.com');
+    });
   });
 
   describe('forwardEmail', () => {
