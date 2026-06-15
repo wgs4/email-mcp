@@ -32,6 +32,63 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/) 
 - add pnpm install and usage instructions - ([13c8d4b](https://github.com/codefuturist/email-mcp/commit/13c8d4bf3006fa4fb5f014eb630006a478082a23))
 
 - - -
+## [v0.3.0](https://github.com/codefuturist/email-mcp/compare/03b3b0233e5e65b1fa30324f3859860e061b364d..v0.3.0) - 2026-06-15
+#### ✨ Features
+- (**bin**) add lifecycle wrapper to prevent orphan email-mcp processes - ([1d29290](https://github.com/codefuturist/email-mcp/commit/1d29290780faba7adb2812b28ac6eb86e45db6d5)) - David Young, Claude Opus 4.7
+- (**db**) email_mcp schema migration 001 + forward-only migrate runner (#9) - ([fb40334](https://github.com/codefuturist/email-mcp/commit/fb40334f2ae221a5d898c22e35c531456e649162)) - David Young, Claude Opus 4.7
+- (**drafts**) add attachment support to save_draft and new update_draft tool (#7) - ([c824407](https://github.com/codefuturist/email-mcp/commit/c824407de9809e3d783d185346d86a23001f14cc)) - David Young
+- (**export**) export_search + save_attachment + batch attachment save - ([60c5de3](https://github.com/codefuturist/email-mcp/commit/60c5de3593f4c6e72b3bfc103190eb2e8c484902)) - Your Name
+- (**routing**) minimal cross_account_move tool (D8/D9/D15/D18) (#11) - ([1d7112f](https://github.com/codefuturist/email-mcp/commit/1d7112f9560c183e16260b2c1c0388317cfd762a)) - David Young, Claude Opus 4.7
+- (**search**) bounded deep search + restore body-in-default (PR-2) (#13) - ([c80303c](https://github.com/codefuturist/email-mcp/commit/c80303c0581ced1f55c36843cf32d89941509de4)) - David Young
+- (**search**) auto-remap mailbox via SPECIAL-USE for cross-account - ([f2f75ea](https://github.com/codefuturist/email-mcp/commit/f2f75ea52b137a6f969b023ba322fe2992a5b08c)) - Your Name, Claude Opus 4.7 (1M context)
+- (**search**) cross-account search + saved-search presets - ([52512ef](https://github.com/codefuturist/email-mcp/commit/52512efd5cf2d4de4a0cb7f2e3d5f0979b8a00da)) - Your Name, Claude Opus 4.7 (1M context)
+- (**search**) attachment metadata filters + faceted counts - ([c9c8faa](https://github.com/codefuturist/email-mcp/commit/c9c8faa6e663f64030020a03812a5fe1efb3be5a)) - Your Name
+- (**search**) server-side filter parity, perf fixes, Gmail fast path - ([27a070f](https://github.com/codefuturist/email-mcp/commit/27a070fbbf84f6e96ed18ea072bef2edd9557a61)) - Your Name, Claude Opus 4.7 (1M context)
+- (**smtp**) add includeAttachments option to reply_email tool - ([3753fdd](https://github.com/codefuturist/email-mcp/commit/3753fddb6ee5fd6204e9d25d163d91ffb21e515a)) - David Young, Claude Sonnet 4.6
+- (**smtp**) add includeAttachments option to reply_email tool - ([470ad56](https://github.com/codefuturist/email-mcp/commit/470ad560cad81a6ed77d46ec47bcc5b701970aeb)) - David Young, Claude Sonnet 4.6
+- (**smtp**) append sent messages to IMAP Sent folder after send - ([ea74211](https://github.com/codefuturist/email-mcp/commit/ea74211a3a782ab3599398a5f17a79c3dd7170ab)) - David Young, Claude Opus 4.6
+#### 🐛 Bug Fixes
+- (**attachments**) unify attachment detection across all IMAP code paths (#14) - ([f91f427](https://github.com/codefuturist/email-mcp/commit/f91f42731b52f8ae7e3c0c34c1c0b0787c54bb78)) - David Young, Claude Opus 4.7 (1M context)
+- (**bin**) use exec so wrapper does not break stdio JSON-RPC - ([df3bd37](https://github.com/codefuturist/email-mcp/commit/df3bd37e800914a97422ff16f5a154b7360e895f)) - David Young, Claude Opus 4.7
+- (**drafts**) preserve attachments when sending drafts - ([02891fa](https://github.com/codefuturist/email-mcp/commit/02891fa7ab36f51698ce626919717de9c7defcaa)) - David Young, Claude Opus 4.8
+- (**imap**) MIME-aware body extraction (empty multipart/Gmail/forwarded bodies) (#15) - ([9794101](https://github.com/codefuturist/email-mcp/commit/9794101e0b16ded3830b894dea4797892f66acae)) - David Young, Claude Opus 4.7 (1M context)
+- (**imap**) harden envelope-date parsing against malformed Date headers (#6) - ([e77a1c7](https://github.com/codefuturist/email-mcp/commit/e77a1c7a492442db66f0dd7e836126d391e4701a)) - David Young, Claude Opus 4.7, Claude Opus 4.7, Claude Opus 4.7
+- (**search**) never present a failed IMAP SEARCH as a clean zero (PR-1) (#12) - ([56b1f2c](https://github.com/codefuturist/email-mcp/commit/56b1f2cb6654c3b06037cba0933b6021e6bf85e8)) - David Young, Claude Opus 4.7 (1M context)
+- (**search**) align has_attachment boolean with attachments[] helper - ([eb2c6ce](https://github.com/codefuturist/email-mcp/commit/eb2c6ce9b5045681d374f633143677505668d2b9)) - Your Name, Claude Sonnet 4.6
+- (**smtp**) pass explicit SMTP envelope on reply (fixes "No recipients defined") - ([94a64a6](https://github.com/codefuturist/email-mcp/commit/94a64a6bfe33d356b6e1d0aae78d7a86efb910a6)) - David Young, Claude Opus 4.8 (1M context)
+- (**smtp**) explicit /index.js suffix on MailComposer import - ([0209649](https://github.com/codefuturist/email-mcp/commit/020964924d646a414f352ce46b7be1a719ecbf93)) - David Young, Claude Sonnet 4.6
+- (**smtp**) replace require() with ESM import for MailComposer - ([457d59e](https://github.com/codefuturist/email-mcp/commit/457d59e85dd2dfaaeb829579a470855f2e2687d9)) - David Young, Claude Sonnet 4.6
+- (**smtp**) resolve correct Sent folder and harden RFC compliance - ([f54e8b7](https://github.com/codefuturist/email-mcp/commit/f54e8b7e3c8f286630e3a0e9d37fb8cb580ab099)) - David Young, Claude Opus 4.6
+#### 📚 Documentation
+- (**config**) add example config and cpanel sent folder troubleshooting - ([e3a39cc](https://github.com/codefuturist/email-mcp/commit/e3a39cca8b83667cec14d8712ce0ab71a2ebeb4d)) - Your Name
+- (**db**) provisioning must reassign public schema owner to email_mcp (#10) - ([92f1409](https://github.com/codefuturist/email-mcp/commit/92f14097d0c9402f937606b28ce2c1774bdd9339)) - David Young, Claude Opus 4.7
+- (**mcp**) teach the LLM to consider Archive folders and require date filters - ([768e1e2](https://github.com/codefuturist/email-mcp/commit/768e1e2af2e0ee1412bebf86ce5ad246870281be)) - David Young, Claude Opus 4.7
+- add Mistral Vibe MCP client installation instructions - ([643fb18](https://github.com/codefuturist/email-mcp/commit/643fb18b9e0c3c241143991db6825d7ca174921a)) - Colin
+- add scheduler daemon setup instructions and delivery requirements - ([cbc3042](https://github.com/codefuturist/email-mcp/commit/cbc3042bcc4ae8c33e7586519b7065ba2b0f264d)) - Colin
+- expand VS Code Copilot setup (all 3 methods) and add Zed client - ([9e1f785](https://github.com/codefuturist/email-mcp/commit/9e1f78518833048c9fd56a37110d0dc54da538ce)) - Colin
+#### Tests
+- (**attachments**) regression for Apple-Mail inline PDF in nested MIME (#17) - ([ac2c535](https://github.com/codefuturist/email-mcp/commit/ac2c5352ad270fb3cecdb71cab790e4a7bd3f21f)) - David Young, Claude Opus 4.8 (1M context)
+#### ♻️ Refactoring
+- (**smtp**) extract fetchAttachment helper to satisfy biome pre-push check - ([a2d08a5](https://github.com/codefuturist/email-mcp/commit/a2d08a5d74dba6b89462cfc5c3bdd74541652f61)) - David Young, Claude Sonnet 4.6
+#### Chores
+- (**gitignore**) ignore stray config.toml inside repo dir - ([988773b](https://github.com/codefuturist/email-mcp/commit/988773b59813cf1c2ce2643b33a39472e5f900e8)) - David Young
+- (**gitignore**) ignore scheduled task - skills/ - ([b766228](https://github.com/codefuturist/email-mcp/commit/b766228a8747856136fc68ad072a673a59c69805)) - David
+- remove stray package-lock.json and ignore non-pnpm lockfiles - ([749179d](https://github.com/codefuturist/email-mcp/commit/749179d93a09adc9157ed0a5cb6ad9b648a6aa63)) - David Young, Claude Opus 4.7
+- normalize server.json formatting - ([4034b78](https://github.com/codefuturist/email-mcp/commit/4034b78715f1ab20306f969ec963b9f0df0aae4d)) - Colin, Copilot
+- fix cog post_bump_hooks to sync package.json and server.json versions - ([03b3b02](https://github.com/codefuturist/email-mcp/commit/03b3b0233e5e65b1fa30324f3859860e061b364d)) - Colin
+#### Styles
+- (**imap**) fix biome formatting in resolveSentFolder - ([293accc](https://github.com/codefuturist/email-mcp/commit/293accc8284272888a31cb87aadd31ab96a9ae7d)) - David Young, Claude Opus 4.6
+- (**smtp**) disable implicit-arrow-linebreak for fetchAttachment - ([2a3a187](https://github.com/codefuturist/email-mcp/commit/2a3a1874757160e474d0b44d941c103107ff98de)) - David Young, Claude Sonnet 4.6
+- (**smtp**) split fetchAttachment arrow to comply with biome line-length - ([3a0ea67](https://github.com/codefuturist/email-mcp/commit/3a0ea6799b3d7dfe3e3dedd7acf0718a171c89bc)) - David Young, Claude Sonnet 4.6
+- (**smtp**) split fetchAttachment arrow to comply with biome line-length - ([9e9efe4](https://github.com/codefuturist/email-mcp/commit/9e9efe4597fbdacbd3ddee2d82a5efbfa8106b7e)) - David Young, Claude Sonnet 4.6
+- (**smtp**) split fetchAttachment arrow to satisfy biome line-length rule - ([8d338f4](https://github.com/codefuturist/email-mcp/commit/8d338f4201eef401b409aeff05a8f1b7a09c3caf)) - David Young, Claude Sonnet 4.6
+- (**smtp**) apply biome formatting for fetchAttachment arrow function - ([60e653a](https://github.com/codefuturist/email-mcp/commit/60e653abd44c823834a2a8bb005bee68e9e7d143)) - David Young, Claude Sonnet 4.6
+- (**smtp**) fix biome arrow function line break - ([5094e97](https://github.com/codefuturist/email-mcp/commit/5094e97c3832f995508ea5761a872243bf97bc38)) - David Young, Claude Sonnet 4.6
+- (**smtp**) apply biome formatting - ([a038e53](https://github.com/codefuturist/email-mcp/commit/a038e536f15563f2516d20e465027dbf095555b8)) - David Young
+- (**smtp**) apply biome formatting - ([31ac61f](https://github.com/codefuturist/email-mcp/commit/31ac61fbb25d2fa96606e75cad360120b4176db9)) - David Young
+
+- - -
+
 ## [v0.2.1](https://github.com/codefuturist/email-mcp/compare/bd6f94d6f0d1f7f4beca5aa8061f2892a40f0ce0..v0.2.1) - 2026-02-20
 #### 🐛 Bug Fixes
 - (**labels**) fix critical parameter swap and multiple label bugs - ([bd6f94d](https://github.com/codefuturist/email-mcp/commit/bd6f94d6f0d1f7f4beca5aa8061f2892a40f0ce0)) - Colin
