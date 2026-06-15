@@ -73,6 +73,82 @@ describe('Email Send Operations', () => {
 
       expect(result.items.length).toBeGreaterThanOrEqual(1);
     });
+
+    it('sends a base64 attachment + bcc: attachment delivered, Bcc header absent', async () => {
+      // GreenMail does not auto-create a Sent folder — create it by the
+      // canonical name so the appendToSent path can find it.
+      const sentFolder = 'Sent';
+      try {
+        await services.imapService.createMailbox(TEST_ACCOUNT_NAME, sentFolder);
+      } catch {
+        // Already exists, ignore.
+      }
+
+      const pdf = Buffer.from('%PDF-1.4 send_email attachment bytes');
+      const subject = `send_email w/ attachment ${Date.now()}`;
+
+      // To = the sending account (test@localhost / `integration`); Bcc = the
+      // SECOND test account (bob@localhost / `integration-2`). bob appears ONLY
+      // in the Bcc — nowhere in To/Cc — and the harness owns an IMAP connection
+      // for `integration-2`, so we can fetch bob's own INBOX and prove the blind
+      // copy actually landed. (The previous version bcc'd alice@localhost, for
+      // whom no account/IMAP connection exists, then fetched bob's mailbox — so
+      // it never verified Bcc delivery at all.)
+      const result = await services.smtpService.sendEmail(TEST_ACCOUNT_NAME, {
+        to: ['test@localhost'],
+        bcc: ['bob@localhost'],
+        subject,
+        body: 'This email carries an attachment and a blind copy.',
+        attachments: await services.imapService.resolveAttachmentsForSend(TEST_ACCOUNT_NAME, [
+          {
+            contentBase64: pdf.toString('base64'),
+            filename: 'sendme.pdf',
+            mimeType: 'application/pdf',
+          },
+        ]),
+      });
+      expect(result.messageId).toBeTruthy();
+
+      await waitForDelivery();
+
+      // (1) The Bcc recipient (bob) actually RECEIVED the message. bob is only a
+      //     blind recipient, so a non-empty hit in bob's own INBOX proves the
+      //     Bcc address was carried in the SMTP envelope (RCPT TO) and delivered.
+      //     If Bcc delivery were broken, bob's INBOX would be empty here.
+      const bccInbox = await services.imapService.listEmails('integration-2', {
+        mailbox: 'INBOX',
+        pageSize: 50,
+        subject,
+      });
+      const bccMatch = bccInbox.items.find((m) => m.subject === subject);
+      expect(bccMatch, 'bcc recipient (bob) should have received the message').toBeDefined();
+
+      // (1b) The copy DELIVERED to the Bcc recipient must not leak the `Bcc:`
+      //      header either — blind recipients stay blind to each other.
+      const delivered = await services.imapService.getEmail(
+        'integration-2',
+        String(bccMatch?.id),
+        'INBOX',
+      );
+      expect(Object.keys(delivered.headers ?? {})).not.toContain('bcc');
+
+      // (2) The Sent copy: attachment present, Bcc header absent.
+      const listed = await services.imapService.listEmails(TEST_ACCOUNT_NAME, {
+        mailbox: sentFolder,
+        pageSize: 50,
+        subject,
+      });
+      const match = listed.items.find((m) => m.subject === subject);
+      expect(match, 'sent copy should exist in the Sent folder').toBeDefined();
+
+      const sent = await services.imapService.getEmail(
+        TEST_ACCOUNT_NAME,
+        String(match?.id),
+        sentFolder,
+      );
+      expect(sent.attachments.map((a) => a.filename)).toContain('sendme.pdf');
+      expect(Object.keys(sent.headers ?? {})).not.toContain('bcc');
+    });
   });
 
   // ---------------------------------------------------------------------------

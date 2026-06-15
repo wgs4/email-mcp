@@ -2216,6 +2216,28 @@ export default class ImapService {
   }
 
   /**
+   * Resolve polymorphic AttachmentInput entries (path / base64 / source-message
+   * reference) into in-memory {@link ResolvedAttachment} binaries for an
+   * outbound send. Mirrors the resolver step of {@link saveDraftWithAttachments}.
+   *
+   * Strict failure: if ANY attachment cannot be resolved, the whole operation
+   * throws — the caller must not send a partial message missing attachments the
+   * user asked for. The error names every attachment that failed.
+   */
+  async resolveAttachmentsForSend(
+    accountName: string,
+    attachments: AttachmentInput[],
+  ): Promise<ResolvedAttachment[]> {
+    if (attachments.length === 0) return [];
+    const result = await resolveAttachments(this, accountName, attachments);
+    if (result.failures.length > 0) {
+      const summary = result.failures.map((f) => `${f.label}: ${f.reason}`).join('; ');
+      throw new Error(`Failed to resolve ${result.failures.length} attachment(s): ${summary}`);
+    }
+    return result.resolved;
+  }
+
+  /**
    * Resolve and save a draft with polymorphic AttachmentInput entries. The
    * resolver fetches binaries (from disk / base64 / source-message IMAP) and
    * hands the in-memory bytes to {@link saveDraft}.

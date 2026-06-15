@@ -9,6 +9,7 @@ import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
 import type { AccountConfig, SendResult } from '../types/index.js';
+import type { ResolvedAttachment } from './attachment-resolver.js';
 import type ImapService from './imap.service.js';
 
 // ---------------------------------------------------------------------------
@@ -117,6 +118,27 @@ export function stripBccHeader(raw: Buffer): Buffer {
   return Buffer.from(rebuilt, 'binary');
 }
 
+/**
+ * Normalize an SMTP envelope recipient list (the RCPT TO set). Drops
+ * empty/whitespace-only addresses (a parsed `{address:''}` is not a recipient)
+ * and de-dupes case-insensitively (an address appearing in both To and Cc, or
+ * differing only in case, yields ONE RCPT). First-seen order and the first
+ * occurrence's original casing are preserved. Exported for unit testing.
+ */
+export function normalizeEnvelopeRecipients(addrs: string[]): string[] {
+  return addrs.reduce<{ seen: Set<string>; list: string[] }>(
+    (acc, addr) => {
+      const trimmed = addr.trim();
+      const key = trimmed.toLowerCase();
+      if (trimmed.length === 0 || acc.seen.has(key)) return acc;
+      acc.seen.add(key);
+      acc.list.push(trimmed);
+      return acc;
+    },
+    { seen: new Set<string>(), list: [] },
+  ).list;
+}
+
 export default class SmtpService {
   constructor(
     private connections: IConnectionManager,
@@ -137,6 +159,7 @@ export default class SmtpService {
       cc?: string[];
       bcc?: string[];
       html?: boolean;
+      attachments?: ResolvedAttachment[];
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
@@ -144,29 +167,51 @@ export default class SmtpService {
     const account = this.connections.getAccount(accountName);
     const transport = await this.connections.getSmtpTransport(accountName);
 
+    const toAddrs = options.to;
+    const ccAddrs = options.cc ?? [];
+    const bccAddrs = options.bcc ?? [];
+
+    // Compose ONCE → raw bytes (same approach as replyToEmail / sendDraft): the
+    // identical bytes are transmitted via SMTP and stored in Sent. Bcc is
+    // deliberately NOT placed in mailOptions — we send the raw message, so
+    // nodemailer would not strip a Bcc header for us; the blind recipients ride
+    // only in the SMTP envelope below.
     const mailOptions = {
       from: account.fullName ? `"${account.fullName}" <${account.email}>` : account.email,
-      to: options.to.join(', '),
-      cc: options.cc?.join(', '),
-      bcc: options.bcc?.join(', '),
+      to: toAddrs.join(', '),
+      cc: ccAddrs.length > 0 ? ccAddrs.join(', ') : undefined,
       subject: options.subject,
       ...(options.html ? { html: options.body } : { text: options.body }),
+      ...(options.attachments?.length ? { attachments: options.attachments } : {}),
     };
 
-    const result = await transport.sendMail(mailOptions);
+    const rawMessage = await new Promise<Buffer>((resolve, reject) => {
+      new MailComposer(mailOptions).compile().build((err: Error | null, buf: Buffer) => {
+        if (err) reject(err);
+        else resolve(buf);
+      });
+    });
 
-    await this.appendToSentFolder(
-      accountName,
-      buildRawMessage({
-        from: mailOptions.from,
-        to: mailOptions.to,
-        subject: mailOptions.subject,
-        body: options.body,
-        cc: mailOptions.cc,
-        messageId: result.messageId ?? '',
-        html: options.html,
-      }),
-    );
+    // Build the SMTP envelope explicitly — nodemailer cannot derive it from the
+    // opaque raw bytes. The RCPT TO list covers every To + Cc + Bcc recipient,
+    // de-duped case-insensitively.
+    const envelope = {
+      from: account.email,
+      to: normalizeEnvelopeRecipients([...toAddrs, ...ccAddrs, ...bccAddrs]),
+    };
+
+    if (envelope.to.length === 0) {
+      // The tool schema requires `to` (minItems 1); guard anyway so we never
+      // hand SMTP an empty RCPT TO list.
+      throw new Error('Cannot send email: no recipients (To/Cc/Bcc all empty)');
+    }
+
+    const result = await transport.sendMail({ envelope, raw: rawMessage });
+
+    // Append the SAME raw bytes to Sent — "one raw message, sent and stored".
+    // This also fixes the previously lossy Sent copy (attachment-blind
+    // buildRawMessage path).
+    await this.appendToSentFolder(accountName, rawMessage);
 
     return {
       messageId: result.messageId ?? '',
@@ -426,24 +471,9 @@ export default class SmtpService {
     const ccAddrs = (draft.cc ?? []).map((a) => a.address);
     const bccAddrs = (draft.bcc ?? []).map((a) => a.address);
 
-    // Normalize the RCPT TO list: drop empty/whitespace-only addresses (a
-    // parsed `{address:''}` is not a recipient) and de-dupe case-insensitively
-    // (an address in both To and Cc, or differing only in case, yields ONE
-    // RCPT). First-seen order and the first occurrence's casing are preserved.
-    const recipients = [...toAddrs, ...ccAddrs, ...bccAddrs].reduce<{
-      seen: Set<string>;
-      list: string[];
-    }>(
-      (acc, addr) => {
-        const trimmed = addr.trim();
-        const key = trimmed.toLowerCase();
-        if (trimmed.length === 0 || acc.seen.has(key)) return acc;
-        acc.seen.add(key);
-        acc.list.push(addr);
-        return acc;
-      },
-      { seen: new Set<string>(), list: [] },
-    ).list;
+    // Normalize the RCPT TO list (drop blanks, de-dupe case-insensitively,
+    // preserve first-seen order). See {@link normalizeEnvelopeRecipients}.
+    const recipients = normalizeEnvelopeRecipients([...toAddrs, ...ccAddrs, ...bccAddrs]);
     const envelope = { from: account.email, to: recipients };
 
     if (envelope.to.length === 0) {

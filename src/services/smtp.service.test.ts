@@ -1,7 +1,8 @@
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
+import type { ResolvedAttachment } from './attachment-resolver.js';
 import type ImapService from './imap.service.js';
-import SmtpService, { stripBccHeader } from './smtp.service.js';
+import SmtpService, { normalizeEnvelopeRecipients, stripBccHeader } from './smtp.service.js';
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -94,7 +95,7 @@ describe('SmtpService', () => {
   });
 
   describe('sendEmail', () => {
-    it('sends email via SMTP transport', async () => {
+    it('sends email via SMTP transport as raw bytes with an explicit envelope', async () => {
       const result = await service.sendEmail('test', {
         to: ['recipient@example.com'],
         subject: 'Hello',
@@ -105,14 +106,19 @@ describe('SmtpService', () => {
         messageId: '<test@example.com>',
         status: 'sent',
       });
-      expect(transport.sendMail).toHaveBeenCalledWith(
-        expect.objectContaining({
-          from: '"Test User" <test@example.com>',
-          to: 'recipient@example.com',
-          subject: 'Hello',
-          text: 'World',
-        }),
-      );
+      const call = transport.sendMail.mock.calls[0][0];
+      // Compose-once → raw: nodemailer receives opaque bytes + explicit envelope.
+      expect(call.raw).toBeInstanceOf(Buffer);
+      expect(call.envelope).toEqual({
+        from: 'test@example.com',
+        to: ['recipient@example.com'],
+      });
+      const rawStr = (call.raw as Buffer).toString('utf-8');
+      // MailComposer normalizes the display name (drops quotes for all-ASCII).
+      expect(rawStr).toContain('From: Test User <test@example.com>');
+      expect(rawStr).toContain('To: recipient@example.com');
+      expect(rawStr).toContain('Subject: Hello');
+      expect(rawStr).toContain('World');
     });
 
     it('throws when rate limited', async () => {
@@ -130,7 +136,7 @@ describe('SmtpService', () => {
       expect(transport.sendMail).not.toHaveBeenCalled();
     });
 
-    it('includes CC and BCC when provided', async () => {
+    it('includes Cc in the message and To+Cc+Bcc in the envelope', async () => {
       await service.sendEmail('test', {
         to: ['a@example.com'],
         subject: 'Test',
@@ -139,12 +145,18 @@ describe('SmtpService', () => {
         bcc: ['bcc@example.com'],
       });
 
-      expect(transport.sendMail).toHaveBeenCalledWith(
-        expect.objectContaining({
-          cc: 'cc1@example.com, cc2@example.com',
-          bcc: 'bcc@example.com',
-        }),
-      );
+      const call = transport.sendMail.mock.calls[0][0];
+      const rawStr = (call.raw as Buffer).toString('utf-8');
+      // Cc appears as a header; Bcc must NOT (it rides only in the envelope).
+      expect(rawStr).toContain('Cc: cc1@example.com, cc2@example.com');
+      expect(rawStr).not.toMatch(/^Bcc:/im);
+      // The envelope RCPT TO covers every To + Cc + Bcc recipient.
+      expect(call.envelope.to).toEqual([
+        'a@example.com',
+        'cc1@example.com',
+        'cc2@example.com',
+        'bcc@example.com',
+      ]);
     });
 
     it('sends as HTML when html=true', async () => {
@@ -156,21 +168,23 @@ describe('SmtpService', () => {
       });
 
       const call = transport.sendMail.mock.calls[0][0];
-      expect(call.html).toBe('<h1>Hello</h1>');
-      expect(call.text).toBeUndefined();
+      const rawStr = (call.raw as Buffer).toString('utf-8');
+      expect(rawStr).toContain('text/html');
+      expect(rawStr).toContain('<h1>Hello</h1>');
     });
 
-    it('calls appendToSent after successful send', async () => {
+    it('calls appendToSent with the same raw bytes that were sent', async () => {
       await service.sendEmail('test', {
         to: ['recipient@example.com'],
         subject: 'Hello',
         body: 'World',
       });
 
-      expect(imapService.appendToSent).toHaveBeenCalledWith(
-        'test',
-        expect.stringContaining('Subject: Hello'),
-      );
+      expect(imapService.appendToSent).toHaveBeenCalledWith('test', expect.any(Buffer));
+      const [[, appended]] = vi.mocked(imapService.appendToSent).mock.calls;
+      expect((appended as Buffer).toString('utf-8')).toContain('Subject: Hello');
+      const sent = transport.sendMail.mock.calls[0][0].raw as Buffer;
+      expect((appended as Buffer).equals(sent)).toBe(true);
     });
 
     it('skips appendToSent for Gmail accounts', async () => {
@@ -236,6 +250,68 @@ describe('SmtpService', () => {
       });
 
       expect(imapService.appendToSent).toHaveBeenCalled();
+    });
+
+    it('composes attachments into the raw message and stores the same bytes', async () => {
+      const attachments: ResolvedAttachment[] = [
+        {
+          filename: 'invoice.pdf',
+          content: Buffer.from('%PDF-1.4 fake invoice bytes'),
+          contentType: 'application/pdf',
+        },
+      ];
+
+      await service.sendEmail('test', {
+        to: ['recipient@example.com'],
+        subject: 'With attachment',
+        body: 'See attached',
+        cc: ['cc1@example.com'],
+        bcc: ['secret@example.com'],
+        attachments,
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      // Raw passthrough, not the old mailOptions shape.
+      expect(call.raw).toBeInstanceOf(Buffer);
+      const rawStr = (call.raw as Buffer).toString('utf-8');
+      // The attachment filename survives in the composed MIME.
+      expect(rawStr).toContain('invoice.pdf');
+      // Bcc must never appear as a header in the composed/stored message.
+      expect(rawStr).not.toMatch(/^Bcc:/im);
+      // Envelope RCPT TO includes To + Cc + Bcc (de-duped).
+      expect(call.envelope.from).toBe('test@example.com');
+      expect(call.envelope.to).toEqual([
+        'recipient@example.com',
+        'cc1@example.com',
+        'secret@example.com',
+      ]);
+
+      // appendToSent receives the SAME raw bytes that were transmitted.
+      const [[, appended]] = vi.mocked(imapService.appendToSent).mock.calls;
+      expect((appended as Buffer).toString('utf-8')).toContain('invoice.pdf');
+      expect((appended as Buffer).equals(call.raw as Buffer)).toBe(true);
+    });
+
+    it('delivers a bcc via the envelope but keeps it out of the raw/Sent message', async () => {
+      await service.sendEmail('test', {
+        to: ['recipient@example.com'],
+        subject: 'Blind copy',
+        body: 'Body',
+        bcc: ['secret@example.com'],
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      const rawStr = (call.raw as Buffer).toString('utf-8');
+      // Bcc is in the SMTP envelope…
+      expect(call.envelope.to).toEqual(['recipient@example.com', 'secret@example.com']);
+      // …but NOT in the transmitted message.
+      expect(rawStr).not.toMatch(/^Bcc:/im);
+      expect(rawStr).not.toContain('secret@example.com');
+      // …and NOT in the Sent copy.
+      const [[, appended]] = vi.mocked(imapService.appendToSent).mock.calls;
+      const appendedStr = (appended as Buffer).toString('utf-8');
+      expect(appendedStr).not.toMatch(/^Bcc:/im);
+      expect(appendedStr).not.toContain('secret@example.com');
     });
   });
 
@@ -671,6 +747,40 @@ describe('SmtpService', () => {
       );
       const out = stripBccHeader(raw);
       expect(out.equals(raw)).toBe(true);
+    });
+  });
+
+  describe('normalizeEnvelopeRecipients', () => {
+    it('de-dupes case-insensitively, preserving first-seen order and casing', () => {
+      const out = normalizeEnvelopeRecipients([
+        'dup@example.com',
+        'other@example.com',
+        'DUP@example.com',
+      ]);
+      expect(out).toEqual(['dup@example.com', 'other@example.com']);
+    });
+
+    it('drops empty and whitespace-only addresses', () => {
+      const out = normalizeEnvelopeRecipients(['', '   ', 'a@example.com', '\t']);
+      expect(out).toEqual(['a@example.com']);
+    });
+
+    it('trims surrounding whitespace before de-duping', () => {
+      const out = normalizeEnvelopeRecipients(['  a@example.com  ', 'A@EXAMPLE.COM']);
+      expect(out).toEqual(['a@example.com']);
+    });
+
+    it('returns an empty array when every address is blank', () => {
+      expect(normalizeEnvelopeRecipients(['', '   '])).toEqual([]);
+    });
+
+    it('preserves order across To + Cc + Bcc concatenation', () => {
+      const out = normalizeEnvelopeRecipients([
+        'to@example.com',
+        'cc@example.com',
+        'bcc@example.com',
+      ]);
+      expect(out).toEqual(['to@example.com', 'cc@example.com', 'bcc@example.com']);
     });
   });
 });

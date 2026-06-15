@@ -6,63 +6,9 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import audit from '../safety/audit.js';
 
-import type { AttachmentInput } from '../services/attachment-resolver.js';
 import type ImapService from '../services/imap.service.js';
 import type SmtpService from '../services/smtp.service.js';
-
-// ---------------------------------------------------------------------------
-// Attachment input schema (snake_case at the MCP boundary)
-// ---------------------------------------------------------------------------
-
-const attachmentFromPath = z.object({
-  path: z.string().describe('Absolute local filesystem path to the file'),
-  filename: z.string().optional().describe('Override filename (defaults to basename of path)'),
-  mime_type: z.string().optional().describe('MIME type override (auto-detected if omitted)'),
-});
-
-const attachmentFromBase64 = z.object({
-  content_base64: z.string().describe('Base64-encoded file content'),
-  filename: z.string().describe('Filename to use on the message'),
-  mime_type: z.string().optional().describe('MIME type override (auto-detected if omitted)'),
-});
-
-const attachmentFromMessage = z.object({
-  source_email_id: z.string().describe('UID of an existing message holding this attachment'),
-  source_mailbox: z
-    .string()
-    .describe('Mailbox path containing the source message (e.g. "INBOX" or "Drafts")'),
-  filename: z.string().describe('Attachment filename on the source message — exact match'),
-});
-
-const attachmentInputSchema = z.union([
-  attachmentFromPath,
-  attachmentFromBase64,
-  attachmentFromMessage,
-]);
-
-type AttachmentInputRaw = z.infer<typeof attachmentInputSchema>;
-
-function adaptAttachmentInput(raw: AttachmentInputRaw): AttachmentInput {
-  if ('path' in raw) {
-    return {
-      path: raw.path,
-      filename: raw.filename,
-      mimeType: raw.mime_type,
-    };
-  }
-  if ('content_base64' in raw) {
-    return {
-      contentBase64: raw.content_base64,
-      filename: raw.filename,
-      mimeType: raw.mime_type,
-    };
-  }
-  return {
-    sourceEmailId: raw.source_email_id,
-    sourceMailbox: raw.source_mailbox,
-    filename: raw.filename,
-  };
-}
+import { adaptAttachmentInput, attachmentInputSchema } from './attachment-input.js';
 
 // ---------------------------------------------------------------------------
 // Tool registration

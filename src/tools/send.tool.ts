@@ -7,15 +7,22 @@ import { z } from 'zod';
 import audit from '../safety/audit.js';
 import { validateInputLength } from '../safety/validation.js';
 
+import type ImapService from '../services/imap.service.js';
 import type SmtpService from '../services/smtp.service.js';
+import { adaptAttachmentInput, attachmentInputSchema } from './attachment-input.js';
 
-export default function registerSendTools(server: McpServer, smtpService: SmtpService): void {
+export default function registerSendTools(
+  server: McpServer,
+  smtpService: SmtpService,
+  imapService: ImapService,
+): void {
   // ---------------------------------------------------------------------------
   // send_email
   // ---------------------------------------------------------------------------
   server.tool(
     'send_email',
-    'Send a new email. Supports plain text or HTML body, CC, and BCC.',
+    'Send a new email. Supports plain text or HTML body, CC, BCC, and attachments ' +
+      '(from a local path, inline base64 bytes, or a reference to an attachment on an existing message).',
     {
       account: z.string().describe('Account name from list_accounts'),
       to: z.array(z.string().email()).min(1).describe('Recipient email addresses'),
@@ -24,17 +31,46 @@ export default function registerSendTools(server: McpServer, smtpService: SmtpSe
       cc: z.array(z.string().email()).optional().describe('CC recipients'),
       bcc: z.array(z.string().email()).optional().describe('BCC recipients'),
       html: z.boolean().default(false).describe('Send as HTML (default: plain text)'),
+      attachments: z
+        .array(attachmentInputSchema)
+        .optional()
+        .describe(
+          'Attachments to include. Each entry is one of: ' +
+            '{ path }: read bytes from a local file (use absolute path); ' +
+            '{ content_base64, filename }: provide bytes inline; ' +
+            '{ source_email_id, source_mailbox, filename }: carry an attachment from another message ' +
+            'without round-tripping bytes through this MCP. Strict failure: if any attachment cannot ' +
+            'be resolved, the email is NOT sent.',
+        ),
     },
     { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     async (params) => {
       try {
         validateInputLength(params.subject, 998, 'Subject');
         validateInputLength(params.body, 5_000_000, 'Body');
-        const result = await smtpService.sendEmail(params.account, params);
+
+        // Resolve attachments BEFORE sending — strict failure means a bad
+        // attachment aborts the whole send rather than mailing a partial.
+        const resolvedAttachments =
+          params.attachments && params.attachments.length > 0
+            ? await imapService.resolveAttachmentsForSend(
+                params.account,
+                params.attachments.map(adaptAttachmentInput),
+              )
+            : undefined;
+
+        const result = await smtpService.sendEmail(params.account, {
+          ...params,
+          attachments: resolvedAttachments,
+        });
         await audit.log(
           'send_email',
           params.account,
-          { to: params.to, subject: params.subject },
+          {
+            to: params.to,
+            subject: params.subject,
+            attachmentCount: params.attachments?.length ?? 0,
+          },
           'ok',
         );
         return {

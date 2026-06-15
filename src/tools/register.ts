@@ -82,7 +82,7 @@ export default function registerAllTools(
 
   // Write tools — skipped in read-only mode
   if (!readOnly) {
-    registerSendTools(server, smtpService);
+    registerSendTools(server, smtpService, imapService);
     registerManageTools(server, imapService);
     registerLabelTools(server, imapService);
     registerBulkTools(server, imapService);
