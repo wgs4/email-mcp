@@ -393,6 +393,46 @@ describe('findMimePartByFilename', () => {
       expect(findMimePartByFilename(struct, att.filename)).toBeDefined();
     }
   });
+
+  // Regression (2026-06-15): Apple Mail composes a PDF as an INLINE part
+  // (disposition: 'inline', NO Content-ID) nested in
+  //   multipart/alternative > multipart/mixed.
+  // extractAttachmentMeta listed the PDF but findMimePartByFilename returned
+  // undefined on the stale build, so save_attachment / download_attachment
+  // threw "Could not locate MIME part". This is the exact bodyStructure of the
+  // Okko order email (INBOX UID 319056) that surfaced the bug; node.part='2.2'.
+  it('resolves an Apple-Mail inline PDF nested in multipart/alternative > multipart/mixed (part 2.2)', () => {
+    const appleMail = {
+      type: 'multipart/alternative',
+      childNodes: [
+        { type: 'text/plain', part: '1', size: 466 },
+        {
+          type: 'multipart/mixed',
+          part: '2',
+          childNodes: [
+            { type: 'text/html', part: '2.1', size: 1643 },
+            {
+              type: 'application/pdf',
+              part: '2.2',
+              size: 346860,
+              disposition: 'inline',
+              parameters: { name: 'motorbass2023.pdf' },
+              dispositionParameters: { filename: 'motorbass2023.pdf' },
+            },
+            { type: 'text/html', part: '2.3', size: 212 },
+          ],
+        },
+      ],
+    };
+    // Metadata path lists the inline PDF (no Content-ID => attachment)...
+    const metas = extractAttachmentMeta(appleMail);
+    expect(metas).toHaveLength(1);
+    expect(metas[0].filename).toBe('motorbass2023.pdf');
+    expect(metas[0].mimeType).toBe('application/pdf');
+    // ...and the download path MUST resolve the same part (regression: this
+    // returned undefined → "Could not locate MIME part").
+    expect(findMimePartByFilename(appleMail, 'motorbass2023.pdf')).toBe('2.2');
+  });
 });
 
 // ---------------------------------------------------------------------------
