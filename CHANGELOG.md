@@ -32,6 +32,16 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/) 
 - add pnpm install and usage instructions - ([13c8d4b](https://github.com/codefuturist/email-mcp/commit/13c8d4bf3006fa4fb5f014eb630006a478082a23))
 
 - - -
+## [v0.4.0](https://github.com/codefuturist/email-mcp/compare/d48d71578519cc5b5cf66c5387f8b50ffb8f1ea1..v0.4.0) - 2026-06-15
+#### ✨ Features
+- (**send**) support attachments on send_email - ([022f266](https://github.com/codefuturist/email-mcp/commit/022f2663c81e6a9748c6afb2252d55c2f13d012c)) - David Young, Claude Opus 4.8
+#### 🐛 Bug Fixes
+- (**release**) push the v-prefixed tag in cog post_bump hooks - ([6ae86cd](https://github.com/codefuturist/email-mcp/commit/6ae86cd408c6b86f9670854eaa00944011b9480d)) - David Young, Claude Opus 4.8
+#### Chores
+- (**release**) finalize 0.3.0 in package.json and server.json - ([d48d715](https://github.com/codefuturist/email-mcp/commit/d48d71578519cc5b5cf66c5387f8b50ffb8f1ea1)) - David Young, Claude Opus 4.8
+
+- - -
+
 ## [v0.3.0](https://github.com/codefuturist/email-mcp/compare/03b3b0233e5e65b1fa30324f3859860e061b364d..v0.3.0) - 2026-06-15
 #### ✨ Features
 - (**bin**) add lifecycle wrapper to prevent orphan email-mcp processes - ([1d29290](https://github.com/codefuturist/email-mcp/commit/1d29290780faba7adb2812b28ac6eb86e45db6d5)) - David Young, Claude Opus 4.7
