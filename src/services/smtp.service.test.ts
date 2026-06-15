@@ -1,7 +1,7 @@
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
 import type ImapService from './imap.service.js';
-import SmtpService from './smtp.service.js';
+import SmtpService, { stripBccHeader } from './smtp.service.js';
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -310,6 +310,38 @@ describe('SmtpService', () => {
   });
 
   describe('sendDraft', () => {
+    // A full MIME draft (multipart/mixed) carrying a Bcc header AND a PDF
+    // attachment. send_draft must transmit these RAW bytes (minus the Bcc
+    // header) so attachments survive — recomposing from the parsed Email loses
+    // the binary parts.
+    const ATTACHMENT_FILENAME = 'invoice.pdf';
+    function buildRawDraftWithAttachmentAndBcc(): Buffer {
+      const raw = [
+        'From: "Test User" <test@example.com>',
+        'To: recipient@example.com',
+        'Cc: cc1@example.com',
+        'Bcc: secret@example.com',
+        'Subject: Draft Subject',
+        'Message-ID: <draft@example.com>',
+        'MIME-Version: 1.0',
+        'Content-Type: multipart/mixed; boundary="BOUNDARY42"',
+        '',
+        '--BOUNDARY42',
+        'Content-Type: text/plain; charset=utf-8',
+        '',
+        'Draft body',
+        '--BOUNDARY42',
+        'Content-Type: application/pdf',
+        'Content-Transfer-Encoding: base64',
+        `Content-Disposition: attachment; filename="${ATTACHMENT_FILENAME}"`,
+        '',
+        Buffer.from('%PDF-1.4 fake invoice bytes').toString('base64'),
+        '--BOUNDARY42--',
+        '',
+      ].join('\r\n');
+      return Buffer.from(raw);
+    }
+
     function createDraftMocks() {
       const mockDraft = {
         email: {
@@ -317,7 +349,8 @@ describe('SmtpService', () => {
           subject: 'Draft Subject',
           from: { address: 'test@example.com' },
           to: [{ address: 'recipient@example.com' }],
-          cc: [],
+          cc: [{ address: 'cc1@example.com' }],
+          bcc: [{ address: 'secret@example.com' }],
           bodyText: 'Draft body',
           bodyHtml: undefined,
           messageId: '<draft@example.com>',
@@ -327,7 +360,7 @@ describe('SmtpService', () => {
           seen: false,
           flagged: false,
           answered: false,
-          hasAttachments: false,
+          hasAttachments: true,
           labels: [],
           attachments: [],
           headers: {},
@@ -335,15 +368,18 @@ describe('SmtpService', () => {
         mailbox: 'Drafts',
       };
 
+      const rawDraft = buildRawDraftWithAttachmentAndBcc();
+
       const imapServiceWithDraft = {
         appendToSent: vi.fn().mockResolvedValue(undefined),
         resolveSentFolder: vi.fn().mockResolvedValue('Sent'),
         getEmail: vi.fn().mockResolvedValue(createMockEmail()),
         fetchDraft: vi.fn().mockResolvedValue(mockDraft),
+        fetchDraftRaw: vi.fn().mockResolvedValue(rawDraft),
         deleteDraft: vi.fn().mockResolvedValue(undefined),
       } as unknown as ImapService;
 
-      return { mockDraft, imapServiceWithDraft };
+      return { mockDraft, rawDraft, imapServiceWithDraft };
     }
 
     it('appends to Sent before deleting draft', async () => {
@@ -358,16 +394,120 @@ describe('SmtpService', () => {
       expect(appendCall).toBeLessThan(deleteCall);
     });
 
-    it('calls appendToSent with draft content', async () => {
+    it('sends the raw draft bytes (preserving the attachment) with an explicit envelope', async () => {
       const { imapServiceWithDraft } = createDraftMocks();
       service = new SmtpService(connections, rateLimiter, imapServiceWithDraft);
 
       await service.sendDraft('test', 1);
 
-      expect(imapServiceWithDraft.appendToSent).toHaveBeenCalledWith(
-        'test',
-        expect.stringContaining('Subject: Draft Subject'),
-      );
+      const call = transport.sendMail.mock.calls[0][0];
+      // Raw passthrough — not a recomposed text/html message.
+      expect(call.raw).toBeInstanceOf(Buffer);
+      const rawStr = (call.raw as Buffer).toString('utf-8');
+      // The attachment part / filename must survive.
+      expect(rawStr).toContain(ATTACHMENT_FILENAME);
+      // The Bcc header must NOT leak into the transmitted message.
+      expect(rawStr).not.toMatch(/^Bcc:/im);
+      // Envelope is explicit and includes To + Cc + Bcc recipients.
+      expect(call.envelope).toBeDefined();
+      expect(call.envelope.from).toBe('test@example.com');
+      expect(call.envelope.to).toEqual([
+        'recipient@example.com',
+        'cc1@example.com',
+        'secret@example.com',
+      ]);
+    });
+
+    it('appends the SAME sanitized raw bytes to Sent (attachment kept, Bcc stripped)', async () => {
+      const { imapServiceWithDraft } = createDraftMocks();
+      service = new SmtpService(connections, rateLimiter, imapServiceWithDraft);
+
+      await service.sendDraft('test', 1);
+
+      expect(imapServiceWithDraft.appendToSent).toHaveBeenCalledWith('test', expect.any(Buffer));
+      const [[, appended]] = vi.mocked(imapServiceWithDraft.appendToSent).mock.calls;
+      const appendedStr = (appended as Buffer).toString('utf-8');
+      expect(appendedStr).toContain(ATTACHMENT_FILENAME);
+      expect(appendedStr).not.toMatch(/^Bcc:/im);
+
+      // The bytes sent and the bytes stored must be identical.
+      const sent = transport.sendMail.mock.calls[0][0].raw as Buffer;
+      expect((appended as Buffer).equals(sent)).toBe(true);
+    });
+
+    it('throws before calling SMTP when the draft has no recipients', async () => {
+      const { mockDraft, rawDraft } = createDraftMocks();
+      const noRecipientDraft = {
+        ...mockDraft,
+        email: { ...mockDraft.email, to: [], cc: [], bcc: [] },
+      };
+      const imapServiceWithDraft = {
+        appendToSent: vi.fn().mockResolvedValue(undefined),
+        resolveSentFolder: vi.fn().mockResolvedValue('Sent'),
+        getEmail: vi.fn().mockResolvedValue(createMockEmail()),
+        fetchDraft: vi.fn().mockResolvedValue(noRecipientDraft),
+        fetchDraftRaw: vi.fn().mockResolvedValue(rawDraft),
+        deleteDraft: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ImapService;
+      service = new SmtpService(connections, rateLimiter, imapServiceWithDraft);
+
+      await expect(service.sendDraft('test', 1)).rejects.toThrow(/no recipients/i);
+      expect(transport.sendMail).not.toHaveBeenCalled();
+    });
+
+    it('de-dupes the envelope recipients case-insensitively (To + Cc + case-variant → one RCPT)', async () => {
+      const { mockDraft, rawDraft } = createDraftMocks();
+      const dupDraft = {
+        ...mockDraft,
+        email: {
+          ...mockDraft.email,
+          // Same address in To and Cc, plus a case-variant — must collapse to ONE.
+          to: [{ address: 'dup@example.com' }, { address: 'other@example.com' }],
+          cc: [{ address: 'DUP@example.com' }],
+          bcc: [],
+        },
+      };
+      const imapServiceWithDraft = {
+        appendToSent: vi.fn().mockResolvedValue(undefined),
+        resolveSentFolder: vi.fn().mockResolvedValue('Sent'),
+        getEmail: vi.fn().mockResolvedValue(createMockEmail()),
+        fetchDraft: vi.fn().mockResolvedValue(dupDraft),
+        fetchDraftRaw: vi.fn().mockResolvedValue(rawDraft),
+        deleteDraft: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ImapService;
+      service = new SmtpService(connections, rateLimiter, imapServiceWithDraft);
+
+      await service.sendDraft('test', 1);
+
+      const call = transport.sendMail.mock.calls[0][0];
+      // First-seen order preserved, original casing of the first occurrence kept.
+      expect(call.envelope.to).toEqual(['dup@example.com', 'other@example.com']);
+    });
+
+    it('throws (before SMTP) when the only recipient is a blank address', async () => {
+      const { mockDraft, rawDraft } = createDraftMocks();
+      const blankDraft = {
+        ...mockDraft,
+        email: {
+          ...mockDraft.email,
+          // A parsed-but-empty address must NOT count as a recipient.
+          to: [{ address: '' }],
+          cc: [{ address: '   ' }],
+          bcc: [],
+        },
+      };
+      const imapServiceWithDraft = {
+        appendToSent: vi.fn().mockResolvedValue(undefined),
+        resolveSentFolder: vi.fn().mockResolvedValue('Sent'),
+        getEmail: vi.fn().mockResolvedValue(createMockEmail()),
+        fetchDraft: vi.fn().mockResolvedValue(blankDraft),
+        fetchDraftRaw: vi.fn().mockResolvedValue(rawDraft),
+        deleteDraft: vi.fn().mockResolvedValue(undefined),
+      } as unknown as ImapService;
+      service = new SmtpService(connections, rateLimiter, imapServiceWithDraft);
+
+      await expect(service.sendDraft('test', 1)).rejects.toThrow(/no recipients/i);
+      expect(transport.sendMail).not.toHaveBeenCalled();
     });
 
     it('still deletes draft when appendToSent fails', async () => {
@@ -381,6 +521,156 @@ describe('SmtpService', () => {
       // appendToSentFolder swallows errors, so deleteDraft should still be called
       expect(imapServiceWithDraft.deleteDraft).toHaveBeenCalledWith('test', 1, 'Drafts');
       warnSpy.mockRestore();
+    });
+  });
+
+  describe('stripBccHeader', () => {
+    it('removes a simple Bcc header', () => {
+      const raw = Buffer.from(
+        ['To: a@example.com', 'Bcc: secret@example.com', 'Subject: Hi', '', 'Body'].join('\r\n'),
+      );
+      const out = stripBccHeader(raw).toString('utf-8');
+      expect(out).not.toMatch(/^Bcc:/im);
+      expect(out).toContain('To: a@example.com');
+      expect(out).toContain('Subject: Hi');
+      expect(out).toContain('Body');
+    });
+
+    it('removes a folded Bcc header including its continuation lines', () => {
+      const raw = Buffer.from(
+        [
+          'To: a@example.com',
+          'Bcc: one@example.com,',
+          '\ttwo@example.com,',
+          ' three@example.com',
+          'Subject: Hi',
+          '',
+          'Body',
+        ].join('\r\n'),
+      );
+      const out = stripBccHeader(raw).toString('utf-8');
+      expect(out).not.toMatch(/bcc/i);
+      expect(out).not.toContain('two@example.com');
+      expect(out).not.toContain('three@example.com');
+      expect(out).toContain('To: a@example.com');
+      expect(out).toContain('Subject: Hi');
+      expect(out).toContain('Body');
+    });
+
+    it('is a no-op when there is no Bcc header', () => {
+      const raw = Buffer.from(
+        ['To: a@example.com', 'Subject: Hi', '', 'Body line one', 'Body line two'].join('\r\n'),
+      );
+      const out = stripBccHeader(raw);
+      expect(out.equals(raw)).toBe(true);
+    });
+
+    it('does not disturb other headers or the body', () => {
+      const raw = Buffer.from(
+        [
+          'From: f@example.com',
+          'To: a@example.com',
+          'Bcc: secret@example.com',
+          'Cc: c@example.com',
+          'Subject: Keep me',
+          'Content-Type: text/plain',
+          '',
+          'Bcc: this is body text, not a header — keep it',
+          'second body line',
+        ].join('\r\n'),
+      );
+      const out = stripBccHeader(raw).toString('utf-8');
+      expect(out).toContain('From: f@example.com');
+      expect(out).toContain('Cc: c@example.com');
+      expect(out).toContain('Subject: Keep me');
+      expect(out).toContain('Content-Type: text/plain');
+      // Header Bcc gone…
+      expect(out).not.toMatch(/^Bcc: secret@example\.com/im);
+      // …but the body line that happens to start with "Bcc:" is preserved.
+      expect(out).toContain('Bcc: this is body text, not a header — keep it');
+      expect(out).toContain('second body line');
+    });
+
+    it('handles both CRLF and LF line endings', () => {
+      const crlf = Buffer.from(
+        ['To: a@example.com', 'Bcc: secret@example.com', 'Subject: Hi', '', 'Body'].join('\r\n'),
+      );
+      const lf = Buffer.from(
+        ['To: a@example.com', 'Bcc: secret@example.com', 'Subject: Hi', '', 'Body'].join('\n'),
+      );
+
+      const crlfOut = stripBccHeader(crlf).toString('utf-8');
+      const lfOut = stripBccHeader(lf).toString('utf-8');
+
+      expect(crlfOut).not.toMatch(/^Bcc:/im);
+      expect(lfOut).not.toMatch(/^Bcc:/im);
+      // Original line endings preserved.
+      expect(crlfOut).toContain('\r\n');
+      expect(lfOut).not.toContain('\r\n');
+      expect(lfOut).toContain('To: a@example.com\nSubject: Hi');
+    });
+
+    it('removes a Resent-Bcc header (RFC 5322 blind-recipient leak)', () => {
+      const raw = Buffer.from(
+        ['To: a@example.com', 'Resent-Bcc: secret@x.com', 'Subject: Hi', '', 'Body'].join('\r\n'),
+      );
+      const out = stripBccHeader(raw).toString('utf-8');
+      expect(out).not.toMatch(/^Resent-Bcc:/im);
+      expect(out).not.toContain('secret@x.com');
+      expect(out).toContain('To: a@example.com');
+      expect(out).toContain('Subject: Hi');
+      expect(out).toContain('Body');
+    });
+
+    it('removes a folded Resent-Bcc header including its continuation lines', () => {
+      const raw = Buffer.from(
+        [
+          'To: a@example.com',
+          'Resent-Bcc: one@x.com,',
+          '\ttwo@x.com,',
+          ' three@x.com',
+          'Subject: Hi',
+          '',
+          'Body',
+        ].join('\r\n'),
+      );
+      const out = stripBccHeader(raw).toString('utf-8');
+      expect(out).not.toMatch(/resent-bcc/i);
+      expect(out).not.toContain('one@x.com');
+      expect(out).not.toContain('two@x.com');
+      expect(out).not.toContain('three@x.com');
+      expect(out).toContain('To: a@example.com');
+      expect(out).toContain('Subject: Hi');
+      expect(out).toContain('Body');
+    });
+
+    it('does NOT strip unrelated headers like X-Original-Bcc', () => {
+      const raw = Buffer.from(
+        [
+          'To: a@example.com',
+          'X-Original-Bcc: archived@example.com',
+          'Subject: Hi',
+          '',
+          'Body',
+        ].join('\r\n'),
+      );
+      const out = stripBccHeader(raw).toString('utf-8');
+      // The X-Original-Bcc header (not a real Bcc) must be retained verbatim.
+      expect(out).toContain('X-Original-Bcc: archived@example.com');
+      expect(out).toContain('To: a@example.com');
+      expect(out).toContain('Subject: Hi');
+      expect(out).toContain('Body');
+    });
+
+    it('returns the buffer unchanged when there is no header/body separator', () => {
+      // A degenerate message with NO blank-line boundary. A later line happens
+      // to start with "Bcc:" — but without a boundary we must NOT treat the
+      // whole thing as headers and delete body content. Return byte-identical.
+      const raw = Buffer.from(
+        ['To: a@example.com', 'Subject: Hi', 'Bcc: looks-like-a-header@example.com'].join('\r\n'),
+      );
+      const out = stripBccHeader(raw);
+      expect(out.equals(raw)).toBe(true);
     });
   });
 });

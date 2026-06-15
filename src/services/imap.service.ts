@@ -2287,6 +2287,37 @@ export default class ImapService {
     return { email, mailbox: draftsPath };
   }
 
+  /**
+   * Fetch the FULL, UNCAPPED RFC822 source of a draft for raw passthrough.
+   *
+   * Unlike {@link fetchDraft} (which routes through the capped
+   * `messageToEmail` parse path for display), this returns the draft's exact
+   * bytes so attachments survive on send. The `MAX_PARSE_SOURCE_BYTES` cap is a
+   * parse/display guard — applying it here would corrupt large-attachment
+   * drafts — so the source is taken verbatim.
+   */
+  async fetchDraftRaw(accountName: string, emailId: number, mailbox: string): Promise<Buffer> {
+    const client = await this.connections.getImapClient(accountName);
+    const safeMailbox = sanitizeMailboxName(mailbox);
+
+    const lock = await client.getMailboxLock(safeMailbox);
+    try {
+      const msg = await client.fetchOne(
+        String(emailId),
+        { uid: true, envelope: true, source: true },
+        { uid: true },
+      );
+
+      if (!msg || !Buffer.isBuffer((msg as unknown as Record<string, unknown>).source)) {
+        throw new Error(`Draft ${emailId} source not found in ${mailbox}`);
+      }
+
+      return (msg as unknown as Record<string, unknown>).source as Buffer;
+    } finally {
+      lock.release();
+    }
+  }
+
   /** Delete a draft after it has been sent. */
   async deleteDraft(accountName: string, emailId: number, mailbox: string): Promise<void> {
     const client = await this.connections.getImapClient(accountName);
