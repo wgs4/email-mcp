@@ -362,5 +362,67 @@ describe('Email Draft Operations', () => {
 
       await waitForDelivery();
     });
+
+    it('preserves attachments and strips Bcc in the Sent copy', async () => {
+      // GreenMail does not auto-create a Sent folder; create it by the
+      // canonical name so resolveSentFolder (and the sendDraft append path)
+      // can find it.
+      const sentFolder = 'Sent';
+      try {
+        await services.imapService.createMailbox(TEST_ACCOUNT_NAME, sentFolder);
+      } catch {
+        // Already exists, ignore.
+      }
+
+      const pdf = Buffer.from('%PDF-1.4 send-draft attachment bytes');
+      const subject = `Draft w/ attachment ${Date.now()}`;
+
+      // Save a draft WITH a base64 attachment AND a bcc recipient.
+      const draft = await services.imapService.saveDraftWithAttachments(TEST_ACCOUNT_NAME, {
+        to: ['bob@localhost'],
+        bcc: ['secret@localhost'],
+        subject,
+        body: 'This draft carries an attachment and a blind copy.',
+        attachments: [
+          {
+            contentBase64: pdf.toString('base64'),
+            filename: 'sendme.pdf',
+            mimeType: 'application/pdf',
+          },
+        ],
+      });
+
+      // Send it via the SmtpService.sendDraft path.
+      const result = await services.smtpService.sendDraft(
+        TEST_ACCOUNT_NAME,
+        draft.id,
+        draft.mailbox,
+      );
+      expect(result.messageId).toBeTruthy();
+
+      await waitForDelivery();
+
+      // Locate the message we just stored in Sent.
+      const listed = await services.imapService.listEmails(TEST_ACCOUNT_NAME, {
+        mailbox: sentFolder,
+        pageSize: 50,
+        subject,
+      });
+      const match = listed.items.find((m) => m.subject === subject);
+      expect(match, 'sent copy should exist in the Sent folder').toBeDefined();
+
+      // Fetch the full Sent copy and assert attachment present + Bcc absent.
+      const sent = await services.imapService.getEmail(
+        TEST_ACCOUNT_NAME,
+        String(match?.id),
+        sentFolder,
+      );
+
+      // (a) The attachment survived (filename matches).
+      expect(sent.attachments.map((a) => a.filename)).toContain('sendme.pdf');
+
+      // (b) The Bcc header is NOT present in the Sent copy.
+      expect(Object.keys(sent.headers ?? {})).not.toContain('bcc');
+    });
   });
 });
