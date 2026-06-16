@@ -25,16 +25,20 @@ skip_ci = "[skip ci]"
 skip_untracked = false
 tag_prefix = "v"
 
+# Version files are updated in PRE-bump so they land in cog's bump commit
+# itself. (Doing this in post_bump leaves package.json/server.json staged but
+# uncommitted, behind the tag/CHANGELOG.) Pushes stay in post_bump, after the
+# commit + tag exist.
 pre_bump_hooks = [
+    "npm pkg set version={{version}}",
+    "git add package.json",
+    "jq --arg v {{version}} '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json",
+    "git add server.json",
     "pnpm check",
     "pnpm build",
 ]
 
 post_bump_hooks = [
-    "npm pkg set version={{version}}",
-    "git add package.json",
-    "jq --arg v {{version}} '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json",
-    "git add server.json",
     "git push origin HEAD",
     "git push origin v{{version}}",
 ]
@@ -80,23 +84,28 @@ authors = [
 [bump_profiles]
 
 [bump_profiles.release]
-pre_bump_hooks = ["pnpm check", "pnpm build"]
-post_bump_hooks = [
+pre_bump_hooks = [
     "npm pkg set version={{version}}",
     "git add package.json",
     "jq --arg v {{version}} '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json",
     "git add server.json",
+    "pnpm check",
+    "pnpm build",
+]
+post_bump_hooks = [
     "git push origin HEAD",
     "git push origin v{{version}}",
 ]
 
 [bump_profiles.hotfix]
-pre_bump_hooks = ["pnpm check"]
-post_bump_hooks = [
+pre_bump_hooks = [
     "npm pkg set version={{version}}",
     "git add package.json",
     "jq --arg v {{version}} '.version = $v | .packages[0].version = $v' server.json > server.tmp && mv server.tmp server.json",
     "git add server.json",
+    "pnpm check",
+]
+post_bump_hooks = [
     "git push origin HEAD",
     "git push origin v{{version}}",
 ]
