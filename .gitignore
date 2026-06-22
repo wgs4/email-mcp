@@ -344,3 +344,9 @@ yarn.lock
 # Contains business email addresses, staff names, vendor domains, and mail
 # server detail — kept out of this public repo.
 scheduled task - skills/
+
+# OpenCode planning artifacts
+.sisyphus/
+
+# Local Docker Compose override (HTTP mode)
+docker-compose.override.yml
