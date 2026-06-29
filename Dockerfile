@@ -42,6 +42,10 @@ ENV NODE_ENV=production
 
 EXPOSE 8080
 
+COPY docker-healthcheck.js .
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD ["node", "docker-healthcheck.js"]
+
 USER node
 
 ENTRYPOINT ["node", "dist/main.js"]
