@@ -306,6 +306,36 @@ For MCP client configuration (e.g. Claude Desktop):
 </details>
 
 <details>
+<summary><strong>Docker (HTTP mode via supergateway)</strong></summary>
+
+The server itself is stdio-only. To expose it as Streamable HTTP, use the
+`codefuturist/email-mcp:http` image, which wraps the stdio server with
+[supergateway](https://github.com/supercorp-ai/supergateway):
+
+```bash
+# Run the HTTP transport image
+docker run --rm -i -p 127.0.0.1:8080:8080 \
+  -v ~/.config/email-mcp:/home/node/.config/email-mcp:ro \
+  ghcr.io/codefuturist/email-mcp:http
+```
+
+The MCP endpoint is exposed at `http://127.0.0.1:8080/mcp` and a health check
+is available at `http://127.0.0.1:8080/health`.
+
+With Docker Compose:
+
+```bash
+# stdio mode
+docker compose --profile stdio up
+
+# Streamable HTTP mode
+docker compose --profile http up
+```
+
+> **Note:** SSE is not supported — this setup uses Streamable HTTP.
+</details>
+
+<details>
 <summary><strong>Single-account via environment variables (no config file needed)</strong></summary>
 
 ```json
