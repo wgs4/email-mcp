@@ -2,6 +2,27 @@ services:
   email-mcp:
     build: .
     image: codefuturist/email-mcp:latest
+    profiles:
+      - stdio
     stdin_open: true # required for stdio transport
     volumes:
       - ${EMAIL_MCP_CONFIG:-~/.config/email-mcp}:/home/node/.config/email-mcp:ro
+
+  email-mcp-http:
+    build:
+      context: .
+      dockerfile: Dockerfile.http
+    image: codefuturist/email-mcp:http
+    profiles:
+      - http
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ${EMAIL_MCP_CONFIG:-~/.config/email-mcp}:/home/node/.config/email-mcp:ro
+    stdin_open: false
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/health').then(r=>r.ok?process.exit(0):process.exit(1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
