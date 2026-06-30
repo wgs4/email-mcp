@@ -1,0 +1,39 @@
+# ── HTTP transport image ───────────────────────────────────────────────────────
+# This image wraps the stdio-only email-mcp server with supergateway so it can
+# be exposed as a Streamable HTTP MCP server. It is built on top of the standard
+# email-mcp image, so all production artifacts and the Node.js runtime are
+# already in place.
+#
+# Build:
+#   docker build -f Dockerfile.http -t codefuturist/email-mcp:http .
+#
+# Run:
+#   docker run --rm -i -p 127.0.0.1:8080:8080 \
+#     -v ~/.config/email-mcp:/home/node/.config/email-mcp:ro \
+#     codefuturist/email-mcp:http
+#
+# The MCP endpoint is exposed at http://127.0.0.1:8080/mcp
+# Health check is available at http://127.0.0.1:8080/health
+# ───────────────────────────────────────────────────────────────────────────────
+
+FROM codefuturist/email-mcp:latest
+
+USER root
+
+# Install supergateway globally. npm is available through the node:24-slim image.
+RUN npm install -g supergateway@latest
+
+USER node
+
+WORKDIR /app
+
+EXPOSE 8080
+
+ENTRYPOINT ["supergateway"]
+CMD [ \
+  "--stdio", "node /app/dist/main.js stdio", \
+  "--outputTransport", "streamableHttp", \
+  "--port", "8080", \
+  "--streamableHttpPath", "/mcp", \
+  "--healthEndpoint", "/health" \
+]
