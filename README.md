@@ -113,9 +113,9 @@ email-mcp is deployed to a k3s cluster via a Helm wrapper chart in the
 **Architecture:**
 
 ```
-ghcr.io/gthieleb/email-mcp  →  k3s Deployment  →  Traefik Ingress
-   (HTTP mode, port 8080)      (1 replica)        email-mcp.mcp.glue-it.de
-                                   │                     TLS: letsencrypt-dns
+ghcr.io/gthieleb/email-mcp  →  k3s Deployment  →  Tailscale Operator Ingress
+   (HTTP mode, port 8080)      (1 replica)        email-mcp.tail6a9722.ts.net
+                                   │                     TLS: Tailscale (automatic)
                                    ▼
                              10Gi PVC (local-path)
                              /home/node/.config/email-mcp
@@ -175,8 +175,10 @@ kubectl exec -it -n mcp deploy/email-mcp -- cat /home/node/.config/email-mcp/con
 
 | Endpoint | URL |
 |----------|-----|
-| MCP HTTP | `https://email-mcp.mcp.glue-it.de/mcp` |
-| Health   | `https://email-mcp.mcp.glue-it.de/health` |
+| MCP HTTP | `https://email-mcp.tail6a9722.ts.net/mcp` |
+| Health   | `https://email-mcp.tail6a9722.ts.net/health` |
+
+Only reachable from within the Tailscale network.
 
 **Config persistence:** The `config.toml` lives on a 10Gi PVC
 (`storageClass: local-path`) mounted at `/home/node/.config/email-mcp`.
