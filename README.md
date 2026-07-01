@@ -33,6 +33,8 @@ Enables AI assistants to read, search, send, manage, schedule, and analyze email
 - [Security](#security)
 - [Background](#background)
 - [Install](#install)
+- [Docker](#docker)
+- [Kubernetes (k3s) Deployment](#kubernetes-k3s-deployment)
 - [Usage](#usage)
 - [API](#api)
 - [Maintainers](#maintainers)
@@ -102,6 +104,84 @@ docker build -t ghcr.io/codefuturist/email-mcp .
 
 > **Note:** The server uses stdio transport. Config must be created on the host first
 > (via `npx @codefuturist/email-mcp setup` or manually) and mounted into the container.
+
+### Kubernetes (k3s) Deployment
+
+email-mcp is deployed to a k3s cluster via a Helm wrapper chart in the
+[`gthieleb/mcp-setup`](https://github.com/gthieleb/mcp-setup) repository.
+
+**Architecture:**
+
+```
+ghcr.io/gthieleb/email-mcp  →  k3s Deployment  →  Traefik Ingress
+   (HTTP mode, port 8080)      (1 replica)        email-mcp.mcp.glue-it.de
+                                   │                     TLS: letsencrypt-dns
+                                   ▼
+                             10Gi PVC (local-path)
+                             /home/node/.config/email-mcp
+```
+
+**Image:** `ghcr.io/gthieleb/email-mcp` — built from this repo via `mcp-setup`'s
+tag-driven pipeline. Push a tag `email-mcp-v0.4.0` in `mcp-setup` to trigger a rebuild.
+
+**Quick deploy:**
+
+```bash
+# One-shot: Helm install + copy local config into PVC
+./deploy.sh --copy-config
+
+# Helm install/upgrade only
+./deploy.sh
+```
+
+The deploy script handles:
+- Helm install/upgrade from `mcp-setup/charts/email-mcp/`
+- Copying `~/.config/email-mcp/config.toml` into the 10Gi PVC via a temporary pod
+- Rolling restart so the new config is picked up
+
+**Manual deployment:**
+
+```bash
+# Ensure namespace and image pull secret exist
+kubectl create namespace mcp --dry-run=client -o yaml | kubectl apply -f -
+kubectl create secret docker-registry ghcr-pull-secret \
+  --namespace mcp \
+  --docker-server ghcr.io \
+  --docker-username <github-username> \
+  --docker-password <token-with-read-packages-scope> \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# Install
+helm install email-mcp ../mcp-setup/charts/email-mcp/ --namespace mcp
+```
+
+**Account management (inside the cluster):**
+
+```bash
+# Add an account interactively
+kubectl exec -it -n mcp deploy/email-mcp -- node dist/main.js account add
+
+# List configured accounts
+kubectl exec -it -n mcp deploy/email-mcp -- node dist/main.js account list
+
+# Test connections
+kubectl exec -it -n mcp deploy/email-mcp -- node dist/main.js test
+
+# View current config
+kubectl exec -it -n mcp deploy/email-mcp -- cat /home/node/.config/email-mcp/config.toml
+```
+
+**Endpoints:**
+
+| Endpoint | URL |
+|----------|-----|
+| MCP HTTP | `https://email-mcp.mcp.glue-it.de/mcp` |
+| Health   | `https://email-mcp.mcp.glue-it.de/health` |
+
+**Config persistence:** The `config.toml` lives on a 10Gi PVC
+(`storageClass: local-path`) mounted at `/home/node/.config/email-mcp`.
+An initContainer creates an empty config on first boot; subsequent restarts
+reuse the existing config.
 
 ## Usage
 
