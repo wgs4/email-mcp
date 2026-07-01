@@ -336,6 +336,43 @@ docker compose --profile http up
 </details>
 
 <details>
+<summary><strong>Docker Compose override (Tailscale / remote binding)</strong></summary>
+
+Docker Compose auto-merges `docker-compose.override.yml` with the base
+`docker-compose.yml`, so you can rebind the HTTP port to a Tailscale IP
+(or any other interface) without editing the tracked compose file.
+
+Create `docker-compose.override.yml` next to `docker-compose.yml`:
+
+```yaml
+# Bind the HTTP sidecar to a Tailscale IP so it is reachable across the tailnet.
+services:
+  email-mcp-http:
+    ports:
+      - "100.64.0.1:15002:8080"   # <tailscale-ip>:<host-port>:<container-port>
+```
+
+Then start as usual — the override is picked up automatically:
+
+```bash
+docker compose --profile http up -d
+```
+
+The container now listens on both bindings (base + override):
+- `127.0.0.1:8080` (from the base file)
+- `100.64.0.1:15002` (from the override)
+
+Health and MCP endpoints are reachable on either:
+
+```bash
+curl http://100.64.0.1:15002/health   # → ok
+```
+
+> **Tip:** Add `docker-compose.override.yml` to your `.gitignore` so the
+> override stays machine-local and never leaks into a PR.
+</details>
+
+<details>
 <summary><strong>Single-account via environment variables (no config file needed)</strong></summary>
 
 ```json
