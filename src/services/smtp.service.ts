@@ -475,11 +475,6 @@ export default class SmtpService {
       throw err;
     }
 
-    // Warn-only when a NEWER lineage member exists (the user may keep variants).
-    const supersession = await this.imapService
-      .findSupersession(accountName, draftId, draftsPath)
-      .catch(() => null);
-
     // …and the FULL raw bytes so attachments are sent as-is (recomposing from
     // the parsed Email loses attachment binaries — that was the bug).
     const rawBuffer = await this.imapService.fetchDraftRaw(accountName, draftId, draftsPath);
@@ -501,6 +496,11 @@ export default class SmtpService {
     if (envelope.to.length === 0) {
       throw new Error('Draft has no recipients (To/Cc/Bcc all empty)');
     }
+
+    // Warn-only when a NEWER lineage member exists (the user may keep variants).
+    const supersession = await this.imapService
+      .findSupersession(accountName, draftId, draftsPath)
+      .catch(() => null);
 
     // Strip the Bcc header so blind recipients never leak into the delivered
     // message or the Sent copy. Threading headers (In-Reply-To/References) and

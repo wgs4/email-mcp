@@ -997,7 +997,7 @@ Default destination is `~/Downloads/email-attachments-<ISO-ts>/`. Per-email erro
 | `get_email_stats` | Email analytics — volume, top senders, daily trends |
 | `check_health` | Connection health, latency, quota, and IMAP capabilities |
 
-#### Write (9)
+#### Write (10)
 
 | Tool | Description |
 |------|-------------|
@@ -1006,6 +1006,7 @@ Default destination is `~/Downloads/email-attachments-<ISO-ts>/`. Per-email erro
 | `forward_email` | Forward with original content quoted |
 | `save_draft` | Save an email draft to the Drafts folder |
 | `send_draft` | Send an existing draft and remove from Drafts |
+| `resync_draft_attachments` | Restore attachments Apple Mail dropped on draft re-save (report or byte-preserving re-apply); `update_draft`/`send_draft` also return a `draft_superseded` hint when the target UID was superseded |
 | `apply_template` | Apply a template with variable substitution |
 | `schedule_email` | Schedule an email for future delivery |
 | `list_scheduled` | List scheduled emails by status |

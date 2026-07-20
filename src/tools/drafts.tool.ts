@@ -377,16 +377,16 @@ export default function registerDraftTools(
           return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
         }
         const a = res.applied;
-        if (a === undefined || a.newUid === null) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `✅ Nothing to restore for draft UID ${r.currentUid}.`,
-              },
-            ],
-          };
-        }
+        const nothingToRestore = {
+          content: [
+            {
+              type: 'text' as const,
+              text: `✅ Nothing to restore for draft UID ${r.currentUid}.`,
+            },
+          ],
+        };
+        if (a === undefined) return nothingToRestore;
+        if (a.newUid === null) return nothingToRestore;
         const warnBlock =
           a.warnings.length > 0 ? `\n\nWarnings:\n  - ${a.warnings.join('\n  - ')}` : '';
         return {
