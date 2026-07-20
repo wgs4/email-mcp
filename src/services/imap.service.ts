@@ -4,6 +4,7 @@
  * No MCP dependency — fully unit-testable.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
@@ -30,6 +31,9 @@ import type {
 import { nonEmpty, RAW_CAP } from '../utils/body-format.js';
 import type { AttachmentInput, ResolvedAttachment } from './attachment-resolver.js';
 import { resolveAttachments } from './attachment-resolver.js';
+import { DraftAttachmentCache } from './draft-attachment-cache.js';
+import type { LineageRef } from './draft-lineage.js';
+import { normalizeFrom, normalizeSubject } from './draft-lineage.js';
 import { assertSafeDestination, resolveUniquePath, sanitizeFilename } from './file-paths.js';
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
@@ -526,6 +530,11 @@ async function messageToEmail(msg: Record<string, unknown>): Promise<Email> {
   };
 }
 
+/** Build a normalized lineage reference for the draft attachment cache (§5). */
+function lineageRefFor(account: string, from: string, subject: string, uuid?: string): LineageRef {
+  return { account, from: normalizeFrom(from), subjectNorm: normalizeSubject(subject), uuid };
+}
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -587,6 +596,9 @@ export default class ImapService {
   }
 
   constructor(private connections: IConnectionManager) {}
+
+  /** Session-lifetime cache backing resync_draft_attachments (design §5). */
+  readonly draftCache = new DraftAttachmentCache();
 
   /**
    * Single choke point for every interactive `client.search()` call (D7/R1).
@@ -2175,8 +2187,10 @@ export default class ImapService {
       html?: boolean;
       inReplyTo?: string;
       attachments?: ResolvedAttachment[];
+      /** Lineage UUID to carry forward (design §4). Minted when absent. */
+      uuid?: string;
     },
-  ): Promise<{ id: number; mailbox: string }> {
+  ): Promise<{ id: number; mailbox: string; uuid: string }> {
     const client = await this.connections.getImapClient(accountName);
     const account = this.connections.getAccount(accountName);
 
@@ -2187,6 +2201,7 @@ export default class ImapService {
 
     const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
     const hasDraftAttachments = !!options.attachments && options.attachments.length > 0;
+    const uuid = options.uuid ?? randomUUID().toUpperCase();
 
     const mailOptions = {
       from: fromAddr,
@@ -2196,6 +2211,7 @@ export default class ImapService {
       subject: options.subject,
       inReplyTo: options.inReplyTo,
       date: new Date(),
+      headers: { 'X-Universally-Unique-Identifier': uuid },
       ...(options.html ? { html: options.body } : { text: options.body }),
       ...(hasDraftAttachments ? { attachments: options.attachments } : {}),
     };
@@ -2212,6 +2228,7 @@ export default class ImapService {
     return {
       id: (appendResult as unknown as { uid?: number }).uid ?? 0,
       mailbox: draftsPath,
+      uuid,
     };
   }
 
@@ -2259,7 +2276,7 @@ export default class ImapService {
       inReplyTo?: string;
       attachments?: AttachmentInput[];
     },
-  ): Promise<{ id: number; mailbox: string }> {
+  ): Promise<{ id: number; mailbox: string; uuid: string }> {
     let resolved: ResolvedAttachment[] = [];
 
     if (options.attachments && options.attachments.length > 0) {
@@ -2271,7 +2288,7 @@ export default class ImapService {
       resolved = result.resolved;
     }
 
-    return this.saveDraft(accountName, {
+    const saved = await this.saveDraft(accountName, {
       to: options.to,
       subject: options.subject,
       body: options.body,
@@ -2280,6 +2297,42 @@ export default class ImapService {
       html: options.html,
       inReplyTo: options.inReplyTo,
       attachments: resolved,
+    });
+
+    const account = this.connections.getAccount(accountName);
+    const ref = lineageRefFor(accountName, account.email, options.subject, saved.uuid);
+    this.draftCache.mapUid(saved.id, ref);
+    this.recordAttachmentOrigins(ref, options.attachments ?? [], resolved);
+    return saved;
+  }
+
+  /** Cache each saved attachment by its ORIGIN (path re-read at apply; else bytes). */
+  private recordAttachmentOrigins(
+    ref: LineageRef,
+    inputs: AttachmentInput[],
+    resolved: ResolvedAttachment[],
+  ): void {
+    resolved.forEach((r) => {
+      const match = inputs.find((i) => {
+        const byName = 'filename' in i && i.filename === r.filename;
+        const byPath = 'path' in i && !i.filename && i.path.endsWith(r.filename);
+        return byName || byPath;
+      });
+      if (match && 'path' in match) {
+        this.draftCache.record(
+          ref,
+          r.filename,
+          { kind: 'path', path: match.path },
+          r.content.length,
+        );
+      } else {
+        this.draftCache.record(
+          ref,
+          r.filename,
+          { kind: 'bytes', content: r.content, contentType: r.contentType },
+          r.content.length,
+        );
+      }
     });
   }
 
@@ -2391,6 +2444,7 @@ export default class ImapService {
       draftId,
       options.mailbox,
     );
+    const existingUuid = existing.headers['x-universally-unique-identifier'];
 
     // Determine which existing attachments to carry forward.
     const existingFilenames = existing.attachments.map((a) => a.filename);
@@ -2443,6 +2497,14 @@ export default class ImapService {
     const bcc = options.bcc ?? existing.bcc?.map((a) => a.address);
     const inReplyTo = options.inReplyTo ?? existing.inReplyTo;
 
+    // Lineage bookkeeping for resync (design §5): carry the UUID forward, record
+    // intentional removals, and (below) cache the resulting attachment set.
+    const account = this.connections.getAccount(accountName);
+    const ref = lineageRefFor(accountName, account.email, subject, existingUuid);
+    (options.attachmentsRemove ?? []).forEach((f) => {
+      this.draftCache.recordRemoval(ref, f);
+    });
+
     // Inline image detection — warn when the body references cid: parts that
     // won't survive the rebuild (v1 treats them as plain attachments only).
     if (html && typeof body === 'string') {
@@ -2464,6 +2526,19 @@ export default class ImapService {
       html,
       inReplyTo,
       attachments: allAttachments,
+      uuid: existingUuid,
+    });
+
+    // Cache the new draft's attachment set + UID→lineage map for resync.
+    const newRef = lineageRefFor(accountName, account.email, subject, newId.uuid);
+    this.draftCache.mapUid(newId.id, newRef);
+    allAttachments.forEach((a) => {
+      this.draftCache.record(
+        newRef,
+        a.filename,
+        { kind: 'bytes', content: a.content, contentType: a.contentType },
+        a.content.length,
+      );
     });
 
     // Only after confirmed APPEND, delete the old UID.
