@@ -97,3 +97,70 @@ describe('resync_draft_attachments (PRD §2 fixture)', () => {
     ).rejects.toThrow();
   });
 });
+
+describe('supersession hints + removal exclusion', () => {
+  let s: TestServices;
+
+  beforeAll(async () => {
+    s = createTestServices(buildTestAccount());
+    await ensureDrafts(s);
+  });
+
+  afterAll(async () => {
+    await s.connections.closeAll();
+  });
+
+  it('findSupersession points a dead UID at the newest lineage member (acceptance #2)', async () => {
+    const first = await s.imapService.saveDraft(TEST_ACCOUNT_NAME, {
+      to: ['x@y.com'],
+      subject: 'Superseded subj',
+      body: 'a',
+      html: true,
+    });
+    const second = await s.imapService.saveDraft(TEST_ACCOUNT_NAME, {
+      to: ['x@y.com'],
+      subject: 'Superseded subj',
+      body: 'b',
+      html: true,
+    });
+    // Mail expunged the old UID.
+    await s.imapService.deleteDraft(TEST_ACCOUNT_NAME, first.id, first.mailbox);
+    const hint = await s.imapService.findSupersession(TEST_ACCOUNT_NAME, first.id, first.mailbox);
+    expect(hint?.newestUid).toBe(second.id);
+  });
+
+  it('does NOT restore an attachment removed via attachments_remove (acceptance #3)', async () => {
+    const saved = await s.imapService.saveDraftWithAttachments(TEST_ACCOUNT_NAME, {
+      to: ['x@y.com'],
+      subject: 'Removal test',
+      body: 'hi',
+      html: true,
+      attachments: [
+        {
+          contentBase64: Buffer.from('X').toString('base64'),
+          filename: 'drop.pdf',
+          mimeType: 'application/pdf',
+        },
+      ],
+    });
+    // Intentionally remove it via update_draft.
+    const updated = await s.imapService.updateDraft(TEST_ACCOUNT_NAME, saved.id, {
+      attachmentsRemove: ['drop.pdf'],
+    });
+    const { report } = await s.imapService.resyncDraftAttachments(TEST_ACCOUNT_NAME, {
+      draftId: updated.id,
+      apply: false,
+      stripDanglingCids: true,
+    });
+    expect(report.missing.map((m) => m.filename)).not.toContain('drop.pdf');
+    expect(report.intentionallyRemovedExcluded).toContain('drop.pdf');
+    // Explicit allowlist overrides the exclusion.
+    const explicit = await s.imapService.resyncDraftAttachments(TEST_ACCOUNT_NAME, {
+      draftId: updated.id,
+      apply: false,
+      stripDanglingCids: true,
+      attachments: ['drop.pdf'],
+    });
+    expect(explicit.report.missing.map((m) => m.filename)).toContain('drop.pdf');
+  });
+});

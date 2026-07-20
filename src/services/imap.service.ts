@@ -2260,12 +2260,13 @@ export default class ImapService {
     });
 
     const appendResult = await client.append(draftsPath, rawMessage, ['\\Draft', '\\Seen']);
+    const id = (appendResult as unknown as { uid?: number }).uid ?? 0;
 
-    return {
-      id: (appendResult as unknown as { uid?: number }).uid ?? 0,
-      mailbox: draftsPath,
-      uuid,
-    };
+    // Map every MCP-written draft UID to its lineage so a later supersession
+    // (Mail expunges this UID) is still resolvable from the dead UID alone (§7).
+    this.draftCache.mapUid(id, lineageRefFor(accountName, account.email, options.subject, uuid));
+
+    return { id, mailbox: draftsPath, uuid };
   }
 
   /**
@@ -2337,7 +2338,6 @@ export default class ImapService {
 
     const account = this.connections.getAccount(accountName);
     const ref = lineageRefFor(accountName, account.email, options.subject, saved.uuid);
-    this.draftCache.mapUid(saved.id, ref);
     this.recordAttachmentOrigins(ref, options.attachments ?? [], resolved);
     return saved;
   }
@@ -2565,9 +2565,8 @@ export default class ImapService {
       uuid: existingUuid,
     });
 
-    // Cache the new draft's attachment set + UID→lineage map for resync.
+    // Cache the new draft's attachment set (UID→lineage map is done in saveDraft).
     const newRef = lineageRefFor(accountName, account.email, subject, newId.uuid);
-    this.draftCache.mapUid(newId.id, newRef);
     allAttachments.forEach((a) => {
       this.draftCache.record(
         newRef,
