@@ -7,8 +7,9 @@
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
-import type { AccountConfig, SendResult } from '../types/index.js';
+import type { AccountConfig, Email, SendResult } from '../types/index.js';
 import type { ResolvedAttachment } from './attachment-resolver.js';
+import { SupersededDraftError } from './draft-errors.js';
 import type ImapService from './imap.service.js';
 
 // ---------------------------------------------------------------------------
@@ -507,12 +508,28 @@ export default class SmtpService {
     this.checkRateLimit(accountName);
 
     // Fetch the parsed draft for its recipient addresses (and the resolved
-    // Drafts mailbox path)…
-    const { email: draft, mailbox: draftsPath } = await this.imapService.fetchDraft(
-      accountName,
-      draftId,
-      mailbox,
-    );
+    // Drafts mailbox path)… If the UID is gone, surface a supersession hint
+    // instead of a bare not-found (design §7).
+    let draft: Email;
+    let draftsPath: string;
+    try {
+      const fetched = await this.imapService.fetchDraft(accountName, draftId, mailbox);
+      draft = fetched.email;
+      draftsPath = fetched.mailbox;
+    } catch (err) {
+      if (/not found in/i.test(err instanceof Error ? err.message : '')) {
+        const hint = await this.imapService
+          .findSupersession(accountName, draftId, mailbox)
+          .catch(() => null);
+        if (hint) {
+          throw new SupersededDraftError(
+            `Draft ${draftId} was superseded; newest is UID ${hint.newestUid}. Send that instead (or resync first).`,
+            hint,
+          );
+        }
+      }
+      throw err;
+    }
 
     // …and the FULL raw bytes so attachments are sent as-is (recomposing from
     // the parsed Email loses attachment binaries — that was the bug).
@@ -536,6 +553,11 @@ export default class SmtpService {
       throw new Error('Draft has no recipients (To/Cc/Bcc all empty)');
     }
 
+    // Warn-only when a NEWER lineage member exists (the user may keep variants).
+    const supersession = await this.imapService
+      .findSupersession(accountName, draftId, draftsPath)
+      .catch(() => null);
+
     // Strip the Bcc header so blind recipients never leak into the delivered
     // message or the Sent copy. Threading headers (In-Reply-To/References) and
     // Message-ID/Date are already embedded in the raw bytes — leave them as-is.
@@ -556,6 +578,11 @@ export default class SmtpService {
     return {
       messageId: result.messageId ?? '',
       status: 'sent',
+      ...(supersession
+        ? {
+            warning: `A newer draft (UID ${supersession.newestUid}) exists in this lineage; you sent UID ${draftId}.`,
+          }
+        : {}),
     };
   }
 }

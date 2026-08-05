@@ -286,6 +286,8 @@ export interface Email extends EmailMeta {
 export interface SendResult {
   messageId: string;
   status: 'sent' | 'failed';
+  /** Warn-only note, e.g. sending a non-newest draft in a lineage (design §7). */
+  warning?: string;
 }
 
 /**

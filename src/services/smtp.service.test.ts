@@ -555,6 +555,7 @@ describe('SmtpService', () => {
         fetchDraft: vi.fn().mockResolvedValue(mockDraft),
         fetchDraftRaw: vi.fn().mockResolvedValue(rawDraft),
         deleteDraft: vi.fn().mockResolvedValue(undefined),
+        findSupersession: vi.fn().mockResolvedValue(null),
       } as unknown as ImapService;
 
       return { mockDraft, rawDraft, imapServiceWithDraft };
@@ -652,6 +653,7 @@ describe('SmtpService', () => {
         fetchDraft: vi.fn().mockResolvedValue(dupDraft),
         fetchDraftRaw: vi.fn().mockResolvedValue(rawDraft),
         deleteDraft: vi.fn().mockResolvedValue(undefined),
+        findSupersession: vi.fn().mockResolvedValue(null),
       } as unknown as ImapService;
       service = new SmtpService(connections, rateLimiter, imapServiceWithDraft);
 

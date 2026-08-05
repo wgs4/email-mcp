@@ -425,4 +425,44 @@ describe('Email Draft Operations', () => {
       expect(Object.keys(sent.headers ?? {})).not.toContain('bcc');
     });
   });
+
+  // ---------------------------------------------------------------------------
+  // UUID stamp + session cache (resync enablers)
+  // ---------------------------------------------------------------------------
+
+  describe('UUID stamp + cache (resync enablers)', () => {
+    it('save_draft stamps X-Universally-Unique-Identifier and returns it', async () => {
+      const saved = await services.imapService.saveDraft(TEST_ACCOUNT_NAME, {
+        to: ['bob@localhost'],
+        subject: 'UUID stamp test',
+        body: 'hi',
+        html: true,
+      });
+      expect(saved.uuid).toMatch(/[0-9A-F-]{36}/);
+      const full = await services.imapService.getEmail(
+        TEST_ACCOUNT_NAME,
+        String(saved.id),
+        saved.mailbox,
+      );
+      expect(full.headers['x-universally-unique-identifier']).toBe(saved.uuid);
+    });
+
+    it('update_draft carries the same UUID forward', async () => {
+      const saved = await services.imapService.saveDraft(TEST_ACCOUNT_NAME, {
+        to: ['bob@localhost'],
+        subject: 'UUID carry test',
+        body: 'v1',
+        html: true,
+      });
+      const updated = await services.imapService.updateDraft(TEST_ACCOUNT_NAME, saved.id, {
+        body: 'v2',
+      });
+      const full = await services.imapService.getEmail(
+        TEST_ACCOUNT_NAME,
+        String(updated.id),
+        updated.mailbox,
+      );
+      expect(full.headers['x-universally-unique-identifier']).toBe(saved.uuid);
+    });
+  });
 });

@@ -4,6 +4,7 @@
  * No MCP dependency — fully unit-testable.
  */
 
+import { randomUUID } from 'node:crypto';
 import type { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
@@ -30,11 +31,23 @@ import type {
 import { nonEmpty, RAW_CAP } from '../utils/body-format.js';
 import type { AttachmentInput, ResolvedAttachment } from './attachment-resolver.js';
 import { resolveAttachments } from './attachment-resolver.js';
+import { DraftAttachmentCache } from './draft-attachment-cache.js';
+import type { SupersessionHint } from './draft-errors.js';
+import type { DraftRow, LineageRef } from './draft-lineage.js';
+import {
+  diffMissingAttachments,
+  normalizeFrom,
+  normalizeSubject,
+  orderByInternalDate,
+  parseUuidHeader,
+  sameLineage,
+} from './draft-lineage.js';
 import { assertSafeDestination, resolveUniquePath, sanitizeFilename } from './file-paths.js';
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
 import type { MailboxRef } from './mailbox-resolver.js';
 import { resolveMailboxForAccount } from './mailbox-resolver.js';
+import { findDanglingCids, injectAttachments } from './mime-splice.js';
 import type { SearchParams } from './search-criteria.js';
 import { buildSearchCriteria, chunkUids } from './search-criteria.js';
 import {
@@ -526,6 +539,38 @@ async function messageToEmail(msg: Record<string, unknown>): Promise<Email> {
   };
 }
 
+/** Build a normalized lineage reference for the draft attachment cache (§5). */
+function lineageRefFor(account: string, from: string, subject: string, uuid?: string): LineageRef {
+  return { account, from: normalizeFrom(from), subjectNorm: normalizeSubject(subject), uuid };
+}
+
+export interface ResyncMissing {
+  filename: string;
+  size?: number;
+  source: 'ancestor' | 'cache' | 'none';
+  lastSeenOnUid?: number;
+  recoverable: boolean;
+}
+
+export interface ResyncReport {
+  currentUid: number;
+  mailbox: string;
+  lineageUids: number[];
+  missing: ResyncMissing[];
+  intentionallyRemovedExcluded: string[];
+  danglingCids: string[];
+}
+
+export interface ResyncApplyResult {
+  newUid: number | null;
+  mailbox: string;
+  restored: string[];
+  skippedUnrecoverable: string[];
+  oldUidReplaced: number | null;
+  strippedCids: string[];
+  warnings: string[];
+}
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -587,6 +632,9 @@ export default class ImapService {
   }
 
   constructor(private connections: IConnectionManager) {}
+
+  /** Session-lifetime cache backing resync_draft_attachments (design §5). */
+  readonly draftCache = new DraftAttachmentCache();
 
   /**
    * Single choke point for every interactive `client.search()` call (D7/R1).
@@ -2175,8 +2223,10 @@ export default class ImapService {
       html?: boolean;
       inReplyTo?: string;
       attachments?: ResolvedAttachment[];
+      /** Lineage UUID to carry forward (design §4). Minted when absent. */
+      uuid?: string;
     },
-  ): Promise<{ id: number; mailbox: string }> {
+  ): Promise<{ id: number; mailbox: string; uuid: string }> {
     const client = await this.connections.getImapClient(accountName);
     const account = this.connections.getAccount(accountName);
 
@@ -2187,6 +2237,7 @@ export default class ImapService {
 
     const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
     const hasDraftAttachments = !!options.attachments && options.attachments.length > 0;
+    const uuid = options.uuid ?? randomUUID().toUpperCase();
 
     const mailOptions = {
       from: fromAddr,
@@ -2196,6 +2247,7 @@ export default class ImapService {
       subject: options.subject,
       inReplyTo: options.inReplyTo,
       date: new Date(),
+      headers: { 'X-Universally-Unique-Identifier': uuid },
       ...(options.html ? { html: options.body } : { text: options.body }),
       ...(hasDraftAttachments ? { attachments: options.attachments } : {}),
     };
@@ -2208,11 +2260,13 @@ export default class ImapService {
     });
 
     const appendResult = await client.append(draftsPath, rawMessage, ['\\Draft', '\\Seen']);
+    const id = (appendResult as unknown as { uid?: number }).uid ?? 0;
 
-    return {
-      id: (appendResult as unknown as { uid?: number }).uid ?? 0,
-      mailbox: draftsPath,
-    };
+    // Map every MCP-written draft UID to its lineage so a later supersession
+    // (Mail expunges this UID) is still resolvable from the dead UID alone (§7).
+    this.draftCache.mapUid(id, lineageRefFor(accountName, account.email, options.subject, uuid));
+
+    return { id, mailbox: draftsPath, uuid };
   }
 
   /**
@@ -2259,7 +2313,7 @@ export default class ImapService {
       inReplyTo?: string;
       attachments?: AttachmentInput[];
     },
-  ): Promise<{ id: number; mailbox: string }> {
+  ): Promise<{ id: number; mailbox: string; uuid: string }> {
     let resolved: ResolvedAttachment[] = [];
 
     if (options.attachments && options.attachments.length > 0) {
@@ -2271,7 +2325,7 @@ export default class ImapService {
       resolved = result.resolved;
     }
 
-    return this.saveDraft(accountName, {
+    const saved = await this.saveDraft(accountName, {
       to: options.to,
       subject: options.subject,
       body: options.body,
@@ -2280,6 +2334,41 @@ export default class ImapService {
       html: options.html,
       inReplyTo: options.inReplyTo,
       attachments: resolved,
+    });
+
+    const account = this.connections.getAccount(accountName);
+    const ref = lineageRefFor(accountName, account.email, options.subject, saved.uuid);
+    this.recordAttachmentOrigins(ref, options.attachments ?? [], resolved);
+    return saved;
+  }
+
+  /** Cache each saved attachment by its ORIGIN (path re-read at apply; else bytes). */
+  private recordAttachmentOrigins(
+    ref: LineageRef,
+    inputs: AttachmentInput[],
+    resolved: ResolvedAttachment[],
+  ): void {
+    resolved.forEach((r) => {
+      const match = inputs.find((i) => {
+        const byName = 'filename' in i && i.filename === r.filename;
+        const byPath = 'path' in i && !i.filename && i.path.endsWith(r.filename);
+        return byName || byPath;
+      });
+      if (match && 'path' in match) {
+        this.draftCache.record(
+          ref,
+          r.filename,
+          { kind: 'path', path: match.path },
+          r.content.length,
+        );
+      } else {
+        this.draftCache.record(
+          ref,
+          r.filename,
+          { kind: 'bytes', content: r.content, contentType: r.contentType },
+          r.content.length,
+        );
+      }
     });
   }
 
@@ -2391,6 +2480,7 @@ export default class ImapService {
       draftId,
       options.mailbox,
     );
+    const existingUuid = existing.headers['x-universally-unique-identifier'];
 
     // Determine which existing attachments to carry forward.
     const existingFilenames = existing.attachments.map((a) => a.filename);
@@ -2443,6 +2533,14 @@ export default class ImapService {
     const bcc = options.bcc ?? existing.bcc?.map((a) => a.address);
     const inReplyTo = options.inReplyTo ?? existing.inReplyTo;
 
+    // Lineage bookkeeping for resync (design §5): carry the UUID forward, record
+    // intentional removals, and (below) cache the resulting attachment set.
+    const account = this.connections.getAccount(accountName);
+    const ref = lineageRefFor(accountName, account.email, subject, existingUuid);
+    (options.attachmentsRemove ?? []).forEach((f) => {
+      this.draftCache.recordRemoval(ref, f);
+    });
+
     // Inline image detection — warn when the body references cid: parts that
     // won't survive the rebuild (v1 treats them as plain attachments only).
     if (html && typeof body === 'string') {
@@ -2464,6 +2562,18 @@ export default class ImapService {
       html,
       inReplyTo,
       attachments: allAttachments,
+      uuid: existingUuid,
+    });
+
+    // Cache the new draft's attachment set (UID→lineage map is done in saveDraft).
+    const newRef = lineageRefFor(accountName, account.email, subject, newId.uuid);
+    allAttachments.forEach((a) => {
+      this.draftCache.record(
+        newRef,
+        a.filename,
+        { kind: 'bytes', content: a.content, contentType: a.contentType },
+        a.content.length,
+      );
     });
 
     // Only after confirmed APPEND, delete the old UID.
@@ -2512,6 +2622,338 @@ export default class ImapService {
       );
     }
     return result.resolved;
+  }
+
+  // -------------------------------------------------------------------------
+  // Draft attachment resync (design 2026-07-19)
+  // -------------------------------------------------------------------------
+
+  /** Resolve the Drafts folder path (autodetect unless overridden). */
+  private async resolveDraftsPath(accountName: string, mailbox?: string): Promise<string> {
+    if (mailbox) return mailbox;
+    const client = await this.connections.getImapClient(accountName);
+    const mailboxes = await client.list();
+    return mailboxes.find((mb) => mb.specialUse === '\\Drafts')?.path ?? 'Drafts';
+  }
+
+  /** Fetch every draft row (uid/from/subject/internalDate/attachments/uuid). */
+  private async listDraftLineageRaw(accountName: string, mailbox: string): Promise<DraftRow[]> {
+    const client = await this.connections.getImapClient(accountName);
+    const lock = await client.getMailboxLock(mailbox);
+    const rows: DraftRow[] = [];
+    try {
+      const selected = client.mailbox;
+      if (!selected || selected.exists === 0) return rows;
+      // eslint-disable-next-line no-restricted-syntax
+      for await (const msg of client.fetch(
+        '1:*',
+        {
+          uid: true,
+          envelope: true,
+          internalDate: true,
+          bodyStructure: true,
+          headers: ['x-universally-unique-identifier'],
+        },
+        { uid: true },
+      )) {
+        const m = msg as unknown as Record<string, unknown>;
+        const envelope = (m.envelope ?? {}) as Record<string, unknown>;
+        const fromEntry = (envelope.from as Record<string, string>[] | undefined)?.[0];
+        rows.push({
+          uid: m.uid as number,
+          from: fromEntry?.address ?? '',
+          subject: (envelope.subject as string) ?? '',
+          internalDate: m.internalDate ? new Date(m.internalDate as string) : new Date(0),
+          attachments: extractAttachmentMeta(m.bodyStructure),
+          uuid: parseUuidHeader(m.headers as Buffer | undefined),
+        });
+      }
+    } finally {
+      lock.release();
+    }
+    return rows;
+  }
+
+  /**
+   * Resolve the lineage (all drafts sharing From + subject/uuid) for a given
+   * draft UID or subject. Returns the current (newest) draft, its ancestors,
+   * and the canonical lineage ref, or null when nothing matches.
+   */
+  async resolveDraftLineage(
+    accountName: string,
+    opts: { draftId?: number; subject?: string; mailbox?: string },
+  ): Promise<{
+    mailbox: string;
+    current: DraftRow;
+    ancestors: DraftRow[];
+    ref: LineageRef;
+  } | null> {
+    const mailbox = await this.resolveDraftsPath(accountName, opts.mailbox);
+    const rows = await this.listDraftLineageRaw(accountName, mailbox);
+    const account = this.connections.getAccount(accountName);
+
+    let anchor: LineageRef | undefined;
+    if (opts.draftId !== undefined) {
+      const hit = rows.find((r) => r.uid === opts.draftId);
+      anchor = hit
+        ? {
+            account: accountName,
+            from: normalizeFrom(hit.from),
+            subjectNorm: normalizeSubject(hit.subject),
+            uuid: hit.uuid,
+          }
+        : this.draftCache.lineageForUid(opts.draftId);
+    } else if (opts.subject !== undefined) {
+      anchor = {
+        account: accountName,
+        from: normalizeFrom(account.email),
+        subjectNorm: normalizeSubject(opts.subject),
+        uuid: undefined,
+      };
+    }
+    if (!anchor) return null;
+
+    const group = orderByInternalDate(
+      rows.filter((r) => {
+        const key = {
+          from: normalizeFrom(r.from),
+          subjectNorm: normalizeSubject(r.subject),
+          uuid: r.uuid,
+        };
+        return sameLineage(key, anchor);
+      }),
+    );
+    if (group.length === 0) return null;
+    const current = group[group.length - 1];
+    return {
+      mailbox,
+      current,
+      ancestors: group.slice(0, -1),
+      ref: { ...anchor, uuid: current.uuid ?? anchor.uuid },
+    };
+  }
+
+  /** Detect + (optionally) restore attachments Apple Mail dropped on re-save. */
+  async resyncDraftAttachments(
+    accountName: string,
+    opts: {
+      draftId?: number;
+      subject?: string;
+      apply: boolean;
+      attachments?: string[];
+      stripDanglingCids: boolean;
+      mailbox?: string;
+    },
+  ): Promise<{ report: ResyncReport; applied?: ResyncApplyResult }> {
+    const lineage = await this.resolveDraftLineage(accountName, opts);
+    if (!lineage) {
+      throw new Error(
+        'No draft lineage found for the given draft_id/subject in the Drafts folder.',
+      );
+    }
+    const { mailbox, current, ancestors, ref } = lineage;
+
+    // Candidate missing = ancestor files + cached files, minus what's on current.
+    const currentNames = new Set(current.attachments.map((a) => a.filename));
+    const fromAncestors = diffMissingAttachments(current, ancestors);
+    const cached = this.draftCache.lookup(ref).filter((c) => !currentNames.has(c.filename));
+    const allNames = new Set<string>([
+      ...fromAncestors.map((m) => m.filename),
+      ...cached.map((c) => c.filename),
+    ]);
+    const allowlist = opts.attachments ? new Set(opts.attachments) : undefined;
+
+    const intentionallyRemovedExcluded: string[] = [];
+    const missing: ResyncMissing[] = [];
+    allNames.forEach((filename) => {
+      if (allowlist && !allowlist.has(filename)) return;
+      if (!allowlist && this.draftCache.isRemoved(ref, filename)) {
+        intentionallyRemovedExcluded.push(filename);
+        return;
+      }
+      const anc = fromAncestors.find((m) => m.filename === filename);
+      const cacheHit = cached.find((c) => c.filename === filename);
+      if (anc) {
+        missing.push({
+          filename,
+          size: anc.size,
+          source: 'ancestor',
+          lastSeenOnUid: anc.lastSeenOnUid,
+          recoverable: true,
+        });
+      } else if (cacheHit) {
+        missing.push({ filename, size: cacheHit.size, source: 'cache', recoverable: true });
+      } else {
+        missing.push({ filename, source: 'none', recoverable: false });
+      }
+    });
+
+    const danglingCids =
+      opts.stripDanglingCids || !opts.apply
+        ? await this.danglingCidsForDraft(accountName, current.uid, mailbox)
+        : [];
+
+    const report: ResyncReport = {
+      currentUid: current.uid,
+      mailbox,
+      lineageUids: [...ancestors.map((a) => a.uid), current.uid],
+      missing,
+      intentionallyRemovedExcluded,
+      danglingCids,
+    };
+
+    if (!opts.apply) return { report };
+
+    // ---- apply ----
+    const recoverable = missing.filter((m) => m.recoverable);
+    const skippedUnrecoverable = missing.filter((m) => !m.recoverable).map((m) => m.filename);
+    if (recoverable.length === 0 && danglingCids.length === 0) {
+      return {
+        report,
+        applied: {
+          newUid: null,
+          mailbox,
+          restored: [],
+          skippedUnrecoverable,
+          oldUidReplaced: null,
+          strippedCids: [],
+          warnings: ['Nothing to restore.'],
+        },
+      };
+    }
+
+    const resolved: ResolvedAttachment[] = [];
+    const restored: string[] = [];
+    const warnings: string[] = [];
+    // eslint-disable-next-line no-restricted-syntax
+    for (const m of recoverable) {
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        resolved.push(await this.recoverAttachmentBytes(accountName, ref, mailbox, m));
+        restored.push(m.filename);
+      } catch (err) {
+        skippedUnrecoverable.push(m.filename);
+        warnings.push(
+          `Could not recover "${m.filename}": ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    const rawCurrent = await this.fetchDraftRaw(accountName, current.uid, mailbox);
+    const spliced = await injectAttachments(rawCurrent, resolved, {
+      stripDanglingCids: opts.stripDanglingCids,
+      ensureUuid: true,
+    });
+    warnings.push(...spliced.warnings);
+
+    const newUid = await this.appendRawDraft(accountName, spliced.raw, mailbox);
+
+    let oldUidReplaced: number | null = null;
+    try {
+      await this.deleteDraft(accountName, current.uid, mailbox);
+      oldUidReplaced = current.uid;
+    } catch (err) {
+      warnings.push(
+        `New draft ${newUid} saved but deleting old UID ${current.uid} failed: ${err instanceof Error ? err.message : String(err)}.`,
+      );
+    }
+
+    this.draftCache.mapUid(newUid, ref);
+    resolved.forEach((a) => {
+      this.draftCache.record(
+        ref,
+        a.filename,
+        { kind: 'bytes', content: a.content, contentType: a.contentType },
+        a.content.length,
+      );
+    });
+
+    return {
+      report,
+      applied: {
+        newUid,
+        mailbox,
+        restored,
+        skippedUnrecoverable,
+        oldUidReplaced,
+        strippedCids: spliced.strippedCids,
+        warnings,
+      },
+    };
+  }
+
+  /** Recover one missing attachment's bytes (surviving ancestor, else cache). */
+  private async recoverAttachmentBytes(
+    accountName: string,
+    ref: LineageRef,
+    mailbox: string,
+    m: ResyncMissing,
+  ): Promise<ResolvedAttachment> {
+    if (m.source === 'ancestor' && m.lastSeenOnUid !== undefined) {
+      const r = await resolveAttachments(this, accountName, [
+        { sourceEmailId: String(m.lastSeenOnUid), sourceMailbox: mailbox, filename: m.filename },
+      ]);
+      if (r.failures.length > 0) throw new Error(r.failures[0].reason);
+      return r.resolved[0];
+    }
+    const hit = this.draftCache.find(ref, m.filename);
+    if (!hit) throw new Error('cache miss');
+    if (hit.origin.kind === 'path') {
+      const r = await resolveAttachments(this, accountName, [
+        { path: hit.origin.path, filename: m.filename },
+      ]);
+      if (r.failures.length > 0) throw new Error(r.failures[0].reason);
+      return r.resolved[0];
+    }
+    return {
+      filename: m.filename,
+      content: hit.origin.content,
+      contentType: hit.origin.contentType,
+    };
+  }
+
+  private async danglingCidsForDraft(
+    accountName: string,
+    uid: number,
+    mailbox: string,
+  ): Promise<string[]> {
+    try {
+      const raw = await this.fetchDraftRaw(accountName, uid, mailbox);
+      return await findDanglingCids(raw);
+    } catch {
+      return [];
+    }
+  }
+
+  /** APPEND pre-built raw draft bytes; returns the new UID. */
+  async appendRawDraft(accountName: string, raw: Buffer, mailbox: string): Promise<number> {
+    const client = await this.connections.getImapClient(accountName);
+    const appendResult = await client.append(mailbox, raw, ['\\Draft', '\\Seen']);
+    return (appendResult as unknown as { uid?: number }).uid ?? 0;
+  }
+
+  /** Supersession lookup for a (possibly dead) UID via the session lineage map. */
+  async findSupersession(
+    accountName: string,
+    deadUid: number,
+    mailbox?: string,
+  ): Promise<SupersessionHint | null> {
+    const lineage = await this.resolveDraftLineage(accountName, { draftId: deadUid, mailbox });
+    if (!lineage || lineage.current.uid === deadUid) return null;
+    const presentNames = new Set(lineage.current.attachments.map((a) => a.filename));
+    const names = new Set<string>([
+      ...lineage.ancestors.flatMap((a) => a.attachments.map((x) => x.filename)),
+      ...lineage.current.attachments.map((a) => a.filename),
+      ...this.draftCache.lookup(lineage.ref).map((c) => c.filename),
+    ]);
+    return {
+      newestUid: lineage.current.uid,
+      newestDate: lineage.current.internalDate.toISOString(),
+      attachmentDiff: [...names].map((filename) => ({
+        filename,
+        presentOnNewest: presentNames.has(filename),
+      })),
+    };
   }
 
   // -------------------------------------------------------------------------

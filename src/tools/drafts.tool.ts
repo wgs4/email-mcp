@@ -6,6 +6,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import audit from '../safety/audit.js';
 
+import { SupersededDraftError } from '../services/draft-errors.js';
 import type ImapService from '../services/imap.service.js';
 import type SmtpService from '../services/smtp.service.js';
 import { adaptAttachmentInput, attachmentInputSchema } from './attachment-input.js';
@@ -118,15 +119,28 @@ export default function registerDraftTools(
 
         await audit.log('send_draft', account, { id, mailbox }, 'ok');
 
+        const warn = result.warning ? `\n⚠️ ${result.warning}` : '';
         return {
           content: [
             {
               type: 'text' as const,
-              text: `✅ Draft sent (Message-ID: ${result.messageId}). Draft removed from folder.`,
+              text: `✅ Draft sent (Message-ID: ${result.messageId}). Draft removed from folder.${warn}`,
             },
           ],
         };
       } catch (err) {
+        if (err instanceof SupersededDraftError) {
+          await audit.log('send_draft', account, { id, mailbox }, 'error', 'draft_superseded');
+          return {
+            isError: true,
+            content: [
+              {
+                type: 'text' as const,
+                text: `⚠️ draft_superseded: ${err.message} (newest UID ${err.hint.newestUid}).`,
+              },
+            ],
+          };
+        }
         const errMsg = err instanceof Error ? err.message : String(err);
         await audit.log('send_draft', account, { id, mailbox }, 'error', errMsg);
         return {
@@ -250,6 +264,31 @@ export default function registerDraftTools(
           ],
         };
       } catch (err) {
+        if (/not found in/i.test(err instanceof Error ? err.message : '')) {
+          const hint = await imapService
+            .findSupersession(account, draftId, mailbox)
+            .catch(() => null);
+          if (hint) {
+            await audit.log(
+              'update_draft',
+              account,
+              { draftId, mailbox },
+              'error',
+              'draft_superseded',
+            );
+            return {
+              isError: true,
+              content: [
+                {
+                  type: 'text' as const,
+                  text:
+                    `⚠️ draft_superseded: UID ${draftId} is gone; newest is UID ${hint.newestUid} (${hint.newestDate}). ` +
+                    `Retry update_draft against ${hint.newestUid}, or run resync_draft_attachments(draft_id=${hint.newestUid}, apply=true) to restore attachments.`,
+                },
+              ],
+            };
+          }
+        }
         const errMsg = err instanceof Error ? err.message : String(err);
         await audit.log('update_draft', account, { draftId, mailbox }, 'error', errMsg);
         return {
@@ -260,6 +299,119 @@ export default function registerDraftTools(
               text: `Failed to update draft: ${errMsg}`,
             },
           ],
+        };
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // resync_draft_attachments
+  // ---------------------------------------------------------------------------
+  server.tool(
+    'resync_draft_attachments',
+    'Detect and restore attachments that Apple Mail silently dropped when it re-saved an MCP ' +
+      'draft. Resolves the draft lineage (same From + subject, or a shared Apple UUID), diffs ' +
+      'attachments against ancestors and the session cache, and (with apply=true) APPENDs a new ' +
+      "draft that carries the user's body BYTE-FOR-BYTE plus the recovered files. apply=false " +
+      '(default) reports only. Pass draft_id (any UID in the lineage) OR subject.',
+    {
+      account: z.string().describe('Account name from list_accounts'),
+      draft_id: z
+        .number()
+        .int()
+        .optional()
+        .describe('UID of any draft in the lineage (ancestor or current)'),
+      subject: z.string().optional().describe('Exact draft subject — use when the UID is unknown'),
+      apply: z.boolean().default(false).describe('false = report only (no write); true = re-apply'),
+      attachments: z
+        .array(z.string())
+        .optional()
+        .describe(
+          'Explicit filename allowlist to restore (overrides intentional-removal exclusion)',
+        ),
+      strip_dangling_cids: z
+        .boolean()
+        .default(true)
+        .describe('When applying, strip <img>/<object> whose cid: has no matching part'),
+      mailbox: z.string().optional().describe('Drafts folder path (auto-detected if omitted)'),
+    },
+    { readOnlyHint: false, destructiveHint: true },
+    async ({
+      account,
+      draft_id: draftId,
+      subject,
+      apply,
+      attachments,
+      strip_dangling_cids: strip,
+      mailbox,
+    }) => {
+      if ((draftId === undefined) === (subject === undefined)) {
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: 'Provide exactly one of draft_id or subject.' }],
+        };
+      }
+      try {
+        const res = await imapService.resyncDraftAttachments(account, {
+          draftId,
+          subject,
+          apply,
+          attachments,
+          stripDanglingCids: strip,
+          mailbox,
+        });
+        await audit.log('resync_draft_attachments', account, { draftId, subject, apply }, 'ok');
+        const r = res.report;
+        if (!apply) {
+          const lines = [
+            `🔎 Resync report — current draft UID ${r.currentUid} (folder: ${r.mailbox}), lineage UIDs: ${r.lineageUids.join(', ')}.`,
+            r.missing.length > 0
+              ? `Missing: ${r.missing.map((m) => `${m.filename} [${m.recoverable ? m.source : 'UNRECOVERABLE'}]`).join(', ')}`
+              : 'No missing attachments.',
+            r.intentionallyRemovedExcluded.length > 0
+              ? `Excluded (intentionally removed): ${r.intentionallyRemovedExcluded.join(', ')}`
+              : '',
+            r.danglingCids.length > 0 ? `Dangling cids: ${r.danglingCids.join(', ')}` : '',
+            'Run again with apply=true to restore.',
+          ].filter(Boolean);
+          return { content: [{ type: 'text' as const, text: lines.join('\n') }] };
+        }
+        const a = res.applied;
+        const nothingToRestore = {
+          content: [
+            {
+              type: 'text' as const,
+              text: `✅ Nothing to restore for draft UID ${r.currentUid}.`,
+            },
+          ],
+        };
+        if (a === undefined) return nothingToRestore;
+        if (a.newUid === null) return nothingToRestore;
+        const warnBlock =
+          a.warnings.length > 0 ? `\n\nWarnings:\n  - ${a.warnings.join('\n  - ')}` : '';
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text:
+                `♻️ Resynced. New draft UID: ${a.newUid} (folder: ${a.mailbox}); restored: ${a.restored.join(', ') || 'none'}; ` +
+                `old UID ${a.oldUidReplaced} replaced${a.strippedCids.length ? `; stripped cids: ${a.strippedCids.join(', ')}` : ''}` +
+                `${a.skippedUnrecoverable.length ? `; UNRECOVERABLE: ${a.skippedUnrecoverable.join(', ')}` : ''}.${warnBlock}`,
+            },
+          ],
+        };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await audit.log(
+          'resync_draft_attachments',
+          account,
+          { draftId, subject, apply },
+          'error',
+          errMsg,
+        );
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: `Failed to resync draft: ${errMsg}` }],
         };
       }
     },
