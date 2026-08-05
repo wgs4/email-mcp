@@ -72,6 +72,12 @@ function createMockImapService() {
     appendToSent: vi.fn().mockResolvedValue(undefined),
     resolveSentFolder: vi.fn().mockResolvedValue('Sent'),
     getEmail: vi.fn().mockResolvedValue(createMockEmail()),
+    downloadAttachment: vi.fn().mockImplementation(async (_a, _i, _m, filename: string) => ({
+      filename,
+      mimeType: 'application/pdf',
+      size: 27,
+      contentBase64: Buffer.from(`bytes-of-${filename}`).toString('base64'),
+    })),
   } as unknown as ImapService;
 }
 
@@ -371,6 +377,19 @@ describe('SmtpService', () => {
   });
 
   describe('forwardEmail', () => {
+    // An original message carrying two distinct attachments plus a duplicate
+    // filename (real mail does this — the Ritter PBX training mail carried the
+    // same user-guide PDF twice).
+    const withAttachments = () =>
+      createMockEmail({
+        hasAttachments: true,
+        attachments: [
+          { filename: 'guide.pdf', mimeType: 'application/pdf', size: 27 },
+          { filename: 'star-codes.pdf', mimeType: 'application/pdf', size: 27 },
+          { filename: 'guide.pdf', mimeType: 'application/pdf', size: 27 },
+        ],
+      });
+
     it('calls appendToSent after successful forward', async () => {
       await service.forwardEmail('test', {
         emailId: '42',
@@ -378,10 +397,93 @@ describe('SmtpService', () => {
         body: 'FYI',
       });
 
-      expect(imapService.appendToSent).toHaveBeenCalledWith(
-        'test',
-        expect.stringContaining('Subject: Fwd: Original Subject'),
-      );
+      expect(imapService.appendToSent).toHaveBeenCalledWith('test', expect.any(Buffer));
+      const [[, rawMsg]] = vi.mocked(imapService.appendToSent).mock.calls;
+      expect((rawMsg as Buffer).toString()).toContain('Subject: Fwd: Original Subject');
+    });
+
+    // Regression: forward composed with an attachment-blind raw builder and sent
+    // only `text`, so every attachment was silently dropped. A forward whose
+    // attachments vanish is the bug this guards.
+    it('carries the original attachments into the forwarded message by default', async () => {
+      imapService.getEmail = vi.fn().mockResolvedValue(withAttachments());
+
+      await service.forwardEmail('test', {
+        emailId: '42',
+        to: ['forward@example.com'],
+        body: 'FYI',
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.raw).toBeInstanceOf(Buffer);
+      const rawStr = (call.raw as Buffer).toString('utf-8');
+      expect(rawStr).toContain('guide.pdf');
+      expect(rawStr).toContain('star-codes.pdf');
+      expect(rawStr).toContain(Buffer.from('bytes-of-guide.pdf').toString('base64'));
+
+      // The SAME bytes land in Sent — no lossy second composition.
+      const [[, appended]] = vi.mocked(imapService.appendToSent).mock.calls;
+      expect((appended as Buffer).equals(call.raw as Buffer)).toBe(true);
+    });
+
+    it('fetches each distinct filename once when the original repeats one', async () => {
+      imapService.getEmail = vi.fn().mockResolvedValue(withAttachments());
+
+      await service.forwardEmail('test', {
+        emailId: '42',
+        to: ['forward@example.com'],
+      });
+
+      // 3 attachment entries, 2 distinct filenames → 2 downloads, 2 MIME parts.
+      expect(imapService.downloadAttachment).toHaveBeenCalledTimes(2);
+      const rawStr = (transport.sendMail.mock.calls[0][0].raw as Buffer).toString('utf-8');
+      expect(rawStr.match(/filename="?guide\.pdf/g)).toHaveLength(1);
+    });
+
+    it('sends with an explicit envelope covering To and Cc', async () => {
+      await service.forwardEmail('test', {
+        emailId: '42',
+        to: ['forward@example.com'],
+        cc: ['cc1@example.com'],
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      expect(call.envelope).toEqual({
+        from: 'test@example.com',
+        to: ['forward@example.com', 'cc1@example.com'],
+      });
+    });
+
+    // Strict, unlike reply's opt-in best-effort re-attach: a forward's
+    // attachments ARE the payload, so a partial forward must not be sent
+    // silently — the caller has to know it failed.
+    it('throws without sending when an attachment cannot be fetched', async () => {
+      imapService.getEmail = vi.fn().mockResolvedValue(withAttachments());
+      imapService.downloadAttachment = vi.fn().mockRejectedValue(new Error('exceeds 25MB limit'));
+
+      await expect(
+        service.forwardEmail('test', {
+          emailId: '42',
+          to: ['forward@example.com'],
+        }),
+      ).rejects.toThrow(/guide\.pdf/);
+
+      expect(transport.sendMail).not.toHaveBeenCalled();
+      expect(imapService.appendToSent).not.toHaveBeenCalled();
+    });
+
+    it('omits attachments when includeAttachments is false', async () => {
+      imapService.getEmail = vi.fn().mockResolvedValue(withAttachments());
+
+      await service.forwardEmail('test', {
+        emailId: '42',
+        to: ['forward@example.com'],
+        includeAttachments: false,
+      });
+
+      expect(imapService.downloadAttachment).not.toHaveBeenCalled();
+      const rawStr = (transport.sendMail.mock.calls[0][0].raw as Buffer).toString('utf-8');
+      expect(rawStr).not.toContain('guide.pdf');
     });
   });
 

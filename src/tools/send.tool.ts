@@ -166,7 +166,7 @@ export default function registerSendTools(
   // ---------------------------------------------------------------------------
   server.tool(
     'forward_email',
-    'Forward an email to new recipients with optional additional message. Original email is quoted below.',
+    'Forward an email to new recipients with optional additional message. The original email is quoted below and its attachments are carried across by default. Strict failure: if an attachment cannot be fetched, nothing is sent (use includeAttachments=false to forward the body alone).',
     {
       account: z.string().describe('Account name from list_accounts'),
       emailId: z.string().describe('Email ID to forward (from list_emails or get_email)'),
@@ -174,6 +174,12 @@ export default function registerSendTools(
       to: z.array(z.string().email()).min(1).describe('Forward to these recipients'),
       body: z.string().optional().describe('Additional message above the forwarded content'),
       cc: z.array(z.string().email()).optional().describe('CC recipients'),
+      includeAttachments: z
+        .boolean()
+        .default(true)
+        .describe(
+          "Carry the original email's attachments into the forward (default true). Set false for a body-only forward.",
+        ),
     },
     { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     async (params) => {
