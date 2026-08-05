@@ -55,6 +55,21 @@ export default defineConfig([
       "@stylistic/eol-last": "off",
       "@stylistic/max-len": "off",
       "import-x/order": "off",
+      // Line-breaking around arrow bodies and call parens. Biome's formatter
+      // puts a multi-line arrow body on its own line and breaks long call
+      // argument lists; these three rules demand the opposite, so the two tools
+      // reformatted the same code back and forth forever — `biome check --write`
+      // and `eslint --fix` each produced a state the other rejected. Since
+      // pre-commit runs both (in parallel, with stage_fixed) but only pre-push
+      // runs the non-fixing `pnpm check`, the result was a commit that passed
+      // pre-commit and then could never be pushed. Biome owns formatting.
+      // `no-confusing-arrow` is included because it only fires on the wrapped
+      // shape biome itself produces.
+      // Note: `test/relaxed-rules` below already disabled the first two for
+      // *.test.ts, which is why only non-test sources ever hit this.
+      "@stylistic/implicit-arrow-linebreak": "off",
+      "@stylistic/function-paren-newline": "off",
+      "@stylistic/no-confusing-arrow": "off",
     },
   },
   {
