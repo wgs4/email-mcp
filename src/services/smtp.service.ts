@@ -241,7 +241,6 @@ export default class SmtpService {
     const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
 
     // Fetch attachment binaries from IMAP when requested (parallel downloads)
-    /* eslint-disable @stylistic/implicit-arrow-linebreak */
     const fetchAttachment = async (filename: string) =>
       this.imapService.downloadAttachment(
         accountName,
@@ -249,7 +248,6 @@ export default class SmtpService {
         options.mailbox ?? 'INBOX',
         filename,
       );
-    /* eslint-enable @stylistic/implicit-arrow-linebreak */
 
     const attachments: { filename: string; content: Buffer; contentType: string }[] = [];
     if (options.includeAttachments && original.attachments.length > 0) {
@@ -425,20 +423,24 @@ export default class SmtpService {
     if (filenames.length === 0) return [];
 
     const results = await Promise.allSettled(
-      filenames.map(async (filename) => this.imapService.downloadAttachment(
+      filenames.map(async (filename) =>
+        this.imapService.downloadAttachment(
           accountName,
           options.emailId,
           options.mailbox ?? 'INBOX',
           filename,
           FORWARD_ATTACHMENT_MAX_BYTES,
-        ),),
+        ),
+      ),
     );
 
-    const failures = results.flatMap((result, i) => (result.status === 'rejected'
+    const failures = results.flatMap((result, i) =>
+      result.status === 'rejected'
         ? [
             `"${filenames[i]}" (${result.reason instanceof Error ? result.reason.message : String(result.reason)})`,
           ]
-        : []),);
+        : [],
+    );
     if (failures.length > 0) {
       throw new Error(
         `Cannot forward: ${failures.length} of ${filenames.length} attachment(s) could not be fetched — ${failures.join('; ')}. ` +
@@ -446,7 +448,8 @@ export default class SmtpService {
       );
     }
 
-    return results.flatMap((result) => (result.status === 'fulfilled'
+    return results.flatMap((result) =>
+      result.status === 'fulfilled'
         ? [
             {
               filename: result.value.filename,
@@ -454,7 +457,8 @@ export default class SmtpService {
               contentType: result.value.mimeType,
             },
           ]
-        : []),);
+        : [],
+    );
   }
 
   // -------------------------------------------------------------------------
