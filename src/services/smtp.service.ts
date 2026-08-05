@@ -4,7 +4,6 @@
  * No MCP dependency — fully unit-testable.
  */
 
-import { randomUUID } from 'node:crypto';
 import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
@@ -16,44 +15,16 @@ import type ImapService from './imap.service.js';
 // Helpers (must be defined before SmtpService)
 // ---------------------------------------------------------------------------
 
+/**
+ * Per-attachment ceiling when carrying attachments across a forward. Higher
+ * than `downloadAttachment`'s 5 MB default, which exists to keep large files
+ * from being base64-streamed through an MCP tool RESPONSE — here the bytes go
+ * straight into the composed message and never reach the model.
+ */
+const FORWARD_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
+
 function isGmailAccount(account: AccountConfig): boolean {
   return account.imap.host.includes('gmail.com') || account.smtp.host.includes('gmail.com');
-}
-
-function encodeRfc2047(value: string): string {
-  if (/^[\x20-\x7E]*$/.test(value)) return value;
-  return `=?UTF-8?B?${Buffer.from(value, 'utf-8').toString('base64')}?=`;
-}
-
-function buildRawMessage(options: {
-  from: string;
-  to: string;
-  subject: string;
-  body: string;
-  cc?: string;
-  messageId: string;
-  inReplyTo?: string;
-  references?: string;
-  html?: boolean;
-}): string {
-  const lines: string[] = [];
-  lines.push(`From: ${options.from}`);
-  lines.push(`To: ${options.to}`);
-  if (options.cc) lines.push(`Cc: ${options.cc}`);
-  lines.push(`Subject: ${encodeRfc2047(options.subject)}`);
-  lines.push(`Date: ${new Date().toUTCString()}`);
-  const mid = options.messageId || `<${randomUUID()}@email-mcp.local>`;
-  lines.push(`Message-ID: ${mid}`);
-  lines.push('MIME-Version: 1.0');
-  if (options.inReplyTo) lines.push(`In-Reply-To: ${options.inReplyTo}`);
-  if (options.references) lines.push(`References: ${options.references}`);
-  const contentType = options.html ? 'text/html; charset=utf-8' : 'text/plain; charset=utf-8';
-  lines.push(`Content-Type: ${contentType}`);
-  lines.push('Content-Transfer-Encoding: 8bit');
-  lines.push('');
-  const normalizedBody = options.body.replace(/\r?\n/g, '\r\n');
-  lines.push(normalizedBody);
-  return lines.join('\r\n');
 }
 
 /**
@@ -342,6 +313,14 @@ export default class SmtpService {
   // Forward
   // -------------------------------------------------------------------------
 
+  /**
+   * Forward a message, carrying its attachments across by default.
+   *
+   * Attachment handling is deliberately STRICTER than `replyToEmail`'s opt-in,
+   * best-effort re-attach: a forward's attachments are usually the whole point
+   * of forwarding, so a fetch failure throws instead of quietly transmitting a
+   * gutted message. Pass `includeAttachments: false` for a body-only forward.
+   */
   async forwardEmail(
     accountName: string,
     options: {
@@ -350,6 +329,7 @@ export default class SmtpService {
       to: string[];
       body?: string;
       cc?: string[];
+      includeAttachments?: boolean;
     },
   ): Promise<SendResult> {
     this.checkRateLimit(accountName);
@@ -379,30 +359,102 @@ export default class SmtpService {
 
     const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
 
-    const result = await transport.sendMail({
+    const attachments = await this.fetchAttachmentsForForward(accountName, original, options);
+
+    // Compose ONCE → raw bytes: the identical bytes are transmitted via SMTP and
+    // stored in Sent. (The previous implementation sent `text` only — dropping
+    // every attachment — and stored a second, separately-built copy from an
+    // attachment-blind raw builder, so the Sent copy was lossy too.)
+    const mailOptions = {
       from: fromAddr,
       to: options.to.join(', '),
-      cc: options.cc?.join(', '),
+      cc: options.cc?.length ? options.cc.join(', ') : undefined,
       subject,
       text: fullBody,
+      ...(attachments.length > 0 ? { attachments } : {}),
+    };
+
+    const rawMessage = await new Promise<Buffer>((resolve, reject) => {
+      new MailComposer(mailOptions).compile().build((err: Error | null, buf: Buffer) => {
+        if (err) reject(err);
+        else resolve(buf);
+      });
     });
 
-    await this.appendToSentFolder(
-      accountName,
-      buildRawMessage({
-        from: fromAddr,
-        to: options.to.join(', '),
-        subject,
-        body: fullBody,
-        cc: options.cc?.join(', '),
-        messageId: result.messageId ?? '',
-      }),
-    );
+    // nodemailer cannot derive an envelope from opaque raw bytes — pass it
+    // explicitly so the RCPT TO list covers every To + Cc recipient.
+    const envelope = {
+      from: account.email,
+      to: normalizeEnvelopeRecipients([...options.to, ...(options.cc ?? [])]),
+    };
+
+    if (envelope.to.length === 0) {
+      throw new Error('Cannot forward email: no recipients (To/Cc both empty)');
+    }
+
+    const result = await transport.sendMail({ envelope, raw: rawMessage });
+
+    await this.appendToSentFolder(accountName, rawMessage);
 
     return {
       messageId: result.messageId ?? '',
       status: 'sent',
     };
+  }
+
+  /**
+   * Download the original's attachments for a forward.
+   *
+   * De-dupes by filename: `downloadAttachment` resolves a MIME part BY filename
+   * and returns the first match, so a message carrying the same filename twice
+   * would otherwise cost two fetches and attach the first part's bytes twice —
+   * possibly the wrong bytes if the same-named parts differ. One part per
+   * distinct filename, first-seen order.
+   *
+   * Throws on the first failure, naming the attachment (see `forwardEmail`).
+   */
+  private async fetchAttachmentsForForward(
+    accountName: string,
+    original: { attachments: { filename: string }[] },
+    options: { emailId: string; mailbox?: string; includeAttachments?: boolean },
+  ): Promise<{ filename: string; content: Buffer; contentType: string }[]> {
+    // Default ON — a forward that silently loses its attachments is broken.
+    if (options.includeAttachments === false) return [];
+
+    const filenames = [...new Set(original.attachments.map((meta) => meta.filename))];
+    if (filenames.length === 0) return [];
+
+    const results = await Promise.allSettled(
+      filenames.map(async (filename) => this.imapService.downloadAttachment(
+          accountName,
+          options.emailId,
+          options.mailbox ?? 'INBOX',
+          filename,
+          FORWARD_ATTACHMENT_MAX_BYTES,
+        ),),
+    );
+
+    const failures = results.flatMap((result, i) => (result.status === 'rejected'
+        ? [
+            `"${filenames[i]}" (${result.reason instanceof Error ? result.reason.message : String(result.reason)})`,
+          ]
+        : []),);
+    if (failures.length > 0) {
+      throw new Error(
+        `Cannot forward: ${failures.length} of ${filenames.length} attachment(s) could not be fetched — ${failures.join('; ')}. ` +
+          'Nothing was sent. Retry, or pass includeAttachments=false to forward the body without them.',
+      );
+    }
+
+    return results.flatMap((result) => (result.status === 'fulfilled'
+        ? [
+            {
+              filename: result.value.filename,
+              content: Buffer.from(result.value.contentBase64, 'base64'),
+              contentType: result.value.mimeType,
+            },
+          ]
+        : []),);
   }
 
   // -------------------------------------------------------------------------
