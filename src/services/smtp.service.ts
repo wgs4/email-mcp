@@ -8,6 +8,7 @@ import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import type { IConnectionManager } from '../connections/types.js';
 import type RateLimiter from '../safety/rate-limiter.js';
 import type { AccountConfig, SendResult } from '../types/index.js';
+import { refoldParamHeaders } from '../utils/mime-headers.js';
 import type { ResolvedAttachment } from './attachment-resolver.js';
 import type ImapService from './imap.service.js';
 
@@ -156,12 +157,16 @@ export default class SmtpService {
       ...(options.attachments?.length ? { attachments: options.attachments } : {}),
     };
 
-    const rawMessage = await new Promise<Buffer>((resolve, reject) => {
+    const composed = await new Promise<Buffer>((resolve, reject) => {
       new MailComposer(mailOptions).compile().build((err: Error | null, buf: Buffer) => {
         if (err) reject(err);
         else resolve(buf);
       });
     });
+
+    // Keep header folds out of quoted filenames — a filename folded mid-value
+    // makes iOS Mail drop the attachment. See refoldParamHeaders.
+    const rawMessage = refoldParamHeaders(composed);
 
     // Build the SMTP envelope explicitly — nodemailer cannot derive it from the
     // opaque raw bytes. The RCPT TO list covers every To + Cc + Bcc recipient,
@@ -283,12 +288,16 @@ export default class SmtpService {
       ...(attachments.length > 0 ? { attachments } : {}),
     };
 
-    const rawMessage = await new Promise<Buffer>((resolve, reject) => {
+    const composed = await new Promise<Buffer>((resolve, reject) => {
       new MailComposer(mailOptions).compile().build((err: Error | null, buf: Buffer) => {
         if (err) reject(err);
         else resolve(buf);
       });
     });
+
+    // Keep header folds out of quoted filenames — a filename folded mid-value
+    // makes iOS Mail drop the attachment. See refoldParamHeaders.
+    const rawMessage = refoldParamHeaders(composed);
 
     // When sending a pre-composed raw message, nodemailer cannot derive the SMTP
     // envelope from the (opaque) raw bytes — it would compute an empty recipient
@@ -372,12 +381,16 @@ export default class SmtpService {
       ...(attachments.length > 0 ? { attachments } : {}),
     };
 
-    const rawMessage = await new Promise<Buffer>((resolve, reject) => {
+    const composed = await new Promise<Buffer>((resolve, reject) => {
       new MailComposer(mailOptions).compile().build((err: Error | null, buf: Buffer) => {
         if (err) reject(err);
         else resolve(buf);
       });
     });
+
+    // Keep header folds out of quoted filenames — a filename folded mid-value
+    // makes iOS Mail drop the attachment. See refoldParamHeaders.
+    const rawMessage = refoldParamHeaders(composed);
 
     // nodemailer cannot derive an envelope from opaque raw bytes — pass it
     // explicitly so the RCPT TO list covers every To + Cc recipient.

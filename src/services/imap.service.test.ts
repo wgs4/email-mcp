@@ -1074,6 +1074,55 @@ describe('ImapService', () => {
   // appendToSent
   // -----------------------------------------------------------------------
 
+  // -----------------------------------------------------------------------
+  // saveDraft — the stored message must carry everything the user asked for
+  // -----------------------------------------------------------------------
+
+  describe('saveDraft', () => {
+    async function appendedDraft(options: Parameters<ImapService['saveDraft']>[1]) {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      await service.saveDraft('test', options);
+      const [, raw] = client.append.mock.calls[0] as [string, Buffer];
+      return raw.toString('binary');
+    }
+
+    it('keeps Bcc in the stored draft', async () => {
+      // MimeNode strips Bcc by default because a send carries it in the SMTP
+      // envelope — but a draft has no envelope, so the list would be lost and
+      // the mail would go out without the blind recipients.
+      const raw = await appendedDraft({
+        to: ['geof@example.com'],
+        subject: 'past due',
+        body: 'hello',
+        bcc: ['kayla@example.com', 'justin@example.com'],
+      });
+
+      expect(raw).toMatch(/^Bcc: .*kayla@example\.com/m);
+      expect(raw).toContain('justin@example.com');
+    });
+
+    it('never folds an attachment filename mid-value', async () => {
+      // A CRLF inside the quoted filename makes iOS Mail refuse the part
+      // ("One or more attachments failed to load") and the attachment silently
+      // vanishes from the draft.
+      const raw = await appendedDraft({
+        to: ['geof@example.com'],
+        subject: 'past due',
+        body: 'hello',
+        attachments: [
+          {
+            filename: 'Farmpedals Statement 08-07-2026.pdf',
+            content: Buffer.from('%PDF-1.4 pretend'),
+            contentType: 'application/pdf',
+          },
+        ],
+      });
+
+      expect(raw).toContain('filename="Farmpedals Statement 08-07-2026.pdf"');
+      expect(raw).not.toMatch(/filename="[^"]*\r\n/);
+    });
+  });
+
   describe('appendToSent', () => {
     it('appends message to resolved Sent folder with \\Seen flag', async () => {
       client.list.mockResolvedValue([{ name: 'Sent', path: 'Sent', specialUse: '\\Sent' }]);

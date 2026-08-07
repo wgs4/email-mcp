@@ -28,6 +28,7 @@ import type {
   SenderStat,
 } from '../types/index.js';
 import { nonEmpty, RAW_CAP } from '../utils/body-format.js';
+import { refoldParamHeaders } from '../utils/mime-headers.js';
 import type { AttachmentInput, ResolvedAttachment } from './attachment-resolver.js';
 import { resolveAttachments } from './attachment-resolver.js';
 import { assertSafeDestination, resolveUniquePath, sanitizeFilename } from './file-paths.js';
@@ -2327,12 +2328,30 @@ export default class ImapService {
       ...(hasDraftAttachments ? { attachments: options.attachments } : {}),
     };
 
-    const rawMessage = await new Promise<Buffer>((resolve, reject) => {
-      new MailComposer(mailOptions).compile().build((err: Error | null, buf: Buffer) => {
+    const composed = await new Promise<Buffer>((resolve, reject) => {
+      const message = new MailComposer(mailOptions).compile();
+
+      // MimeNode omits Bcc from the built headers by default, because a normal
+      // send carries blind recipients in the SMTP envelope instead. A DRAFT has
+      // no envelope yet, so dropping the header silently loses the Bcc list —
+      // the user only finds out when the mail goes without them. keepBcc lives
+      // on the compiled MimeNode, not on the MailComposer options (nodemailer's
+      // own stream/sendmail transports set it the same way).
+      //
+      // Blind recipients still never reach the wire: sendDraft() reads these
+      // addresses back into the SMTP envelope and strips the header from both
+      // the transmitted bytes and the Sent copy (see stripBccHeader).
+      (message as unknown as { keepBcc: boolean }).keepBcc = true;
+
+      message.build((err: Error | null, buf: Buffer) => {
         if (err) reject(err);
         else resolve(buf);
       });
     });
+
+    // Keep header folds out of quoted filenames — iOS Mail will not load an
+    // attachment whose filename is folded mid-value. See refoldParamHeaders.
+    const rawMessage = refoldParamHeaders(composed);
 
     const appendResult = await client.append(draftsPath, rawMessage, ['\\Draft', '\\Seen']);
 
