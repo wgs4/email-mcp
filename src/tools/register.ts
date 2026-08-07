@@ -24,6 +24,7 @@ import registerAttachmentTools from './attachments.tool.js';
 import registerBulkTools from './bulk.tool.js';
 import registerCalendarTools from './calendar.tool.js';
 import registerContactsTools from './contacts.tool.js';
+import registerCrossAccountCopyTool from './cross-account-copy.tool.js';
 import registerCrossAccountMoveTool from './cross-account-move.tool.js';
 import registerDraftTools from './drafts.tool.js';
 import registerEmailsTools from './emails.tool.js';
@@ -88,6 +89,7 @@ export default function registerAllTools(
     registerBulkTools(server, imapService);
     registerDraftTools(server, imapService, smtpService);
     registerCrossAccountMoveTool(server, connections, config);
+    registerCrossAccountCopyTool(server, connections, config);
     registerFolderTools(server, imapService);
     registerTemplateWriteTools(server, templateService, imapService, smtpService);
     registerSchedulerTools(server, schedulerService);

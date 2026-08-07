@@ -1929,7 +1929,7 @@ export default class ImapService {
   }
 
   // -------------------------------------------------------------------------
-  // Move / Delete
+  // Move / Copy / Delete
   // -------------------------------------------------------------------------
 
   async moveEmail(
@@ -1947,6 +1947,37 @@ export default class ImapService {
       const ok = await client.messageMove(emailId, safeDest, { uid: true });
       if (!ok) {
         throw new Error(`IMAP server rejected the move from "${safeSource}" to "${safeDest}".`);
+      }
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Same-account copy — the non-destructive sibling of moveEmail. Uses the
+   * server-side IMAP COPY, so the message is duplicated inside the account
+   * without ever leaving the server: no FETCH/APPEND round-trip, and the copy
+   * keeps the original sender, date, MIME structure and attachments verbatim.
+   * The original stays exactly where it is.
+   *
+   * Cross-account copies cannot use COPY (it is single-connection by
+   * definition) — those go through cross_account_copy's FETCH → APPEND saga.
+   */
+  async copyEmail(
+    accountName: string,
+    emailId: string,
+    sourceMailbox: string,
+    destinationMailbox: string,
+  ): Promise<void> {
+    const client = await this.connections.getImapClient(accountName);
+    const safeSource = sanitizeMailboxName(sourceMailbox);
+    const safeDest = sanitizeMailboxName(destinationMailbox);
+    await ImapService.assertRealMailbox(client, safeSource);
+    const lock = await client.getMailboxLock(safeSource);
+    try {
+      const ok = await client.messageCopy(emailId, safeDest, { uid: true });
+      if (!ok) {
+        throw new Error(`IMAP server rejected the copy from "${safeSource}" to "${safeDest}".`);
       }
     } finally {
       lock.release();
