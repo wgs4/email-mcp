@@ -687,6 +687,250 @@ describe('ImapService', () => {
   });
 
   // -----------------------------------------------------------------------
+  // PR-3 — R6 automatic recency-window fallback. A search that could not
+  // complete gets ONE narrowed retry instead of a bare failure, and the
+  // response says so out loud. The invariant under test throughout: the
+  // caller can always tell what range was actually searched.
+  // -----------------------------------------------------------------------
+
+  describe('searchEmails — R6 windowed fallback', () => {
+    function hit(uid: number, subject: string) {
+      return {
+        uid,
+        envelope: { subject, from: [{ address: 'a@x' }], to: [], date: '2024-01-01T00:00:00Z' },
+        flags: new Set<string>(),
+        bodyStructure: { type: 'text', subtype: 'plain' },
+        source: Buffer.from(''),
+      };
+    }
+
+    /** A distinct ephemeral client so we can assert which connection ran what. */
+    function primeEphemeral(uids: number[] | false) {
+      const ephemeral = createMockImapClient();
+      ephemeral.search.mockResolvedValue(uids as unknown as number[]);
+      connections.createEphemeralImapClient.mockResolvedValue(ephemeral);
+      return ephemeral;
+    }
+
+    it('R6: a failed search with no date filter retries over 90 days and returns FLAGGED partial results', async () => {
+      // Small folder ⇒ not at-risk ⇒ the original runs on the shared client.
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+      const ephemeral = primeEphemeral([7]);
+      client.fetch.mockReturnValueOnce(
+        // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+        (async function* gen() {
+          yield hit(7, 'Re: Order #29804 confirmed');
+        })(),
+      );
+
+      const result = await service.searchEmails('test', 'Order #29804', { pageSize: 10 });
+
+      // Real rows come back — the point of R6 is not to hand back a bare error.
+      expect(result.items.map((i) => i.subject)).toEqual(['Re: Order #29804 confirmed']);
+      expect(result.searchFailed).toBeUndefined();
+      // ...but they are unmistakably labelled as covering only the window.
+      expect(result.searchStatus?.kind).toBe('search_failed');
+      expect(result.searchStatus?.windowed).toEqual({ applied: true, sinceDays: 90 });
+      expect(result.totalApprox).toBe(true);
+      expect(result.warning).toMatch(/PARTIAL RESULTS/);
+      expect(result.warning).toMatch(/90-day recency window/);
+      // The retry ran isolated + bounded, never back on the shared client.
+      expect(ephemeral.search).toHaveBeenCalledTimes(1);
+      expect(client.search).toHaveBeenCalledTimes(1);
+    });
+
+    it('R6: the retry ANDs SINCE onto the ORIGINAL expression (same search, less mail)', async () => {
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+      const ephemeral = primeEphemeral([7]);
+      client.fetch.mockReturnValueOnce(
+        // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+        (async function* gen() {
+          yield hit(7, 'Hit');
+        })(),
+      );
+
+      await service.searchEmails('test', 'needle', { seen: false, pageSize: 10 });
+
+      const retryCriteria = ephemeral.search.mock.calls[0][0] as {
+        or?: unknown;
+        seen?: boolean;
+        since?: Date;
+      };
+      expect(retryCriteria.since).toBeInstanceOf(Date);
+      // Roughly 90 days back — not "today", not the epoch.
+      const daysBack = (Date.now() - (retryCriteria.since as Date).getTime()) / 86_400_000;
+      expect(daysBack).toBeGreaterThanOrEqual(90);
+      expect(daysBack).toBeLessThan(91);
+      // The original query is intact; we narrowed it, we did not replace it.
+      expect(retryCriteria.or).toEqual([
+        { subject: 'needle' },
+        { from: 'needle' },
+        { body: 'needle' },
+      ]);
+      expect(retryCriteria.seen).toBe(false);
+    });
+
+    it('R6: a windowed retry that finds NOTHING still reports the ORIGINAL failure (never total:0)', async () => {
+      // A zero-row 90-day window says nothing about the other ~78,000
+      // messages — presenting it as a clean zero would rebuild the exact
+      // silent false-negative this whole feature exists to remove.
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+      primeEphemeral([]);
+
+      const result = await service.searchEmails('test', 'Order #29804', {});
+
+      expect(result.searchFailed).toBe(true);
+      expect(result.searchStatus?.kind).toBe('search_failed');
+      expect(result.searchStatus?.windowed).toEqual({ applied: true, sinceDays: 90 });
+      expect(result.total).toBe(0);
+      expect(result.items).toEqual([]);
+      expect(result.warning).toMatch(/did not complete/i);
+      expect(result.warning).toMatch(/NOT as "no such mail"/);
+    });
+
+    it('R6: a windowed retry that ALSO fails reports the ORIGINAL failure, not the retry error', async () => {
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+      const ephemeral = createMockImapClient();
+      ephemeral.search.mockRejectedValue(new Error('ephemeral socket died'));
+      connections.createEphemeralImapClient.mockResolvedValue(ephemeral);
+
+      const result = await service.searchEmails('test', 'Order #29804', {});
+
+      expect(result.searchFailed).toBe(true);
+      // The caller is told what happened to THEIR search, not to our retry.
+      expect(result.searchStatus?.kind).toBe('search_failed');
+      expect(result.searchStatus?.windowed).toEqual({ applied: true, sinceDays: 90 });
+    });
+
+    it('R6: an already date-scoped search is NOT re-windowed (never shrink the caller range)', async () => {
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+
+      const result = await service.searchEmails('test', 'Order #29804', { since: '2024-01-01' });
+
+      expect(result.searchFailed).toBe(true);
+      expect(result.searchStatus?.windowed).toBeUndefined();
+      expect(connections.createEphemeralImapClient).not.toHaveBeenCalled();
+    });
+
+    it('R6: a connection_error is NOT retried (the socket is broken, not the query)', async () => {
+      client.search.mockRejectedValueOnce(new Error('socket hang up'));
+
+      const result = await service.searchEmails('test', 'anything', {});
+
+      expect(result.searchFailed).toBe(true);
+      expect(result.searchStatus?.kind).toBe('connection_error');
+      expect(result.searchStatus?.windowed).toBeUndefined();
+      expect(connections.createEphemeralImapClient).not.toHaveBeenCalled();
+    });
+
+    it('R6: a UID-addressed search is NOT windowed (a date AND would drop named UIDs)', async () => {
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+
+      const result = await service.searchEmails('test', '', { uids: '316401,316705' });
+
+      expect(result.searchFailed).toBe(true);
+      expect(result.searchStatus?.windowed).toBeUndefined();
+      expect(connections.createEphemeralImapClient).not.toHaveBeenCalled();
+    });
+
+    it('R6: the Gmail raw fast-path is NOT windowed (native search, different syntax)', async () => {
+      connections.getAccount.mockReturnValue({
+        name: 'test',
+        email: 'test@gmail.com',
+        username: 'test@gmail.com',
+        imap: { host: 'imap.gmail.com', port: 993, tls: true, starttls: false, verifySsl: true },
+        smtp: { host: 'smtp.gmail.com', port: 465, tls: true, starttls: false, verifySsl: true },
+      });
+      client.search.mockResolvedValueOnce(false as unknown as number[]);
+
+      const result = await service.searchEmails('test', '', { gmailRaw: 'from:green.jonadam' });
+
+      expect(result.searchFailed).toBe(true);
+      expect(result.searchStatus?.windowed).toBeUndefined();
+      expect(connections.createEphemeralImapClient).not.toHaveBeenCalled();
+    });
+
+    it('R3+R6: a bounded-wait TIMEOUT on a huge folder comes back as bounded, flagged, windowed results', async () => {
+      vi.useFakeTimers();
+      try {
+        client.mailbox = { exists: 79_000 }; // wgs-usa/INBOX.Archive scale
+        const stalled = createMockImapClient();
+        stalled.search.mockReturnValue(new Promise(() => {})); // hangs past the budget
+        const recovered = createMockImapClient();
+        recovered.search.mockResolvedValue([316705, 316401]);
+        connections.createEphemeralImapClient
+          .mockResolvedValueOnce(stalled)
+          .mockResolvedValueOnce(recovered);
+        client.fetch.mockReturnValueOnce(
+          // eslint-disable-next-line @stylistic/wrap-iife -- mirror createMockImapClient pattern
+          (async function* gen() {
+            yield hit(316705, 'Re: Order #29804 confirmed');
+          })(),
+        );
+
+        const p = service.searchEmails('test', 'Order #29804', { pageSize: 10 });
+        await vi.advanceTimersByTimeAsync(120_000);
+        const result = await p;
+
+        // Bounded: the stalled connection was torn down, not waited on.
+        expect(stalled.close).toHaveBeenCalled();
+        // Flagged partial: rows served, provenance stated.
+        expect(result.items.map((i) => i.subject)).toEqual(['Re: Order #29804 confirmed']);
+        expect(result.searchFailed).toBeUndefined();
+        expect(result.searchStatus?.kind).toBe('timeout');
+        expect(result.searchStatus?.windowed).toEqual({ applied: true, sinceDays: 90 });
+        expect(result.totalApprox).toBe(true);
+        expect(result.warning).toMatch(/PARTIAL RESULTS/);
+        expect(result.folderSize).toBe(79_000);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // R2 at the service level — `deep:false` must keep a free-text query off
+  // the body-scan path entirely, even on a folder that would otherwise be
+  // "at risk" (this is the cheap escape hatch the PRD asks for).
+  // -----------------------------------------------------------------------
+
+  describe('searchEmails — R2 deep opt-out', () => {
+    it('R2: deep:false on a huge non-FTS folder sends NO body term and stays on the shared connection', async () => {
+      client.mailbox = { exists: 79_000 };
+      client.search.mockResolvedValueOnce([]);
+
+      const result = await service.searchEmails('test', 'Order #29804', { deep: false });
+
+      const criteria = client.search.mock.calls[0][0] as { or: unknown };
+      expect(criteria.or).toEqual([
+        { subject: 'Order #29804' },
+        { from: 'Order #29804' },
+        { to: 'Order #29804' },
+      ]);
+      expect(JSON.stringify(criteria)).not.toContain('"body"');
+      // Not at-risk ⇒ no ephemeral connection, no body-scan cost warning.
+      expect(connections.createEphemeralImapClient).not.toHaveBeenCalled();
+      expect(result.warning).toBeUndefined();
+    });
+
+    it('R2: the same query WITHOUT deep:false does scan bodies (deep is the default)', async () => {
+      client.mailbox = { exists: 79_000 };
+      const ephemeral = createMockImapClient();
+      ephemeral.search.mockResolvedValue([]);
+      connections.createEphemeralImapClient.mockResolvedValue(ephemeral);
+
+      await service.searchEmails('test', 'Order #29804', {});
+
+      const criteria = ephemeral.search.mock.calls[0][0] as { or: unknown };
+      expect(criteria.or).toEqual([
+        { subject: 'Order #29804' },
+        { from: 'Order #29804' },
+        { body: 'Order #29804' },
+      ]);
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // listEmails — malformed envelope dates (regression)
   // -----------------------------------------------------------------------
 

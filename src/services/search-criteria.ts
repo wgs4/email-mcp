@@ -11,6 +11,23 @@ import { normalizeDate } from '../utils/date.js';
 
 export interface SearchParams {
   query?: string;
+  /**
+   * R2: controls how far a free-text `query` reaches.
+   *
+   * `undefined`/`true` (default) — subject + from + BODY. Deep by default is
+   * what callers expect from a "search"; PR-2 made the big-folder body scan
+   * safe (detected, warned, bounded on an isolated connection) rather than
+   * removing it, so the default is a cost question, not a correctness one.
+   *
+   * `false` — header-only (subject + from + to). The PRD's explicit cheap
+   * opt-out: no BODY term reaches the server, so the search stays a header
+   * scan even on an 80k-message non-FTS folder. Use it when you know the
+   * token is in the subject/sender and you want speed over reach.
+   *
+   * Only affects `query`. An explicit `body:`/`text:` filter always scans
+   * bodies regardless — that is its own opt-in.
+   */
+  deep?: boolean;
   to?: string;
   from?: string;
   subject?: string;
@@ -97,16 +114,28 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
   // ---------------------------------------------------------------------------
   const andConditions: Record<string, unknown>[] = [];
 
+  // Tri-state read of the R2 opt-out: only an explicit `false` turns the
+  // free-text query header-only. `undefined` keeps the deep default.
+  const deepQuery = params.deep !== false;
+
   // Free-text `query` is DEEP BY DEFAULT — subject/from/body OR (the behavior
   // users expect). The big-folder body-scan risk this used to create is now
   // handled by PR-2: a body scan over a large non-FTS folder is detected
   // (R5), warned about, and run on a bounded ephemeral connection (R3) so it
   // fails loudly/cleanly instead of silently. `bodyScan` (below) flags this
   // path for that gate.
+  //
+  // R2: `deep: false` is the explicit header-only opt-out — subject/from/to,
+  // no BODY term, so the server never leaves the header index. TO is included
+  // here (and only here) because it is the third cheap envelope field and the
+  // PRD asks for it "where cheap"; it is NOT in the deep OR, where the body
+  // term already dominates the cost.
   if (params.query && params.query.length > 0) {
     const q = sanitizeSearchQuery(params.query);
     andConditions.push({
-      or: [{ subject: q }, { from: q }, { body: q }],
+      or: deepQuery
+        ? [{ subject: q }, { from: q }, { body: q }]
+        : [{ subject: q }, { from: q }, { to: q }],
     });
   }
 
@@ -178,13 +207,17 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
     criteria = Object.assign({}, ...andConditions);
   }
 
-  // A free-text query (now body-inclusive) or an explicit body:/text: filter
+  // A deep free-text query (body-inclusive) or an explicit body:/text: filter
   // makes the server scan message bodies — the expensive/abortable case the
-  // R5 at-risk gate guards. TEXT covers headers+body, so it counts too.
+  // R5 at-risk gate guards. TEXT covers headers+body, so it counts too. A
+  // `deep: false` query emits no BODY term, so it does NOT set this flag and
+  // never takes the bounded ephemeral path — that is the whole point of the
+  // opt-out.
   // (Boolean sub-expressions: an empty string is "no value", and `||` here is
   // a true logical-OR of booleans — not a nullish-default, hence not `??`.)
   const nonEmpty = (v: string | undefined): boolean => v !== undefined && v.length > 0;
-  const bodyScan = nonEmpty(params.query) || nonEmpty(params.body) || nonEmpty(params.text);
+  const bodyScan =
+    (deepQuery && nonEmpty(params.query)) || nonEmpty(params.body) || nonEmpty(params.text);
 
   return {
     criteria,
@@ -198,6 +231,46 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
     bodyScan,
     warnings,
   };
+}
+
+// ---------------------------------------------------------------------------
+// R6 — automatic recency-window fallback
+// ---------------------------------------------------------------------------
+
+/**
+ * R6: the recency window an automatic post-failure retry narrows to.
+ *
+ * 90 days is the PRD's answer to its own open question. It is long enough to
+ * cover the realistic "where did that mail go?" lookup (the incident messages
+ * were days old) and short enough that `SEARCH SINCE <date>` prunes the
+ * candidate set hard on the folders that provoke the failure — Dovecot
+ * evaluates the internal-date term cheaply before it ever opens a body.
+ */
+export const RECENCY_WINDOW_DAYS = 90;
+
+/**
+ * True when the caller already scoped the search by date. R6 must not fire in
+ * that case: the request is already narrow, so a failure is not "too broad",
+ * and silently ANDing our own `since` on top would shrink an explicit range
+ * the caller chose — a second, quieter false-negative.
+ */
+export function hasDateNarrowing(params: SearchParams): boolean {
+  const dated = [params.since, params.before, params.on, params.sentSince, params.sentBefore];
+  return dated.some((v) => typeof v === 'string' && v.length > 0);
+}
+
+/**
+ * Return a copy of `criteria` ANDed with `SINCE <days ago>`.
+ *
+ * imapflow ANDs top-level criteria keys, so adding `since` alongside an
+ * existing `or:[…]` narrows the whole expression rather than replacing it —
+ * the windowed retry searches for the same thing, just over less mail.
+ */
+export function withRecencyWindow(
+  criteria: Record<string, unknown>,
+  days: number,
+): Record<string, unknown> {
+  return { ...criteria, since: normalizeDate(`${days}d`) };
 }
 
 /** Splits a UID list into fixed-size chunks — handy for bounded FETCH ranges. */
