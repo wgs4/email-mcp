@@ -10,6 +10,10 @@
  * be logged is a move that does not happen. `claim()` is called AFTER the
  * destination APPEND and BEFORE source cleanup, so a failed insert leaves the
  * source intact and the next run's pre-flight dedup reconciles.
+ *
+ * `logCopy()` is the deliberate exception: a copy destroys nothing, so its
+ * audit row is best-effort and every throw here is downgraded to a warning by
+ * the caller (see cross-account-mover.ts's header for the reasoning).
  */
 
 import postgres from 'postgres';
@@ -128,6 +132,39 @@ export class MoveLogRepository {
           : null;
         return { ok: false, existing };
       }
+      throw classifyConnectError(err);
+    }
+  }
+
+  /**
+   * Insert the audit row for a COPY (`operation='copy'`, migration 002).
+   *
+   * Unlike claim() this is NOT part of the operation's contract — the caller
+   * treats any throw as a warning and completes the copy regardless — so there
+   * is no 23505 branch: `uniq_move_log_msgid` is scoped to `operation='move'`
+   * precisely so copy rows can neither lose a race against, nor poison, the
+   * move dedup guard. `source_deleted` is FALSE and `source_cleanup` stays NULL
+   * because a copy never touches the source.
+   */
+  async logCopy(entry: MoveLogEntry): Promise<number> {
+    const sql = this.client();
+    try {
+      const rows = await sql<{ id: number }[]>`
+        INSERT INTO email_move_log (
+          source_account, source_mailbox, source_uid,
+          dest_account, dest_mailbox, dest_uid,
+          message_id, subject, from_addr, email_date, size_bytes,
+          manual, status, source_deleted, operation
+        ) VALUES (
+          ${entry.source_account}, ${entry.source_mailbox}, ${entry.source_uid},
+          ${entry.dest_account}, ${entry.dest_mailbox}, ${entry.dest_uid},
+          ${entry.message_id}, ${entry.subject}, ${entry.from_addr},
+          ${entry.email_date}, ${entry.size_bytes},
+          ${entry.manual}, ${entry.status}, FALSE, 'copy'
+        )
+        RETURNING id`;
+      return rows[0].id;
+    } catch (err) {
       throw classifyConnectError(err);
     }
   }

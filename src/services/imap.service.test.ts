@@ -31,6 +31,8 @@ function createMockImapClient() {
     download: vi.fn().mockResolvedValue(null),
     search: vi.fn().mockResolvedValue([]),
     messageMove: vi.fn().mockResolvedValue(true),
+    // imapflow's messageCopy resolves to a CopyResponseObject (or false).
+    messageCopy: vi.fn().mockResolvedValue({ path: 'INBOX', destination: 'Archive' }),
     messageDelete: vi.fn().mockResolvedValue(true),
     messageFlagsAdd: vi.fn().mockResolvedValue(true),
     messageFlagsRemove: vi.fn().mockResolvedValue(true),
@@ -130,6 +132,56 @@ describe('ImapService', () => {
       await service.moveEmail('test', '1', 'INBOX', 'Sent');
 
       expect(client.messageMove).toHaveBeenCalledWith('1', 'Sent', { uid: true });
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // copyEmail
+  // -----------------------------------------------------------------------
+
+  describe('copyEmail', () => {
+    it('uses the server-side IMAP COPY — no fetch/append round-trip', async () => {
+      // assertRealMailbox calls client.list() internally
+      client.list.mockResolvedValue([{ name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' }]);
+
+      await service.copyEmail('test', '42', 'INBOX', 'Archive');
+
+      expect(client.getMailboxLock).toHaveBeenCalledWith('INBOX');
+      expect(client.messageCopy).toHaveBeenCalledWith('42', 'Archive', { uid: true });
+      expect(client.fetchOne).not.toHaveBeenCalled();
+      expect(client.append).not.toHaveBeenCalled();
+      expect(client._releaseFn).toHaveBeenCalled();
+    });
+
+    it('leaves the original in place (never moves or deletes the source)', async () => {
+      client.list.mockResolvedValue([{ name: 'INBOX', path: 'INBOX', specialUse: '\\Inbox' }]);
+
+      await service.copyEmail('test', '42', 'INBOX', 'Archive');
+
+      expect(client.messageMove).not.toHaveBeenCalled();
+      expect(client.messageDelete).not.toHaveBeenCalled();
+      expect(client.messageFlagsAdd).not.toHaveBeenCalled();
+    });
+
+    it('throws when the server rejects the COPY', async () => {
+      client.list.mockResolvedValue([]);
+      client.messageCopy.mockResolvedValue(false);
+
+      await expect(service.copyEmail('test', '42', 'INBOX', 'Archive')).rejects.toThrow(
+        /rejected the copy/,
+      );
+      expect(client._releaseFn).toHaveBeenCalled();
+    });
+
+    it('refuses a virtual source folder', async () => {
+      client.list.mockResolvedValue([
+        { name: 'All Mail', path: '[Gmail]/All Mail', specialUse: '\\All' },
+      ]);
+
+      await expect(service.copyEmail('test', '42', '[Gmail]/All Mail', 'Archive')).rejects.toThrow(
+        /virtual folder/,
+      );
+      expect(client.messageCopy).not.toHaveBeenCalled();
     });
   });
 

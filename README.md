@@ -450,6 +450,14 @@ email-mcp runs without it** — if the database is unset or unreachable, only th
 routing tools are affected (they report `database_unavailable`), and the server
 boots and serves all other tools normally.
 
+`cross_account_copy` and `copy_email` are deliberately in that "everything else"
+group: a copy destroys nothing, so it is never blocked by the database. When a
+connection string is configured the copy is audit-logged best-effort (rows carry
+`operation = 'copy'`); when it is absent, unreachable, or the INSERT fails, the
+copy still completes and reports an `audit_log_skipped` warning. A move keeps the
+opposite, fail-closed rule — no audit log, no move — because it destroys the
+original.
+
 **Connection string.** Provide it one of two ways (the env var wins if both are set):
 
 ```toml

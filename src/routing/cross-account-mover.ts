@@ -1,5 +1,6 @@
 /**
- * CrossAccountMover (D15) — the cross-account move saga (D18).
+ * CrossAccountMover (D15) — the cross-account move saga (D18) and the
+ * non-destructive cross-account copy that shares its first steps.
  *
  * Transaction-script style. Source and destination are DIFFERENT accounts →
  * two independent imapflow clients → two independent mailbox locks (no
@@ -7,7 +8,7 @@
  * not applicable to the standalone tool, which acquires its own locks like
  * every other tool in the codebase).
  *
- * Atomic sequence (D18):
+ * MOVE — atomic sequence (D18):
  *   1. FETCH source: raw RFC822 + flags + INTERNALDATE + Message-ID + UIDVALIDITY
  *   2. Pre-flight dedup on destination by Message-ID
  *   3. APPEND to destination (preserve flags + INTERNALDATE), capture dest_uid
@@ -22,12 +23,31 @@
  *      proven-safe-EXPUNGE fallback needs a per-account operator assertion that
  *      is out of scope here, so we fail closed instead of risking the footgun.
  *   9. recordSourceCleanup
+ *
+ * COPY — steps 1-3 of that same sequence and nothing else:
+ *   1-3. Identical, and literally the same code (`stageAtDestination`) so the
+ *      two paths cannot drift apart: the copy lands with the original sender,
+ *      Date, MIME structure, attachments, flags and INTERNALDATE — natively
+ *      delivered, not forwarded.
+ *   4. SKIPPED. $Routed is move/routing semantics; a copy must not look routed.
+ *   5. Best-effort audit INSERT (logCopy) — see below.
+ *   6-9. DELETED. The source is never re-opened for write: no Trash move, no
+ *      \Deleted, no EXPUNGE, ever.
+ *
+ * Why the audit log is a hard requirement for a move but best-effort for a copy:
+ * the move's claim() is the only durable record that the source was destroyed,
+ * so "no audit log, no move" (D-Premise-2) is the right fail-closed posture. A
+ * copy destroys nothing, and the common configuration has no [database] section
+ * at all — refusing a non-destructive operation because Postgres is absent
+ * fails closed on something that has nothing to fail closed about. So a missing
+ * URL, an unreachable host, or a rejected INSERT produces an
+ * `audit_log_skipped` warning and the copy still reports success.
  */
 
 import type ConnectionManager from '../connections/manager.js';
 import type { ErrorKind, MoveWarning, SourceCleanup } from './error-kinds.js';
 import { ERROR_KIND, MoveError, WARNING_KIND } from './error-kinds.js';
-import type { MoveLogRepository } from './log-repository.js';
+import type { MoveLogEntry, MoveLogRepository } from './log-repository.js';
 
 export interface MoveArgs {
   sourceAccount: string;
@@ -36,6 +56,12 @@ export interface MoveArgs {
   destAccount: string;
   destMailbox: string;
 }
+
+/** Copy takes exactly the same inputs as a move; the alias reads better at call sites. */
+export type CopyArgs = MoveArgs;
+
+/** Which saga a shared step is running under. */
+export type TransferMode = 'move' | 'copy';
 
 export type MoveResult =
   | {
@@ -65,6 +91,41 @@ export type MoveResult =
       move_log_id?: number;
     };
 
+/**
+ * Same discriminated-union shape as MoveResult, minus the semantics a copy does
+ * not have. `source_cleanup` is pinned to null (there is no cleanup to report —
+ * the source is untouched by construction) and the audit-log id is nullable
+ * because the copy completes with or without it.
+ */
+export type CopyResult =
+  | {
+      success: true;
+      status: 'success' | 'duplicate_skipped';
+      source_account: string;
+      source_mailbox: string;
+      source_uid: number;
+      dest_account: string;
+      dest_mailbox: string;
+      dest_uid: number | null;
+      message_id: string | null;
+      subject: string | null;
+      from: string | null;
+      size_bytes: number | null;
+      /** Always null: a copy never touches the source. */
+      source_cleanup: null;
+      /** email_move_log id when the best-effort audit row landed; null when it did not. */
+      copy_log_id: number | null;
+      warnings: MoveWarning[];
+    }
+  | {
+      success: false;
+      error_kind: string;
+      error_message: string;
+      source_account: string;
+      source_mailbox: string;
+      source_uid: number | null;
+    };
+
 interface FetchedSource {
   raw: Buffer;
   flags: string[];
@@ -74,6 +135,13 @@ interface FetchedSource {
   from: string | null;
   sizeBytes: number | null;
   uidValidity: bigint;
+}
+
+/** What steps 1-3 produce, for either mode's tail to finish with. */
+interface StagedMessage {
+  src: FetchedSource;
+  destUid: number | null;
+  dedupHit: boolean;
 }
 
 function toDate(v: unknown): Date | undefined {
@@ -141,86 +209,16 @@ export class CrossAccountMover {
       move_log_id: moveLogId,
     });
 
-    if (!Number.isInteger(uid) || uid <= 0) {
-      return fail(ERROR_KIND.INVALID_EMAIL_ID, `email_id "${emailId}" is not a positive integer`);
-    }
-    const accounts = new Set(this.connections.getAccountNames());
-    if (!accounts.has(sourceAccount)) {
-      return fail(ERROR_KIND.SOURCE_NOT_FOUND, `source account "${sourceAccount}" not configured`);
-    }
-    if (!accounts.has(destAccount)) {
-      return fail(
-        ERROR_KIND.DEST_ACCOUNT_INVALID,
-        `destination account "${destAccount}" not configured`,
-      );
-    }
-    if (sourceAccount === destAccount) {
-      return fail(
-        ERROR_KIND.SAME_ACCOUNT_MOVE,
-        'source and destination are the same account — use move_email instead',
-      );
+    const invalid = this.validateArgs(args, uid, 'move');
+    if (invalid) {
+      return fail(invalid.kind, invalid.message);
     }
 
     const warnings: MoveWarning[] = [];
 
     try {
-      // 1. FETCH source.
-      const src = await this.fetchSource(sourceAccount, sourceMailbox, uid);
-
-      // 2-4. Destination work: dedup, APPEND, $Routed.
-      const destClient = await this.connections.getImapClient(destAccount);
-      let destUid: number | null = null;
-      let dedupHit = false;
-      const destLock = await destClient.getMailboxLock(destMailbox);
-      try {
-        if (src.messageId) {
-          const found = await destClient.search(
-            { header: { 'message-id': src.messageId } },
-            { uid: true },
-          );
-          if (found && found.length > 0) {
-            dedupHit = true;
-            [destUid] = found;
-          }
-        }
-        if (!dedupHit) {
-          const appended = await destClient.append(
-            destMailbox,
-            src.raw,
-            src.flags,
-            src.internalDate,
-          );
-          if (appended === false || typeof appended.uid !== 'number') {
-            throw new MoveError(
-              ERROR_KIND.APPEND_FAILED,
-              'destination APPEND failed or returned no UID',
-            );
-          }
-          destUid = appended.uid;
-          // 4. $Routed keyword, capability-gated on PERMANENTFLAGS.
-          const mb = destClient.mailbox;
-          const permFlags = mb && mb.permanentFlags ? mb.permanentFlags : new Set<string>();
-          if (permFlags.has('\\*') || permFlags.has('$Routed')) {
-            await destClient
-              .messageFlagsAdd(String(destUid), ['$Routed'], { uid: true })
-              .catch(() => {
-                warnings.push({
-                  kind: WARNING_KIND.FLAG_NOT_SET,
-                  message: '$Routed STORE failed on destination',
-                });
-              });
-          } else {
-            warnings.push({
-              kind: WARNING_KIND.FLAG_NOT_SET,
-              message: 'destination PERMANENTFLAGS does not accept custom keywords',
-            });
-          }
-        }
-      } catch (err) {
-        throw classifyImapError(err, ERROR_KIND.APPEND_FAILED);
-      } finally {
-        destLock.release();
-      }
+      // 1-4. FETCH source, dedup, APPEND, $Routed.
+      const { src, destUid, dedupHit } = await this.stageAtDestination(args, uid, 'move', warnings);
 
       // 5. Synchronous audit INSERT (D-Premise-2 — part of the move contract).
       // claim() throws a typed MoveError on DB-down/misconfig (→ outer catch);
@@ -310,6 +308,232 @@ export class CrossAccountMover {
         ERROR_KIND.CONNECTION_ERROR,
         `cross-account move failed: ${err instanceof Error ? err.message : String(err)}`,
       );
+    }
+  }
+
+  async copyMany(argsList: CopyArgs[]): Promise<CopyResult[]> {
+    // Sequential, per-item results — same posture as moveMany.
+    return argsList.reduce<Promise<CopyResult[]>>(async (accP, args) => {
+      const acc = await accP;
+      acc.push(await this.copyOne(args));
+      return acc;
+    }, Promise.resolve([]));
+  }
+
+  /**
+   * Steps 1-3 of the saga and nothing else. The source is opened READ-ONLY (a
+   * FETCH under a mailbox lock) and never written to: no $Routed, no Trash
+   * move, no \Deleted, no EXPUNGE. There is no post-append duplicate-discard
+   * path either — that exists only to unwind a lost DB claim race, and a copy
+   * makes no claim, so nothing at the destination is ever deleted.
+   */
+  async copyOne(args: CopyArgs): Promise<CopyResult> {
+    const { sourceAccount, sourceMailbox, emailId, destAccount, destMailbox } = args;
+    const uid = Number.parseInt(emailId, 10);
+
+    const fail = (kind: string, message: string): CopyResult => ({
+      success: false,
+      error_kind: kind,
+      error_message: message,
+      source_account: sourceAccount,
+      source_mailbox: sourceMailbox,
+      source_uid: Number.isFinite(uid) ? uid : null,
+    });
+
+    const invalid = this.validateArgs(args, uid, 'copy');
+    if (invalid) {
+      return fail(invalid.kind, invalid.message);
+    }
+
+    const warnings: MoveWarning[] = [];
+
+    try {
+      // 1-3. FETCH source, dedup, APPEND. (4. $Routed is move-only.)
+      const { src, destUid, dedupHit } = await this.stageAtDestination(args, uid, 'copy', warnings);
+
+      // 5. Best-effort audit row — never fails or blocks the copy.
+      const status: 'success' | 'duplicate_skipped' = dedupHit ? 'duplicate_skipped' : 'success';
+      const copyLogId = await this.recordCopy(
+        {
+          source_account: sourceAccount,
+          source_mailbox: sourceMailbox,
+          source_uid: uid,
+          dest_account: destAccount,
+          dest_mailbox: destMailbox,
+          dest_uid: destUid,
+          message_id: src.messageId,
+          subject: src.subject,
+          from_addr: src.from,
+          email_date: null,
+          size_bytes: src.sizeBytes,
+          status,
+          manual: true,
+        },
+        warnings,
+      );
+
+      return {
+        success: true,
+        status,
+        source_account: sourceAccount,
+        source_mailbox: sourceMailbox,
+        source_uid: uid,
+        dest_account: destAccount,
+        dest_mailbox: destMailbox,
+        dest_uid: destUid,
+        message_id: src.messageId,
+        subject: src.subject,
+        from: src.from,
+        size_bytes: src.sizeBytes,
+        source_cleanup: null,
+        copy_log_id: copyLogId,
+        warnings,
+      };
+    } catch (err) {
+      if (err instanceof MoveError) {
+        return fail(err.kind, err.message);
+      }
+      return fail(
+        ERROR_KIND.CONNECTION_ERROR,
+        `cross-account copy failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Shared input guards. Pure — never touches IMAP or Postgres. Only the
+   * same-account refusal differs between modes, and only in which sibling tool
+   * it names.
+   */
+  private validateArgs(
+    args: MoveArgs,
+    uid: number,
+    mode: TransferMode,
+  ): { kind: ErrorKind; message: string } | null {
+    const { sourceAccount, emailId, destAccount } = args;
+    if (!Number.isInteger(uid) || uid <= 0) {
+      return {
+        kind: ERROR_KIND.INVALID_EMAIL_ID,
+        message: `email_id "${emailId}" is not a positive integer`,
+      };
+    }
+    const accounts = new Set(this.connections.getAccountNames());
+    if (!accounts.has(sourceAccount)) {
+      return {
+        kind: ERROR_KIND.SOURCE_NOT_FOUND,
+        message: `source account "${sourceAccount}" not configured`,
+      };
+    }
+    if (!accounts.has(destAccount)) {
+      return {
+        kind: ERROR_KIND.DEST_ACCOUNT_INVALID,
+        message: `destination account "${destAccount}" not configured`,
+      };
+    }
+    if (sourceAccount === destAccount) {
+      return mode === 'move'
+        ? {
+            kind: ERROR_KIND.SAME_ACCOUNT_MOVE,
+            message: 'source and destination are the same account — use move_email instead',
+          }
+        : {
+            kind: ERROR_KIND.SAME_ACCOUNT_COPY,
+            message: 'source and destination are the same account — use copy_email instead',
+          };
+    }
+    return null;
+  }
+
+  /**
+   * Steps 1-4, shared by both sagas: FETCH the source (read-only), pre-flight
+   * dedup the destination by Message-ID, APPEND preserving flags +
+   * INTERNALDATE, and — for a MOVE only — STORE the $Routed keyword.
+   *
+   * Throws a typed MoveError; the caller's outer catch maps it to a result.
+   */
+  private async stageAtDestination(
+    args: MoveArgs,
+    uid: number,
+    mode: TransferMode,
+    warnings: MoveWarning[],
+  ): Promise<StagedMessage> {
+    const { sourceAccount, sourceMailbox, destAccount, destMailbox } = args;
+
+    // 1. FETCH source.
+    const src = await this.fetchSource(sourceAccount, sourceMailbox, uid);
+
+    // 2-4. Destination work: dedup, APPEND, $Routed.
+    const destClient = await this.connections.getImapClient(destAccount);
+    let destUid: number | null = null;
+    let dedupHit = false;
+    const destLock = await destClient.getMailboxLock(destMailbox);
+    try {
+      if (src.messageId) {
+        const found = await destClient.search(
+          { header: { 'message-id': src.messageId } },
+          { uid: true },
+        );
+        if (found && found.length > 0) {
+          dedupHit = true;
+          [destUid] = found;
+        }
+      }
+      if (!dedupHit) {
+        const appended = await destClient.append(destMailbox, src.raw, src.flags, src.internalDate);
+        if (appended === false || typeof appended.uid !== 'number') {
+          throw new MoveError(
+            ERROR_KIND.APPEND_FAILED,
+            'destination APPEND failed or returned no UID',
+          );
+        }
+        destUid = appended.uid;
+        // 4. $Routed keyword, capability-gated on PERMANENTFLAGS. Move only —
+        // a copy must look natively delivered, not routed.
+        if (mode === 'move') {
+          const mb = destClient.mailbox;
+          const permFlags = mb && mb.permanentFlags ? mb.permanentFlags : new Set<string>();
+          if (permFlags.has('\\*') || permFlags.has('$Routed')) {
+            await destClient
+              .messageFlagsAdd(String(destUid), ['$Routed'], { uid: true })
+              .catch(() => {
+                warnings.push({
+                  kind: WARNING_KIND.FLAG_NOT_SET,
+                  message: '$Routed STORE failed on destination',
+                });
+              });
+          } else {
+            warnings.push({
+              kind: WARNING_KIND.FLAG_NOT_SET,
+              message: 'destination PERMANENTFLAGS does not accept custom keywords',
+            });
+          }
+        }
+      }
+    } catch (err) {
+      throw classifyImapError(err, ERROR_KIND.APPEND_FAILED);
+    } finally {
+      destLock.release();
+    }
+
+    return { src, destUid, dedupHit };
+  }
+
+  /**
+   * Step 5 for a COPY: best-effort audit row. Every failure mode — no
+   * [database].url (the default install), unreachable host, un-migrated schema,
+   * rejected INSERT — becomes an audit_log_skipped warning on an otherwise
+   * successful copy. Contrast claim() in moveOne, where a move that cannot be
+   * logged must not happen at all.
+   */
+  private async recordCopy(entry: MoveLogEntry, warnings: MoveWarning[]): Promise<number | null> {
+    try {
+      return await this.logRepo.logCopy(entry);
+    } catch (err) {
+      warnings.push({
+        kind: WARNING_KIND.AUDIT_LOG_SKIPPED,
+        message: `copy completed but was not audit-logged: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      return null;
     }
   }
 

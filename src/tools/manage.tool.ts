@@ -1,5 +1,5 @@
 /**
- * MCP tools: move_email, delete_email, mark_email
+ * MCP tools: move_email, copy_email, delete_email, mark_email
  */
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -8,6 +8,26 @@ import audit from '../safety/audit.js';
 import { sanitizeMailboxName } from '../safety/validation.js';
 
 import type ImapService from '../services/imap.service.js';
+
+/**
+ * copy_email is the SAME-account tool (server-side IMAP COPY). It accepts an
+ * optional destinationAccount purely so a cross-account request is refused with
+ * a pointer at the right tool — the mirror image of how cross_account_copy
+ * refuses a same-account request. Returns the refusal text, or null when the
+ * request really is single-account.
+ */
+export function crossAccountCopyRefusal(
+  account: string,
+  destinationAccount?: string,
+): string | null {
+  if (destinationAccount && destinationAccount !== account) {
+    return (
+      `source and destination are different accounts ("${account}" → ` +
+      `"${destinationAccount}") — use cross_account_copy instead`
+    );
+  }
+  return null;
+}
 
 export default function registerManageTools(server: McpServer, imapService: ImapService): void {
   // ---------------------------------------------------------------------------
@@ -61,6 +81,72 @@ export default function registerManageTools(server: McpServer, imapService: Imap
             {
               type: 'text' as const,
               text: `Failed to move email: ${errMsg}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // copy_email
+  // ---------------------------------------------------------------------------
+  server.tool(
+    'copy_email',
+    'Copy an email into another mailbox folder WITHIN the same account, leaving ' +
+      'the original exactly where it is. Uses the server-side IMAP COPY, so the ' +
+      'copy keeps the original sender, date, MIME structure and attachments. ' +
+      'The sourceMailbox must be a real folder, not a virtual one like "All Mail". ' +
+      'To copy into a DIFFERENT account use cross_account_copy instead.',
+    {
+      account: z.string().describe('Account name from list_accounts'),
+      emailId: z.string().describe('Email ID to copy (from list_emails)'),
+      sourceMailbox: z.string().describe('Current mailbox (e.g., INBOX)'),
+      destinationMailbox: z
+        .string()
+        .describe('Target mailbox (e.g., Archive). Use list_mailboxes to see options.'),
+      destinationAccount: z
+        .string()
+        .optional()
+        .describe(
+          'Optional. Only accepted when it equals `account`; a different value is ' +
+            'refused with a pointer to cross_account_copy.',
+        ),
+    },
+    // Not idempotent: a second call appends a second copy.
+    { readOnlyHint: false, destructiveHint: false, idempotentHint: false },
+    async ({ account, emailId, sourceMailbox, destinationMailbox, destinationAccount }) => {
+      const params = { emailId, sourceMailbox, destinationMailbox, destinationAccount };
+      const refusal = crossAccountCopyRefusal(account, destinationAccount);
+      if (refusal) {
+        await audit.log('copy_email', account, params, 'error', refusal);
+        return {
+          isError: true,
+          content: [{ type: 'text' as const, text: `Failed to copy email: ${refusal}` }],
+        };
+      }
+      try {
+        const cleanSource = sanitizeMailboxName(sourceMailbox);
+        const cleanDest = sanitizeMailboxName(destinationMailbox);
+        await imapService.copyEmail(account, emailId, cleanSource, cleanDest);
+        await audit.log('copy_email', account, params, 'ok');
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `✅ Email copied from "${sourceMailbox}" to "${destinationMailbox}" (original left in place).`,
+            },
+          ],
+        };
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await audit.log('copy_email', account, params, 'error', errMsg);
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text' as const,
+              text: `Failed to copy email: ${errMsg}`,
             },
           ],
         };
