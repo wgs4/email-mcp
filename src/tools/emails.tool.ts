@@ -589,7 +589,9 @@ export default function registerEmailsTools(
   server.tool(
     'search_emails',
     'Search emails with server-side filters. Omit query (or pass an empty string) to use pure filters. ' +
-      'Free-text `query` searches subject + from + body (deep by default). On a very large folder whose ' +
+      'Free-text `query` searches subject + from + body (deep by default). Pass deep=false to make it ' +
+      'header-only (subject + from + to) — no body scan at all, which is dramatically cheaper on a huge ' +
+      'folder when you know the token is in the subject or sender. On a very large folder whose ' +
       'server has no full-text index, a body scan is expensive: it is run on a bounded connection and, ' +
       'if it cannot complete, returns an explicitly flagged failure (never a silent zero) with a cost ' +
       'warning suggesting you narrow by date (since/before/on) or subject:/from:. ' +
@@ -599,6 +601,9 @@ export default function registerEmailsTools(
       'faster native Gmail search. Results are paginated; large result sets are capped at 5000 UIDs with a warning. ' +
       'A failed or timed-out SEARCH is reported explicitly (searchFailed + a warning) and is NEVER returned as a ' +
       'silent zero-result — if you see it, narrow the query and retry; the messages may still exist. ' +
+      'If an un-dated search does not complete, it is retried automatically over the last 90 days and the ' +
+      'response is labelled PARTIAL RESULTS with searchStatus.windowed — those results cover ONLY that window, ' +
+      'so re-run with an explicit since:/before: range to search further back. ' +
       'Archive folders and osTicket-ingested mailboxes (e.g. INBOX.osTicket on support@ addresses accumulate ' +
       'tens of thousands of messages) are very large — always include a date filter (since/before/on or relative ' +
       'tokens like "30d") or narrow by subject:/from:, otherwise the search may be slow or truncated.',
@@ -612,6 +617,14 @@ export default function registerEmailsTools(
           'Search keyword across subject + from + body (deep by default; omit to use filters only). ' +
             'On a very large non-indexed folder a body scan is bounded and, if it cannot complete, ' +
             'returns a flagged failure (never a silent zero) — narrow by date or subject:/from: and retry.',
+        ),
+      deep: z
+        .boolean()
+        .optional()
+        .describe(
+          'How far `query` reaches. true/omitted = subject + from + body (default). ' +
+            'false = header-only (subject + from + to) — no BODY term is sent, so the search stays ' +
+            'cheap on huge non-indexed folders. Does not affect the explicit body:/text: filters.',
         ),
       mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
       page: z.number().int().min(1).default(1).describe('Page number'),
@@ -695,6 +708,7 @@ export default function registerEmailsTools(
           mailbox: params.mailbox,
           page: params.page,
           pageSize: params.pageSize,
+          deep: params.deep,
           to: params.to,
           from: params.from,
           subject: params.subject,
@@ -765,7 +779,11 @@ export default function registerEmailsTools(
     'Search emails across multiple accounts in parallel. Same filter set as search_emails ' +
       'but fans out across N accounts and merges results sorted by date. Each result is tagged ' +
       'with the account it came from. Partial failures are surfaced as warnings without failing ' +
-      'the whole call. Useful for "find X anywhere in my inboxes" queries across your email ecosystem.',
+      'the whole call — an account whose SEARCH did not complete is reported as a LOUD per-account ' +
+      'warning and contributes no results, never a silent zero. An un-dated search that does not ' +
+      'complete is retried automatically over the last 90 days; the warning for that account then ' +
+      'reads PARTIAL RESULTS and its rows cover only that window. Pass deep=false for a cheap header-only ' +
+      'free-text query. Useful for "find X anywhere in my inboxes" queries across your email ecosystem.',
     {
       query: z
         .string()
@@ -775,6 +793,14 @@ export default function registerEmailsTools(
           'Search keyword across subject + from + body (deep by default; omit to use filters only). ' +
             'On a very large non-indexed folder a body scan is bounded and, if it cannot complete, ' +
             'returns a flagged failure (never a silent zero) — narrow by date or subject:/from: and retry.',
+        ),
+      deep: z
+        .boolean()
+        .optional()
+        .describe(
+          'How far `query` reaches. true/omitted = subject + from + body (default). ' +
+            'false = header-only (subject + from + to) — no BODY term is sent, so the search stays ' +
+            'cheap on huge non-indexed folders. Does not affect the explicit body:/text: filters.',
         ),
       accounts: z
         .array(z.string())
@@ -847,6 +873,7 @@ export default function registerEmailsTools(
           mailbox: params.mailbox,
           page: params.page,
           pageSize: params.pageSize,
+          deep: params.deep,
           to: params.to,
           from: params.from,
           subject: params.subject,

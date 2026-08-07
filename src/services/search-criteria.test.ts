@@ -1,4 +1,10 @@
-import { buildSearchCriteria, chunkUids } from './search-criteria.js';
+import {
+  buildSearchCriteria,
+  chunkUids,
+  hasDateNarrowing,
+  RECENCY_WINDOW_DAYS,
+  withRecencyWindow,
+} from './search-criteria.js';
 
 describe('buildSearchCriteria', () => {
   describe('empty / defaults', () => {
@@ -273,6 +279,112 @@ describe('buildSearchCriteria — PR 2 post-filter extensions', () => {
       attachmentMimetype: 'application/pdf',
       facets: ['sender'],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R2 — the explicit body-search opt-out. `deep:false` must emit NO body term,
+// which is what keeps a free-text query off the pathological scan path on a
+// huge non-FTS folder (the whole cost half of the false-negative incident).
+// ---------------------------------------------------------------------------
+
+describe('buildSearchCriteria — R2 deep opt-out', () => {
+  it('deep:false makes a free-text query header-only (subject/from/to), no body term', () => {
+    const result = buildSearchCriteria({ query: 'Order #29804', deep: false }, { isGmail: false });
+
+    expect(result.criteria).toEqual({
+      or: [{ subject: 'Order #29804' }, { from: 'Order #29804' }, { to: 'Order #29804' }],
+    });
+    // The load-bearing assertion: nothing in the compiled criteria asks the
+    // server to open a message body.
+    expect(JSON.stringify(result.criteria)).not.toContain('"body"');
+  });
+
+  it('deep:false clears bodyScan, so the R5 at-risk/ephemeral gate does not engage', () => {
+    expect(
+      buildSearchCriteria({ query: 'invoice', deep: false }, { isGmail: false }).bodyScan,
+    ).toBe(false);
+  });
+
+  it('deep:true is the same as omitting it — body search is opt-out, not opt-in', () => {
+    const explicit = buildSearchCriteria({ query: 'invoice', deep: true }, { isGmail: false });
+    const implicit = buildSearchCriteria({ query: 'invoice' }, { isGmail: false });
+
+    expect(explicit.criteria).toEqual(implicit.criteria);
+    expect(explicit.criteria).toEqual({
+      or: [{ subject: 'invoice' }, { from: 'invoice' }, { body: 'invoice' }],
+    });
+    expect(explicit.bodyScan).toBe(true);
+  });
+
+  it('deep:false does NOT disarm an explicit body:/text: filter (that is its own opt-in)', () => {
+    const withBody = buildSearchCriteria(
+      { query: 'refund', body: 'wire transfer', deep: false },
+      { isGmail: false },
+    );
+    expect(withBody.criteria).toEqual({
+      or: [{ subject: 'refund' }, { from: 'refund' }, { to: 'refund' }],
+      body: 'wire transfer',
+    });
+    expect(withBody.bodyScan).toBe(true);
+
+    const withText = buildSearchCriteria({ text: 'anything', deep: false }, { isGmail: false });
+    expect(withText.bodyScan).toBe(true);
+  });
+
+  it('deep:false alongside a to: filter keeps both — the OR term and the AND term', () => {
+    const result = buildSearchCriteria(
+      { query: 'adam', to: 'support@wgsusa.com', deep: false },
+      { isGmail: false },
+    );
+    expect(result.criteria).toEqual({
+      or: [{ subject: 'adam' }, { from: 'adam' }, { to: 'adam' }],
+      to: 'support@wgsusa.com',
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R6 — recency-window helpers
+// ---------------------------------------------------------------------------
+
+describe('R6 recency-window helpers', () => {
+  it('the fallback window is 90 days', () => {
+    expect(RECENCY_WINDOW_DAYS).toBe(90);
+  });
+
+  it('hasDateNarrowing is true for any of since/before/on/sentSince/sentBefore', () => {
+    expect(hasDateNarrowing({ since: '30d' })).toBe(true);
+    expect(hasDateNarrowing({ before: '2024-01-01' })).toBe(true);
+    expect(hasDateNarrowing({ on: 'yesterday' })).toBe(true);
+    expect(hasDateNarrowing({ sentSince: '7d' })).toBe(true);
+    expect(hasDateNarrowing({ sentBefore: '7d' })).toBe(true);
+  });
+
+  it('hasDateNarrowing is false with no dates, and treats "" as no value', () => {
+    expect(hasDateNarrowing({ query: 'invoice', from: 'a@b.com' })).toBe(false);
+    expect(hasDateNarrowing({})).toBe(false);
+    expect(hasDateNarrowing({ since: '' })).toBe(false);
+  });
+
+  it('withRecencyWindow ANDs a since date onto the existing criteria without replacing it', () => {
+    const base = { or: [{ subject: 'x' }, { from: 'x' }, { body: 'x' }], seen: false };
+    const windowed = withRecencyWindow(base, RECENCY_WINDOW_DAYS) as {
+      or: unknown;
+      seen: boolean;
+      since: Date;
+    };
+
+    // Original expression preserved — the retry searches the same thing.
+    expect(windowed.or).toEqual(base.or);
+    expect(windowed.seen).toBe(false);
+    expect(windowed.since).toBeInstanceOf(Date);
+    // ~90 days ago at UTC midnight (so between 90 and 91 days back).
+    const diff = Date.now() - windowed.since.getTime();
+    expect(diff).toBeGreaterThanOrEqual(90 * 24 * 60 * 60 * 1000);
+    expect(diff).toBeLessThan(91 * 24 * 60 * 60 * 1000);
+    // Non-mutating — the caller keeps the un-windowed criteria.
+    expect(base).not.toHaveProperty('since');
   });
 });
 

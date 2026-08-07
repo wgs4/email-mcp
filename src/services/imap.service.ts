@@ -36,7 +36,13 @@ import { detectLabelStrategy } from './label-strategy.js';
 import type { MailboxRef } from './mailbox-resolver.js';
 import { resolveMailboxForAccount } from './mailbox-resolver.js';
 import type { SearchParams } from './search-criteria.js';
-import { buildSearchCriteria, chunkUids } from './search-criteria.js';
+import {
+  buildSearchCriteria,
+  chunkUids,
+  hasDateNarrowing,
+  RECENCY_WINDOW_DAYS,
+  withRecencyWindow,
+} from './search-criteria.js';
 import {
   connectionErrorStatus,
   SearchFailedError,
@@ -96,6 +102,8 @@ export interface SearchOptions {
   mailbox?: string;
   page?: number;
   pageSize?: number;
+  /** R2: `false` = header-only free-text query (see `SearchParams.deep`). */
+  deep?: boolean;
   to?: string;
   from?: string;
   subject?: string;
@@ -613,6 +621,22 @@ export default class ImapService {
     } catch (err) {
       return { ok: false, status: connectionErrorStatus(err) };
     }
+  }
+
+  /**
+   * R6: is this failure worth one automatic narrowed retry?
+   *
+   * `search_failed` (imapflow's swallowed `false` — a server NO on an
+   * expensive query, or a socket timeout) and `timeout` (our own bounded-wait
+   * expiry) both mean "too much work for this folder", which is exactly what
+   * a recency window fixes.
+   *
+   * `connection_error` deliberately does NOT retry: the socket is already
+   * broken, so a retry burns a fresh connection to re-learn the same thing,
+   * and the fix the caller needs is "reconnect", not "search less mail".
+   */
+  private static isWindowRetryable(status: SearchStatus): boolean {
+    return status.kind === 'search_failed' || status.kind === 'timeout';
   }
 
   /**
@@ -1153,6 +1177,8 @@ export default class ImapService {
       mailbox?: string;
       page?: number;
       pageSize?: number;
+      /** R2: `false` = header-only free-text query (see `SearchParams.deep`). */
+      deep?: boolean;
       // Legacy (unchanged) filters — camelCase:
       to?: string;
       hasAttachment?: boolean;
@@ -1203,9 +1229,10 @@ export default class ImapService {
     };
     try {
       const params: SearchParams = { ...(options as SearchParams), query };
-      const { criteria, postFilters, warnings, bodyScan } = buildSearchCriteria(params, {
-        isGmail,
-      });
+      const { criteria, postFilters, warnings, bodyScan, gmailRawUsed } = buildSearchCriteria(
+        params,
+        { isGmail },
+      );
 
       // R5/R8: folder size is FREE under the lock (no STATUS round-trip). A
       // body scan over a large folder on a server with no full-text index is
@@ -1239,6 +1266,67 @@ export default class ImapService {
         searchOutcome = await ImapService.runSearch(client, criteria);
       }
 
+      // -----------------------------------------------------------------
+      // R6: automatic recency-window fallback
+      // -----------------------------------------------------------------
+      // A search that could not complete is a "too much mail" signal, not an
+      // answer. Rather than hand the caller a bare failure, retry ONCE
+      // narrowed to the last RECENCY_WINDOW_DAYS days and label the response
+      // as windowed. Preconditions, each load-bearing:
+      //   - the failure is a work-volume failure (see `isWindowRetryable`);
+      //   - the caller did not already scope by date (`hasDateNarrowing`) —
+      //     otherwise we would silently shrink THEIR range;
+      //   - the search is not UID-addressed (already maximally narrow, and a
+      //     date AND would drop UIDs the caller explicitly named);
+      //   - not the Gmail raw fast-path (native, fast, different syntax).
+      // The retry always runs on a bounded ephemeral connection: we have just
+      // seen this search misbehave, and the shared client must not be put
+      // back under it (D3) or left able to hang the request (R3).
+      let windowedStatus: SearchStatus | undefined;
+      if (
+        !searchOutcome.ok &&
+        !gmailRawUsed &&
+        ImapService.isWindowRetryable(searchOutcome.status) &&
+        !hasDateNarrowing(params) &&
+        params.uids === undefined
+      ) {
+        const originalStatus = searchOutcome.status;
+        const windowed = { applied: true, sinceDays: RECENCY_WINDOW_DAYS } as const;
+        // D3(b): never hold the shared mailbox lock across the retry either.
+        releaseLock();
+        const retry = await ImapService.runSearchEphemeral(
+          this.connections,
+          accountName,
+          mailbox,
+          withRecencyWindow(criteria, RECENCY_WINDOW_DAYS),
+          EPHEMERAL_SEARCH_TIMEOUT_MS,
+        );
+        if (retry.ok && retry.uids.length > 0) {
+          // Partial success. Loud, explicit, and never mistakable for a
+          // complete answer: the caller is told the range that WAS searched.
+          warnings.push(
+            `PARTIAL RESULTS — the full-range search did not complete (${originalStatus.kind}); ` +
+              `automatically retried with a ${RECENCY_WINDOW_DAYS}-day recency window and ` +
+              'these results come from that window only. Matches older than ' +
+              `${RECENCY_WINDOW_DAYS} days are NOT included — re-run with an explicit ` +
+              'since:/before: range (or narrow by subject:/from:) to search further back.',
+          );
+          searchOutcome = retry;
+          windowedStatus = { ...originalStatus, windowed };
+        } else {
+          // The windowed retry found nothing usable. Report the ORIGINAL
+          // failure: a zero-row result over 90 days says nothing about the
+          // other 78,000 messages, so presenting it as `total: 0` would
+          // rebuild the exact silent zero this whole feature removes.
+          warnings.push(
+            `A ${RECENCY_WINDOW_DAYS}-day windowed retry was attempted automatically and did ` +
+              'not produce results either — treat this as "search did not complete", NOT as ' +
+              '"no such mail".',
+          );
+          searchOutcome = { ok: false, status: { ...originalStatus, windowed } };
+        }
+      }
+
       if (!searchOutcome.ok) {
         // R1/R4: a failed SEARCH must never read as a clean zero. Surface the
         // structured status AND fold it into `warning` so it always reaches
@@ -1261,15 +1349,20 @@ export default class ImapService {
         };
       }
 
-      // The at-risk path released the shared lock for the slow SEARCH;
-      // re-acquire it for the cheap page FETCH / facet scan below (identical
-      // to the non-at-risk path from here on).
+      // The at-risk path — and the R6 windowed retry — released the shared
+      // lock for the slow SEARCH; re-acquire it for the cheap page FETCH /
+      // facet scan below (identical to the non-at-risk path from here on).
       if (!activeLock) {
         activeLock = await client.getMailboxLock(mailbox);
       }
 
       let uids: number[] = searchOutcome.uids;
-      let totalApprox = false;
+      // R6: a windowed result covers a slice of the folder, so `total` counts
+      // that slice — approximate by construction, independent of the UID cap.
+      let totalApprox = windowedStatus !== undefined;
+      // R6: carried on every success return below so the windowed label
+      // travels with the results, not only with failures.
+      const windowedFields = windowedStatus ? { searchStatus: windowedStatus } : {};
 
       if (uids.length > MAX_SEARCH_UIDS) {
         const originalCount = uids.length;
@@ -1292,6 +1385,7 @@ export default class ImapService {
           ...(warning ? { warning } : {}),
           ...(totalApprox ? { totalApprox } : {}),
           ...(folderSize !== undefined ? { folderSize } : {}),
+          ...windowedFields,
         };
       }
 
@@ -1325,6 +1419,7 @@ export default class ImapService {
           ...(totalApprox ? { totalApprox } : {}),
           ...(facets ? { facets } : {}),
           ...(folderSize !== undefined ? { folderSize } : {}),
+          ...windowedFields,
         };
       }
 
@@ -1397,6 +1492,7 @@ export default class ImapService {
         ...(totalApprox ? { totalApprox } : {}),
         ...(facets ? { facets } : {}),
         ...(folderSize !== undefined ? { folderSize } : {}),
+        ...windowedFields,
       };
     } finally {
       releaseLock();

@@ -306,7 +306,7 @@ export const SEARCH_FAIL_KIND = {
   SEARCH_FAILED: 'search_failed',
   /** `client.search()` rejected — a connection error that escaped SearchCommand. */
   CONNECTION_ERROR: 'connection_error',
-  /** Our own bounded-wait expiry on an ephemeral connection (PR-2/R3). Reserved. */
+  /** Our own bounded-wait expiry on an ephemeral connection (PR-2/R3). */
   TIMEOUT: 'timeout',
 } as const;
 
@@ -317,8 +317,15 @@ export interface SearchStatus {
   /** Human-readable explanation of what failed (never implies "zero matches"). */
   message: string;
   /**
-   * Set by the R6 windowed fallback (PR-3) when a narrowed retry was applied.
-   * Reserved here so the contract is stable across the PR sequence.
+   * Set by the R6 windowed fallback when a narrowed retry was applied.
+   *
+   * Present in BOTH outcomes of that retry, which is why it lives on the
+   * status rather than beside `searchFailed`:
+   *  - retry produced rows → `searchFailed` is UNSET, the result carries real
+   *    items, and this marks them as covering only the last `sinceDays` days;
+   *  - retry produced nothing → `searchFailed` is set with the ORIGINAL
+   *    failure (a zero-row window proves nothing about the rest of the
+   *    folder), and this records that the fallback was already tried.
    */
   windowed?: { applied: true; sinceDays: number };
   /** Actionable next step for the caller (narrow the query, retry, etc.). */
@@ -344,7 +351,12 @@ export interface PaginatedResult<T> {
    * authoritative. Always accompanied by `searchStatus` + `warning`.
    */
   searchFailed?: true;
-  /** Structured failure detail when `searchFailed` is set. */
+  /**
+   * Structured failure detail. Always present when `searchFailed` is set. Also
+   * present WITHOUT `searchFailed` on an R6 windowed partial success, where it
+   * carries the original failure plus `windowed` — the results are real but
+   * cover only the fallback window (see `SearchStatus.windowed`).
+   */
   searchStatus?: SearchStatus;
   /**
    * Message count of the opened mailbox (R8). Free under the search lock —

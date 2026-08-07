@@ -707,7 +707,11 @@ Features:
 
 > **`query` is deep by default — bounded and warned on huge folders.** Free-text `query` searches `SUBJECT` + `FROM` + `BODY`. On a server with no full-text-search (FTS) index, a `BODY` scan over a very large folder is expensive, so when the target folder is large, lacks FTS, and the search touches the body, email-mcp runs it on a **bounded, isolated connection** and attaches a **cost warning** suggesting you narrow by date (`since`/`before`/`on`) or `subject:`/`from:`. If the bounded scan can't finish it returns an explicitly flagged failure — never a silent zero. Truly fast deep search over giant folders requires enabling an FTS index on the IMAP server itself (an infrastructure change, out of scope here).
 >
+> **`deep: false` — the cheap header-only opt-out.** Pass `deep=false` and `query` becomes `SUBJECT` + `FROM` + `TO` only. No `BODY` term reaches the server, so the search stays a header scan even on an 80k-message non-FTS folder and never takes the bounded/ephemeral path. Use it whenever you know the token is in the subject or the sender. It does not affect the explicit `body:`/`text:` filters — those are their own opt-in.
+>
 > **A failed search is never a silent zero.** If an IMAP `SEARCH` fails, times out (including the bounded-scan budget), or is aborted by the server, the result is flagged explicitly (`searchFailed: true` + a `searchStatus` + a warning) instead of an indistinguishable empty result. `search_all_accounts` surfaces a failed account as a loud per-account warning, never as a clean zero participant. Treat a flagged failure as "unknown, narrow and retry" — the messages may still exist.
+>
+> **Automatic 90-day windowed retry.** If a search that carries no date filter fails to complete, email-mcp retries it once, narrowed to the last 90 days, on a bounded isolated connection. If that retry finds rows you get them — labelled `PARTIAL RESULTS` in the warning, with `searchStatus.windowed = { applied: true, sinceDays: 90 }` and `totalApprox: true`, because they cover only that window; re-run with an explicit `since:`/`before:` range to search further back. If it finds nothing, the response reports the **original** failure (a zero-row 90-day window says nothing about the rest of the folder), still flagged, never `total: 0`. A search you already date-scoped is never re-windowed, and a connection error is not retried.
 >
 > **Large folders.** Archive folders and osTicket-ingested mailboxes (e.g. `INBOX.osTicket` on `support@…` addresses, which accumulate tens of thousands of messages) are very large. The opened folder's message count is reported in the result so you can judge truncation/timeout risk; prefer a date filter (`since`/`before`/`on`) or `subject:`/`from:` there.
 
@@ -716,6 +720,7 @@ Features:
 | Tool param        | Service option  | Type             | IMAP term / behavior                                                                                  |
 |-------------------|-----------------|------------------|-------------------------------------------------------------------------------------------------------|
 | `query`           | `query`         | string           | OR across `SUBJECT` / `FROM` / `BODY` (deep by default; bounded + cost-warned on huge non-FTS folders) |
+| `deep`            | `deep`          | boolean          | `false` = header-only `query` (`SUBJECT` / `FROM` / `TO`, no `BODY` term). Default deep                |
 | `from`            | `from`          | string           | `FROM` substring                                                                                      |
 | `to`              | `to`            | string           | `TO` substring                                                                                        |
 | `cc`              | `cc`            | string           | `CC` substring                                                                                        |
