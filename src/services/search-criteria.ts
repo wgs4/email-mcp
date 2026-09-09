@@ -229,12 +229,47 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
   if (params.text) andConditions.push(expandable('text', params.text));
   if (params.body) andConditions.push(expandable('body', params.body));
 
-  // Dates
+  // Dates.
+  //
+  // [P4] A BEFORE/SENTBEFORE in the FUTURE is dropped, not passed through.
+  // Reproduced 2026-09-09 against Dovecot 2.3.21 + fts_xapian: any SEARCH
+  // carrying a future BEFORE returns no result set at all — the server answers
+  // NO — while the identical search with BEFORE <= today succeeds, and the
+  // same future BEFORE against Gmail succeeds. It is not our client and it is
+  // not the folder: it reproduced on INBOX (1,223 msgs) and INBOX.Archive
+  // (84,029), with and without a text term.
+  //
+  // Dropping is safe and is NOT a narrowing: "delivered before a future date"
+  // is the same set as "no upper bound", and dropping also keeps any
+  // future-dated message a clamp would have hidden. It cost the 2026-09-09
+  // 10:53 cash run 24 of its email searches, every one of them silently, so
+  // the caller is told when it happens.
+  const futureBefore = (raw: string, field: 'before' | 'sent_before'): Date | undefined => {
+    const d = normalizeDate(raw);
+    // Compare against the END of today: a BEFORE of today or earlier is a
+    // legitimate bound the server handles correctly.
+    const endOfToday = new Date();
+    endOfToday.setUTCHours(23, 59, 59, 999);
+    if (d.getTime() <= endOfToday.getTime()) return d;
+    warnings.push(
+      `${field} "${raw}" is in the future and was dropped: this server returns a failed ` +
+        'SEARCH for a future upper bound. Results are unbounded above, which covers the ' +
+        'same mail, so nothing is missing.',
+    );
+    return undefined;
+  };
+
   if (params.since) andConditions.push({ since: normalizeDate(params.since) });
-  if (params.before) andConditions.push({ before: normalizeDate(params.before) });
+  if (params.before) {
+    const b = futureBefore(params.before, 'before');
+    if (b) andConditions.push({ before: b });
+  }
   if (params.on) andConditions.push({ on: normalizeDate(params.on) });
   if (params.sentSince) andConditions.push({ sentSince: normalizeDate(params.sentSince) });
-  if (params.sentBefore) andConditions.push({ sentBefore: normalizeDate(params.sentBefore) });
+  if (params.sentBefore) {
+    const b = futureBefore(params.sentBefore, 'sent_before');
+    if (b) andConditions.push({ sentBefore: b });
+  }
 
   // Flags — imapflow accepts booleans and handles UN- prefixing internally
   if (params.seen !== undefined) andConditions.push({ seen: params.seen });

@@ -516,3 +516,59 @@ describe('amount queries search both spellings', () => {
     expect(r.warnings.filter((w) => w.includes('NOT expanded'))).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// [P4] Future BEFORE. Dovecot 2.3.21 + fts_xapian answers NO to any SEARCH
+// carrying a BEFORE in the future, so the search fails outright rather than
+// returning matches. Verified 2026-09-09: BEFORE <= today succeeds, the same
+// future BEFORE against Gmail succeeds, and it reproduced on a 1,223-message
+// INBOX and an 84,029-message Archive alike. It silently cost a cash-report
+// run 24 searches. Dropping the bound is not a narrowing — "before a future
+// date" and "no upper bound" select the same mail.
+// ---------------------------------------------------------------------------
+describe('a future before/sent_before is dropped, with a warning', () => {
+  const future = () => {
+    const d = new Date();
+    d.setUTCFullYear(d.getUTCFullYear() + 1);
+    return d.toISOString().slice(0, 10);
+  };
+  const past = '2020-01-01';
+
+  it('drops a future before and says so', () => {
+    const r = buildSearchCriteria(
+      { subject: 'Kemper', since: past, before: future() },
+      { isGmail: false },
+    );
+    expect(r.criteria.before).toBeUndefined();
+    expect(r.criteria.since).toBeInstanceOf(Date);
+    expect(r.warnings.join(' ')).toContain('is in the future and was dropped');
+  });
+
+  it('keeps a past before untouched and warns about nothing', () => {
+    const r = buildSearchCriteria({ subject: 'Kemper', before: past }, { isGmail: false });
+    expect(r.criteria.before).toBeInstanceOf(Date);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('keeps TODAY as a before — the bound the server handles correctly', () => {
+    const today = new Date().toISOString().slice(0, 10);
+    const r = buildSearchCriteria({ subject: 'x', before: today }, { isGmail: false });
+    expect(r.criteria.before).toBeInstanceOf(Date);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('applies the same rule to sent_before', () => {
+    const r = buildSearchCriteria({ subject: 'x', sentBefore: future() }, { isGmail: false });
+    expect(r.criteria.sentBefore).toBeUndefined();
+    expect(r.warnings.join(' ')).toContain('sent_before');
+  });
+
+  it('a dropped before still leaves a usable search, not an empty one', () => {
+    const r = buildSearchCriteria(
+      { query: 'invoice', since: past, before: future() },
+      { isGmail: false },
+    );
+    expect(r.criteria.or).toBeDefined();
+    expect(r.criteria.since).toBeInstanceOf(Date);
+  });
+});
