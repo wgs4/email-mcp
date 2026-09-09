@@ -235,7 +235,8 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
   //
   // imapflow does not send SINCE/BEFORE for these. It converts them to the
   // RFC 5032 WITHIN relative forms and sends `YOUNGER <secs>` / `OLDER <secs>`
-  // (it does this even though this server does not advertise WITHIN). A future
+  // whenever the server advertises WITHIN (RFC 5032) — this one does, but only
+  // POST-login; the pre-login greeting omits it, which is easy to misread. A future
   // date makes that age negative, imapflow clamps it to 0, and RFC 5032
   // forbids 0: Dovecot answers
   //     BAD Error in IMAP command UID SEARCH: Invalid search interval parameter
