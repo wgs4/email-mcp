@@ -518,15 +518,15 @@ describe('amount queries search both spellings', () => {
 });
 
 // ---------------------------------------------------------------------------
-// [P4] Future BEFORE. Dovecot 2.3.21 + fts_xapian answers NO to any SEARCH
-// carrying a BEFORE in the future, so the search fails outright rather than
-// returning matches. Verified 2026-09-09: BEFORE <= today succeeds, the same
-// future BEFORE against Gmail succeeds, and it reproduced on a 1,223-message
-// INBOX and an 84,029-message Archive alike. It silently cost a cash-report
-// run 24 searches. Dropping the bound is not a narrowing — "before a future
-// date" and "no upper bound" select the same mail.
+// [P4] Future since/before. imapflow converts these to the RFC 5032 relative
+// forms YOUNGER/OLDER; a future date makes the age negative, imapflow clamps
+// it to 0, and RFC 5032 forbids 0 — Dovecot answers BAD "Invalid search
+// interval parameter", which surfaces as a failed search. Captured on the
+// wire 2026-09-09: `before 2026-12-31` -> "YOUNGER 584011 OLDER 0", and
+// `since 2027-12-31` -> "YOUNGER 0". sentSince/sentBefore are sent as
+// absolute SENTSINCE/SENTBEFORE and are unaffected.
 // ---------------------------------------------------------------------------
-describe('a future before/sent_before is dropped, with a warning', () => {
+describe('a future since/before never reaches the server as a zero interval', () => {
   const future = () => {
     const d = new Date();
     d.setUTCFullYear(d.getUTCFullYear() + 1);
@@ -534,7 +534,7 @@ describe('a future before/sent_before is dropped, with a warning', () => {
   };
   const past = '2020-01-01';
 
-  it('drops a future before and says so', () => {
+  it('drops a future before and says why', () => {
     const r = buildSearchCriteria(
       { subject: 'Kemper', since: past, before: future() },
       { isGmail: false },
@@ -544,23 +544,36 @@ describe('a future before/sent_before is dropped, with a warning', () => {
     expect(r.warnings.join(' ')).toContain('is in the future and was dropped');
   });
 
+  it('clamps a future since rather than dropping it — dropping would widen to everything', () => {
+    const r = buildSearchCriteria({ subject: 'Kemper', since: future() }, { isGmail: false });
+    const since = r.criteria.since as Date;
+    expect(since).toBeInstanceOf(Date);
+    expect(since.getTime()).toBeLessThanOrEqual(Date.now() + 1000);
+    expect(r.warnings.join(' ')).toContain('clamped to now');
+  });
+
   it('keeps a past before untouched and warns about nothing', () => {
     const r = buildSearchCriteria({ subject: 'Kemper', before: past }, { isGmail: false });
     expect(r.criteria.before).toBeInstanceOf(Date);
     expect(r.warnings).toEqual([]);
   });
 
-  it('keeps TODAY as a before — the bound the server handles correctly', () => {
-    const today = new Date().toISOString().slice(0, 10);
-    const r = buildSearchCriteria({ subject: 'x', before: today }, { isGmail: false });
-    expect(r.criteria.before).toBeInstanceOf(Date);
+  it('keeps a past since untouched', () => {
+    const r = buildSearchCriteria({ subject: 'Kemper', since: past }, { isGmail: false });
+    expect(r.criteria.since).toBeInstanceOf(Date);
     expect(r.warnings).toEqual([]);
   });
 
-  it('applies the same rule to sent_before', () => {
+  it('leaves sent_before alone even in the future — it is sent as an absolute SENTBEFORE', () => {
     const r = buildSearchCriteria({ subject: 'x', sentBefore: future() }, { isGmail: false });
-    expect(r.criteria.sentBefore).toBeUndefined();
-    expect(r.warnings.join(' ')).toContain('sent_before');
+    expect(r.criteria.sentBefore).toBeInstanceOf(Date);
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('leaves sent_since alone even in the future', () => {
+    const r = buildSearchCriteria({ subject: 'x', sentSince: future() }, { isGmail: false });
+    expect(r.criteria.sentSince).toBeInstanceOf(Date);
+    expect(r.warnings).toEqual([]);
   });
 
   it('a dropped before still leaves a usable search, not an empty one', () => {

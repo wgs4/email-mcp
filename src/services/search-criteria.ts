@@ -231,45 +231,70 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
 
   // Dates.
   //
-  // [P4] A BEFORE/SENTBEFORE in the FUTURE is dropped, not passed through.
-  // Reproduced 2026-09-09 against Dovecot 2.3.21 + fts_xapian: any SEARCH
-  // carrying a future BEFORE returns no result set at all — the server answers
-  // NO — while the identical search with BEFORE <= today succeeds, and the
-  // same future BEFORE against Gmail succeeds. It is not our client and it is
-  // not the folder: it reproduced on INBOX (1,223 msgs) and INBOX.Archive
-  // (84,029), with and without a text term.
+  // [P4] `since` and `before` must never resolve to a FUTURE instant.
   //
-  // Dropping is safe and is NOT a narrowing: "delivered before a future date"
-  // is the same set as "no upper bound", and dropping also keeps any
-  // future-dated message a clamp would have hidden. It cost the 2026-09-09
-  // 10:53 cash run 24 of its email searches, every one of them silently, so
-  // the caller is told when it happens.
-  const futureBefore = (raw: string, field: 'before' | 'sent_before'): Date | undefined => {
-    const d = normalizeDate(raw);
-    // Compare against the END of today: a BEFORE of today or earlier is a
-    // legitimate bound the server handles correctly.
-    const endOfToday = new Date();
-    endOfToday.setUTCHours(23, 59, 59, 999);
-    if (d.getTime() <= endOfToday.getTime()) return d;
-    warnings.push(
-      `${field} "${raw}" is in the future and was dropped: this server returns a failed ` +
-        'SEARCH for a future upper bound. Results are unbounded above, which covers the ' +
-        'same mail, so nothing is missing.',
-    );
-    return undefined;
-  };
+  // imapflow does not send SINCE/BEFORE for these. It converts them to the
+  // RFC 5032 WITHIN relative forms and sends `YOUNGER <secs>` / `OLDER <secs>`
+  // (it does this even though this server does not advertise WITHIN). A future
+  // date makes that age negative, imapflow clamps it to 0, and RFC 5032
+  // forbids 0: Dovecot answers
+  //     BAD Error in IMAP command UID SEARCH: Invalid search interval parameter
+  // imapflow's SearchCommand turns any BAD into a non-array `false`, which we
+  // correctly report as "SEARCH did not complete" — so a caller sees an
+  // infrastructure failure for what is really a malformed argument we sent.
+  //
+  // Captured on the wire 2026-09-09 against wgs-usa INBOX:
+  //     before 2026-12-31 -> A UID SEARCH YOUNGER 584011 OLDER 0 SUBJECT Kemper  -> BAD
+  //     since  2027-12-31 -> A UID SEARCH YOUNGER 0 SUBJECT Kemper               -> BAD
+  //     OLDER 0 / YOUNGER 0 alone                                                -> BAD
+  //     OLDER 1 alone                                                            -> OK, 1240 hits
+  // It cost the 2026-09-09 10:53 cash run 24 searches, each reported to the
+  // agent as "coverage incomplete" rather than as a bad query.
+  //
+  // sentSince/sentBefore are NOT affected: imapflow sends those as absolute
+  // SENTSINCE/SENTBEFORE, which take a future date happily (verified), so they
+  // are passed through untouched.
+  const nowMs = Date.now();
 
-  if (params.since) andConditions.push({ since: normalizeDate(params.since) });
-  if (params.before) {
-    const b = futureBefore(params.before, 'before');
-    if (b) andConditions.push({ before: b });
+  if (params.since) {
+    const d = normalizeDate(params.since);
+    if (d.getTime() > nowMs) {
+      // Cannot be dropped: "delivered on or after a future date" legitimately
+      // matches nothing, and dropping it would silently WIDEN the search to
+      // everything. Clamping to exactly `now` is not enough either — an age of
+      // zero seconds still emits YOUNGER 0, the very thing Dovecot rejects. Back
+      // it off by a second so the interval is >= 1: that matches only mail
+      // delivered in the last second, i.e. effectively the empty set the caller
+      // asked for, and it can never fail the query.
+      warnings.push(
+        `since "${params.since}" is in the future; clamped to now. A future lower bound ` +
+          'matches no delivered mail, so expect zero results — this is not a failure.',
+      );
+      andConditions.push({ since: new Date(nowMs - 1000) });
+    } else {
+      andConditions.push({ since: d });
+    }
   }
+
+  if (params.before) {
+    const d = normalizeDate(params.before);
+    if (d.getTime() > nowMs) {
+      // Safe to drop, and not a narrowing: "delivered before a future instant"
+      // selects the same mail as no upper bound at all, and dropping also keeps
+      // any future-dated message that clamping would have hidden.
+      warnings.push(
+        `before "${params.before}" is in the future and was dropped; results are unbounded ` +
+          'above, which covers the same mail. Sending it would have produced an invalid ' +
+          'relative search interval and failed the query outright.',
+      );
+    } else {
+      andConditions.push({ before: d });
+    }
+  }
+
   if (params.on) andConditions.push({ on: normalizeDate(params.on) });
   if (params.sentSince) andConditions.push({ sentSince: normalizeDate(params.sentSince) });
-  if (params.sentBefore) {
-    const b = futureBefore(params.sentBefore, 'sent_before');
-    if (b) andConditions.push({ sentBefore: b });
-  }
+  if (params.sentBefore) andConditions.push({ sentBefore: normalizeDate(params.sentBefore) });
 
   // Flags — imapflow accepts booleans and handles UN- prefixing internally
   if (params.seen !== undefined) andConditions.push({ seen: params.seen });
