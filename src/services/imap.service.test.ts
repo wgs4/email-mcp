@@ -530,16 +530,27 @@ describe('ImapService', () => {
       expect(result.folderSize).toBe(50_000);
     });
 
-    it('R5: an FTS-capable server is NOT at-risk — shared path, no cost warning', async () => {
+    // [P3] Was: "an FTS-capable server is NOT at-risk — shared path, no cost
+    // warning". The shared-path half is now deliberately gone. Believing an
+    // index exists is not the same as that FOLDER's index being built: WGS ran
+    // Dovecot with fts_xapian configured while an 84,029-message Archive was
+    // still unindexed, and such a folder silently degrades to a brute-force
+    // scan. Taking the shared client into that has no ceiling and can hang
+    // every other request. Isolation costs one connection and ~0s of latency,
+    // so it is now unconditional for large body scans. What FTS still changes
+    // is what we TELL the caller.
+    it('R5/[P3]: an FTS-capable server stays isolated, but is reported as INDEXED', async () => {
       client.mailbox = { exists: 50_000 };
       client.capabilities = new Map([['SEARCH=FUZZY', true]]);
-      client.search.mockResolvedValueOnce([]);
+      const ephemeral = createMockImapClient();
+      ephemeral.search.mockResolvedValue([]);
+      connections.createEphemeralImapClient.mockResolvedValue(ephemeral);
 
       const result = await service.searchEmails('test', 'invoice', {});
 
-      expect(result.warning).toBeUndefined();
-      expect(client.search).toHaveBeenCalled();
-      expect(connections.createEphemeralImapClient).not.toHaveBeenCalled();
+      expect(result.warning).toContain('with a server-side full-text index');
+      expect(result.warning).not.toContain('with no server-side full-text index');
+      expect(connections.createEphemeralImapClient).toHaveBeenCalled();
     });
 
     it('R5: a header-only query on a huge folder is NOT at-risk (no body scan)', async () => {
@@ -659,10 +670,12 @@ describe('ImapService', () => {
       // reconnect). A poisoned cache would keep treating it as no-FTS.
       client.capabilities = new Map([['SEARCH=FUZZY', true]]);
       client.search.mockResolvedValueOnce([]);
-      await service.searchEmails('test', 'invoice', {});
+      const second = await service.searchEmails('test', 'invoice', {});
 
-      // FTS now detected → shared path, NO new ephemeral connection.
-      expect(connections.createEphemeralImapClient.mock.calls.length).toBe(afterFirst);
+      // [P3] Detection is now observable in the REPORTED text rather than in
+      // the connection choice (large body scans are always isolated). A
+      // poisoned cache would still say "no server-side full-text index" here.
+      expect(second.warning).toContain('with a server-side full-text index');
     });
 
     it('R3/D3 [P2]: a search resolving AFTER the timeout — no unhandled rejection, conn closed', async () => {

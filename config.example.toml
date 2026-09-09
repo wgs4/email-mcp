@@ -21,6 +21,15 @@ rate_limit = 10
 # a plain folder, not the paper airplane one.
 #
 # Fix: always set sent_folder = "INBOX.Sent Messages" for cPanel accounts.
+
+# Set true if this account's IMAP server maintains a full-text index for message
+# bodies. REQUIRED for Dovecot: the fts / fts_xapian plugins index bodies but
+# advertise NO IMAP capability for it, so autodetection (which looks for
+# SEARCH=FUZZY, RFC 6203) cannot see them and every body search on a large
+# folder is reported as unindexed. Set false to force the unindexed reading.
+# Omit to autodetect. Large body scans run on a bounded isolated connection
+# either way; this only changes what is reported to the caller.
+# has_fts = true
 # See docs/troubleshooting-sent-folder.md for full details.
 # ============================================================
 

@@ -653,10 +653,53 @@ export default class ImapService {
     return undefined;
   }
 
+  /**
+   * [P3] Operator-declared FTS for an account, or undefined to autodetect.
+   *
+   * Two sources, config first: the account's `hasFts` field, then the
+   * `EMAIL_MCP_FTS_ACCOUNTS` environment variable (comma-separated account
+   * names) as an escape hatch for deployments that cannot edit config. Env
+   * membership can only turn FTS ON; it never overrides an explicit
+   * `hasFts: false`, so a deliberate opt-out cannot be undone by accident.
+   */
+  private declaredFts(accountName: string): boolean | undefined {
+    let configured: boolean | undefined;
+    try {
+      configured = this.connections.getAccount(accountName)?.hasFts;
+    } catch {
+      // Unknown account here is not this function's problem — the caller is
+      // already holding a live client for it. Fall through to the env list.
+      configured = undefined;
+    }
+    if (configured !== undefined) return configured;
+
+    const raw = process.env.EMAIL_MCP_FTS_ACCOUNTS;
+    if (!raw) return undefined;
+    const listed = raw
+      .split(',')
+      .map((n) => n.trim())
+      .filter((n) => n.length > 0);
+    return listed.includes(accountName) ? true : undefined;
+  }
+
   /** R5: memoized per-account FTS capability (see `ftsByAccount`). */
   private accountHasFts(accountName: string, client: ImapFlow): boolean {
     const cached = this.ftsByAccount.get(accountName);
     if (cached !== undefined) return cached;
+
+    // [P3] Explicit configuration wins over autodetection, in BOTH directions,
+    // and is definitive enough to memoize immediately. This exists because
+    // capability sniffing cannot work on the most common self-hosted setup:
+    // Dovecot's fts/fts_xapian plugins index message bodies but advertise
+    // nothing in CAPABILITY, so `SEARCH=FUZZY` is absent even when a working
+    // index answers a 17k-message body search in 0.154s. Without this, such an
+    // account is permanently reported as having no index.
+    const declared = this.declaredFts(accountName);
+    if (declared !== undefined) {
+      this.ftsByAccount.set(accountName, declared);
+      return declared;
+    }
+
     const caps = (client as { capabilities?: unknown }).capabilities;
     // [P2] Only memoize a DEFINITIVE reading. If capabilities aren't
     // populated yet (not a Map, or an empty Map — pre-connect / pre-CAPABILITY
@@ -1241,18 +1284,31 @@ export default class ImapService {
       // connection so it fails loudly/cleanly instead of silently (R3/D3),
       // and tell the caller how to make it fast.
       const folderSize = ImapService.readMailboxSize(client);
-      const atRisk =
-        bodyScan &&
-        folderSize !== undefined &&
-        folderSize > LARGE_FOLDER_THRESHOLD &&
-        !this.accountHasFts(accountName, client);
+      const largeBodyScan =
+        bodyScan && folderSize !== undefined && folderSize > LARGE_FOLDER_THRESHOLD;
+      const indexed = largeBodyScan && this.accountHasFts(accountName, client);
 
+      // [P3] The bounded isolated connection is a SAFETY measure, and it is
+      // now applied to every large body scan — indexed or not. It was
+      // previously skipped whenever we believed an index existed, which put
+      // the shared client under an unbounded scan on exactly the wrong bet: a
+      // server can be configured for FTS while a given folder's index is still
+      // being built, and that folder then falls back to a brute-force scan
+      // with no ceiling. Isolation costs one connection and no measurable
+      // latency (an indexed 17k-message body search returns in ~0.15s), so it
+      // is not worth trading away. What the FTS reading changes is what we
+      // TELL the caller, which is the part that was wrong.
       let searchOutcome: { ok: true; uids: number[] } | { ok: false; status: SearchStatus };
-      if (atRisk) {
+      if (largeBodyScan) {
         warnings.push(
-          `Large folder (${folderSize} messages) with no server-side full-text index — ` +
-            'a full-body search is slow. Running it on a bounded isolated connection; ' +
-            'narrow with a date filter (since/before/on) or subject:/from: to make it fast.',
+          indexed
+            ? `Large folder (${folderSize} messages) with a server-side full-text index — ` +
+                'body search is served from the index and should be fast. If it is ' +
+                "slow or fails, that folder's index is probably still building; " +
+                'narrow with a date filter (since/before/on) or subject:/from:.'
+            : `Large folder (${folderSize} messages) with no server-side full-text index — ` +
+                'a full-body search is slow. Running it on a bounded isolated connection; ' +
+                'narrow with a date filter (since/before/on) or subject:/from: to make it fast.',
         );
         // D3(b): never hold the shared mailbox lock across the slow scan.
         releaseLock();

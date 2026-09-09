@@ -71,6 +71,22 @@ export interface AccountConfig {
   sentFolder?: string;
   saveToSent?: boolean;
   gmailAutoSave?: boolean;
+  /**
+   * Declare that this account's server maintains a full-text index for body
+   * searches. REQUIRED for Dovecot: the fts / fts_xapian plugins index bodies
+   * but advertise NO IMAP capability for it (verified against Dovecot 2.3.21 +
+   * fts_xapian, whose CAPABILITY is `IMAP4rev1 SASL-IR LOGIN-REFERRALS ID
+   * ENABLE IDLE LITERAL+ AUTH=...` — no `SEARCH=FUZZY`), so autodetection
+   * cannot see it and every body search is reported as unindexed.
+   *
+   * Set `false` to force the unindexed reading even on a server that does
+   * advertise `SEARCH=FUZZY`. Leave unset for autodetection.
+   *
+   * This only affects what we REPORT and how we advise the caller. Large body
+   * scans run on a bounded isolated connection either way — see the body-scan
+   * block in `imap.service.ts`.
+   */
+  hasFts?: boolean;
 }
 
 export interface WatcherConfig {

@@ -55,6 +55,10 @@ export const AccountConfigSchema = z
     sent_folder: z.string().optional(),
     save_to_sent: z.boolean().optional(),
     gmail_auto_save: z.boolean().optional(),
+    // Declare a server-side full-text index. Dovecot's fts/fts_xapian plugins
+    // index bodies but advertise no IMAP capability for it, so autodetection
+    // cannot see them and every body search is reported as unindexed.
+    has_fts: z.boolean().optional(),
   })
   .refine((data) => data.password ?? data.oauth2, {
     message: 'Either password or oauth2 config is required',

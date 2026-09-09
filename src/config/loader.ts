@@ -189,6 +189,7 @@ function normalizeAccount(raw: RawAccountConfig): AccountConfig {
     sentFolder: raw.sent_folder,
     saveToSent: raw.save_to_sent,
     gmailAutoSave: raw.gmail_auto_save,
+    hasFts: raw.has_fts,
   };
 }
 
