@@ -81,6 +81,48 @@ export interface BuildResult {
   warnings: string[];
 }
 
+/**
+ * Money amounts vs. Dovecot fts-xapian tokenisation. Measured by the WGS
+ * mail-server team on 2026-09-09 against real mail, index and raw scan
+ * side by side:
+ *
+ *   - a digits-only term ("2950") is a SUBSTRING match inside tokens that
+ *     carry no thousands separator: it finds 2950, $2950.00, 12950 — but
+ *     never "2,950", because the comma splits that token;
+ *   - a term containing "," or "." ("2,950", "1463.84") is matched as a whole
+ *     token or prefix: "2,950" finds 2,950 and $2,950.00 but not 2950, and
+ *     "1463.84" does NOT find "1,463.84".
+ *
+ * So either spelling on its own silently misses mail written the other way,
+ * and the caller has no way to know which way the sender wrote it. For any
+ * amount whose integer part has four or more digits — the only case where a
+ * thousands separator can appear — we search BOTH the grouped form and the
+ * plain digits, decimals dropped ("1,463" and "1463" both also match the .84
+ * forms). Under 1,000 there is nothing to expand and the term is left alone.
+ *
+ * A 4+-digit non-money number (a PO or order number) gets the same treatment;
+ * the extra grouped variant is a harmless OR term and the plain-digits term
+ * still matches exactly as it always did.
+ */
+const AMOUNT_RE = /^\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?$/;
+
+export function amountVariants(term: string): [grouped: string, digits: string] | undefined {
+  const m = AMOUNT_RE.exec(term.trim());
+  if (!m) return undefined;
+  const digits = m[1].replace(/,/g, '').replace(/^0+(?=\d)/, '');
+  if (digits.length < 4) return undefined;
+  const grouped = digits.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+  return [grouped, digits];
+}
+
+function amountNote(term: string, [grouped, digits]: [string, string]): string {
+  return (
+    `Amount "${term}" searched as "${grouped}" OR "${digits}": the full-text index ` +
+    'treats a comma or dot as part of the word and matches plain digits as a substring, ' +
+    'so either spelling alone misses mail written the other way.'
+  );
+}
+
 export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boolean }): BuildResult {
   const warnings: string[] = [];
 
@@ -130,23 +172,62 @@ export function buildSearchCriteria(params: SearchParams, opts: { isGmail: boole
   // here (and only here) because it is the third cheap envelope field and the
   // PRD asks for it "where cheap"; it is NOT in the deep OR, where the body
   // term already dominates the cost.
+  // Whether the single top-level `or` slot is taken by the free-text query.
+  // Conditions are merged with Object.assign, so a second `or` would silently
+  // overwrite the first — see the explicit-filter expansion below.
+  let orSlotUsed = false;
   if (params.query && params.query.length > 0) {
     const q = sanitizeSearchQuery(params.query);
-    andConditions.push({
-      or: deepQuery
-        ? [{ subject: q }, { from: q }, { body: q }]
-        : [{ subject: q }, { from: q }, { to: q }],
-    });
+    const amt = amountVariants(q);
+    if (amt) {
+      // An amount lives in a subject or a body, never in a sender or
+      // recipient, so FROM/TO drop out and both spellings go in their place.
+      warnings.push(amountNote(q, amt));
+      const subject = amt.map((v) => ({ subject: v }));
+      andConditions.push({
+        or: deepQuery ? [...subject, ...amt.map((v) => ({ body: v }))] : subject,
+      });
+    } else {
+      andConditions.push({
+        or: deepQuery
+          ? [{ subject: q }, { from: q }, { body: q }]
+          : [{ subject: q }, { from: q }, { to: q }],
+      });
+    }
+    orSlotUsed = true;
   }
+
+  // Explicit subject:/body:/text: filters get the same amount expansion, but
+  // only while the `or` slot is free (imapflow criteria are a flat object and
+  // hold ONE `or`). With a free-text query present the filter is passed through
+  // unexpanded and the caller is told, rather than silently losing one of them.
+  const expandable = (
+    field: 'subject' | 'body' | 'text',
+    value: string,
+  ): Record<string, unknown> => {
+    const amt = amountVariants(value);
+    if (!amt) return { [field]: value };
+    if (orSlotUsed) {
+      warnings.push(
+        `${field}: "${value}" looks like an amount but was NOT expanded to both spellings ` +
+          'because the free-text query already occupies the OR clause; put the amount in ' +
+          'query instead, or search each spelling separately.',
+      );
+      return { [field]: value };
+    }
+    orSlotUsed = true;
+    warnings.push(amountNote(value, amt));
+    return { or: amt.map((v) => ({ [field]: v })) };
+  };
 
   // Simple passthrough string fields
   if (params.to) andConditions.push({ to: params.to });
   if (params.from) andConditions.push({ from: params.from });
-  if (params.subject) andConditions.push({ subject: params.subject });
+  if (params.subject) andConditions.push(expandable('subject', params.subject));
   if (params.cc) andConditions.push({ cc: params.cc });
   if (params.bcc) andConditions.push({ bcc: params.bcc });
-  if (params.text) andConditions.push({ text: params.text });
-  if (params.body) andConditions.push({ body: params.body });
+  if (params.text) andConditions.push(expandable('text', params.text));
+  if (params.body) andConditions.push(expandable('body', params.body));
 
   // Dates
   if (params.since) andConditions.push({ since: normalizeDate(params.since) });

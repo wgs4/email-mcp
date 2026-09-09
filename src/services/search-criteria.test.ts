@@ -1,4 +1,5 @@
 import {
+  amountVariants,
   buildSearchCriteria,
   chunkUids,
   hasDateNarrowing,
@@ -399,5 +400,119 @@ describe('chunkUids', () => {
 
   it('chunk larger than input returns single chunk', () => {
     expect(chunkUids([1, 2, 3], 100)).toEqual([[1, 2, 3]]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Amount expansion. Measured fts-xapian behaviour (WGS mail-server team,
+// 2026-09-09): "2950" substring-matches tokens without a separator and never
+// finds "2,950"; "2,950" / "1463.84" match as whole tokens and never find
+// "2950" / "1,463.84". One spelling alone silently misses the other, so both
+// go into the OR. Under 1,000 nothing can be grouped, so nothing is expanded.
+// ---------------------------------------------------------------------------
+describe('amountVariants', () => {
+  it.each([
+    ['2950', ['2,950', '2950']],
+    ['2,950', ['2,950', '2950']],
+    ['$2,950.00', ['2,950', '2950']],
+    ['1463.84', ['1,463', '1463']],
+    ['1,463.84', ['1,463', '1463']],
+    ['2950000', ['2,950,000', '2950000']],
+    ['  $ 12345 ', ['12,345', '12345']],
+    ['0012345', ['12,345', '12345']],
+  ])('%s -> %j', (term, want) => {
+    expect(amountVariants(term)).toEqual(want);
+  });
+
+  it.each([
+    ['48.20'],
+    ['950'],
+    ['$999.99'],
+    ['invoice'],
+    ['Order #29804'],
+    ['12,95'],
+    ['-2950'],
+    ['2950 USD'],
+  ])('%s is left alone', (term) => {
+    expect(amountVariants(term)).toBeUndefined();
+  });
+});
+
+describe('amount queries search both spellings', () => {
+  it('deep query "1463.84" ORs subject+body for "1,463" and "1463", no FROM, no raw term', () => {
+    const r = buildSearchCriteria({ query: '1463.84' }, { isGmail: false });
+    expect(r.criteria).toEqual({
+      or: [{ subject: '1,463' }, { subject: '1463' }, { body: '1,463' }, { body: '1463' }],
+    });
+    expect(r.bodyScan).toBe(true);
+    expect(r.warnings).toHaveLength(1);
+    expect(r.warnings[0]).toContain('"1463.84" searched as "1,463" OR "1463"');
+  });
+
+  it('header-only (deep:false) amount query keeps to SUBJECT, both spellings, no BODY', () => {
+    const r = buildSearchCriteria({ query: '2,950', deep: false }, { isGmail: false });
+    expect(r.criteria).toEqual({ or: [{ subject: '2,950' }, { subject: '2950' }] });
+    expect(r.bodyScan).toBe(false);
+  });
+
+  it('date bounds still AND around the expanded OR', () => {
+    const r = buildSearchCriteria(
+      { query: '$2,950.00', since: '2026-08-28', before: '2026-09-04' },
+      { isGmail: false },
+    );
+    expect(r.criteria.or).toEqual([
+      { subject: '2,950' },
+      { subject: '2950' },
+      { body: '2,950' },
+      { body: '2950' },
+    ]);
+    expect(r.criteria.since).toBeInstanceOf(Date);
+    expect(r.criteria.before).toBeInstanceOf(Date);
+  });
+
+  it('a non-amount query keeps the classic subject/from/body shape and no note', () => {
+    const r = buildSearchCriteria({ query: 'invoice' }, { isGmail: false });
+    expect(r.criteria).toEqual({
+      or: [{ subject: 'invoice' }, { from: 'invoice' }, { body: 'invoice' }],
+    });
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('an amount under 1,000 is not expanded', () => {
+    const r = buildSearchCriteria({ query: '48.20' }, { isGmail: false });
+    expect(r.criteria).toEqual({
+      or: [{ subject: '48.20' }, { from: '48.20' }, { body: '48.20' }],
+    });
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('explicit body: amount is expanded when no query holds the OR slot', () => {
+    const r = buildSearchCriteria({ body: '1,463.84' }, { isGmail: false });
+    expect(r.criteria).toEqual({ or: [{ body: '1,463' }, { body: '1463' }] });
+    expect(r.bodyScan).toBe(true);
+  });
+
+  it('explicit subject: amount is expanded the same way', () => {
+    const r = buildSearchCriteria({ subject: '2950' }, { isGmail: false });
+    expect(r.criteria).toEqual({ or: [{ subject: '2,950' }, { subject: '2950' }] });
+  });
+
+  it('query + body: amount — the query wins the OR slot, body passes through with a note', () => {
+    const r = buildSearchCriteria({ query: 'refund', body: '2950' }, { isGmail: false });
+    // one flat `or` only (Object.assign would silently drop a second one)
+    expect(r.criteria).toEqual({
+      or: [{ subject: 'refund' }, { from: 'refund' }, { body: 'refund' }],
+      body: '2950',
+    });
+    expect(r.warnings.join(' ')).toContain('NOT expanded');
+  });
+
+  it('two explicit amount filters — first takes the OR slot, second passes through with a note', () => {
+    const r = buildSearchCriteria({ subject: '2950', body: '1463.84' }, { isGmail: false });
+    expect(r.criteria).toEqual({
+      or: [{ subject: '2,950' }, { subject: '2950' }],
+      body: '1463.84',
+    });
+    expect(r.warnings.filter((w) => w.includes('NOT expanded'))).toHaveLength(1);
   });
 });
