@@ -212,6 +212,7 @@ async function runHttpServer(port: number): Promise<void> {
   const schedulerService = new SchedulerService(smtpService, imapService);
   const watcherService = new WatcherService(config.settings.watcher, config.accounts);
   const hooksService = new HooksService(config.settings.hooks, imapService);
+  const searchPresetRegistry = new SearchPresetRegistry(config.searches);
 
   // Per-session factory: tools share service instances but each MCP session
   // needs its own McpServer because the SDK binds one transport per server.
@@ -231,6 +232,7 @@ async function runHttpServer(port: number): Promise<void> {
       schedulerService,
       watcherService,
       hooksService,
+      searchPresetRegistry,
     );
     registerAllResources(server, connections, imapService, templateService, schedulerService);
     registerAllPrompts(server);
