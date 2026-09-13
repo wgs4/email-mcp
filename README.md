@@ -306,6 +306,73 @@ For MCP client configuration (e.g. Claude Desktop):
 </details>
 
 <details>
+<summary><strong>Docker (HTTP mode via supergateway)</strong></summary>
+
+The server itself is stdio-only. To expose it as Streamable HTTP, use the
+`codefuturist/email-mcp:http` image, which wraps the stdio server with
+[supergateway](https://github.com/supercorp-ai/supergateway):
+
+```bash
+# Run the HTTP transport image
+docker run --rm -i -p 127.0.0.1:8080:8080 \
+  -v ~/.config/email-mcp:/home/node/.config/email-mcp:ro \
+  ghcr.io/codefuturist/email-mcp:http
+```
+
+The MCP endpoint is exposed at `http://127.0.0.1:8080/mcp` and a health check
+is available at `http://127.0.0.1:8080/health`.
+
+With Docker Compose:
+
+```bash
+# stdio mode
+docker compose --profile stdio up
+
+# Streamable HTTP mode
+docker compose --profile http up
+```
+
+> **Note:** SSE is not supported — this setup uses Streamable HTTP.
+</details>
+
+<details>
+<summary><strong>Docker Compose override (Tailscale / remote binding)</strong></summary>
+
+Docker Compose auto-merges `docker-compose.override.yml` with the base
+`docker-compose.yml`, so you can rebind the HTTP port to a Tailscale IP
+(or any other interface) without editing the tracked compose file.
+
+Create `docker-compose.override.yml` next to `docker-compose.yml`:
+
+```yaml
+# Bind the HTTP sidecar to a Tailscale IP so it is reachable across the tailnet.
+services:
+  email-mcp-http:
+    ports:
+      - "100.64.0.1:15002:8080"   # <tailscale-ip>:<host-port>:<container-port>
+```
+
+Then start as usual — the override is picked up automatically:
+
+```bash
+docker compose --profile http up -d
+```
+
+The container now listens on both bindings (base + override):
+- `127.0.0.1:8080` (from the base file)
+- `100.64.0.1:15002` (from the override)
+
+Health and MCP endpoints are reachable on either:
+
+```bash
+curl http://100.64.0.1:15002/health   # → ok
+```
+
+> **Tip:** Add `docker-compose.override.yml` to your `.gitignore` so the
+> override stays machine-local and never leaks into a PR.
+</details>
+
+<details>
 <summary><strong>Single-account via environment variables (no config file needed)</strong></summary>
 
 ```json

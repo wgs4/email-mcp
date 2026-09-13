@@ -340,7 +340,8 @@ $RECYCLE.BIN/
 package-lock.json
 yarn.lock
 
-# Local-only operational docs for the server-side scheduled triage job.
-# Contains business email addresses, staff names, vendor domains, and mail
-# server detail — kept out of this public repo.
-scheduled task - skills/
+# Local planning directories and compose overrides
+.hermes/
+.sisyphus/
+docker-compose.override.yml
+
