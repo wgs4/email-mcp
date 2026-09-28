@@ -13,6 +13,7 @@
  *   bodyText / bodyHtml (trimmed-non-empty?)
  *        │
  *        ├─ have text or html ──► format=full     → text ?? html
+ *        │                        format=html     → html ?? text (raw HTML part)
  *        │                        format=text     → text ?? stripHtml(html)
  *        │                        format=stripped → stripReplyChain(above)
  *        │
@@ -30,7 +31,7 @@
  * stage that produced `""` used to win over a real HTML alternative.
  */
 
-export type BodyFormat = 'full' | 'text' | 'stripped';
+export type BodyFormat = 'full' | 'text' | 'stripped' | 'html';
 
 /**
  * Hard safety cap (bytes/chars) on the raw RFC822 fallback. A multipart
@@ -119,6 +120,9 @@ function capRaw(raw: string): string {
  *             raw RFC822 source — never a silent empty string.
  * - text:     plain text (bodyText, else HTML stripped to text).
  * - stripped: like text, but also removes quoted reply chains/signatures.
+ * - html:     the raw HTML part, unmodified (else the text part). For callers
+ *             that must store the original HTML, e.g. the UPS ACH archive's
+ *             html_blob.
  */
 export function applyBodyFormat(src: BodySource, format: BodyFormat, maxLength?: number): string {
   const text = nonEmpty(src.bodyText);
@@ -128,6 +132,8 @@ export function applyBodyFormat(src: BodySource, format: BodyFormat, maxLength?:
   if (text || html) {
     if (format === 'full') {
       body = text ?? html ?? '';
+    } else if (format === 'html') {
+      body = html ?? text ?? '';
     } else {
       const base = text ?? (html ? stripHtml(html) : '');
       body = format === 'stripped' ? stripReplyChain(base) : base;

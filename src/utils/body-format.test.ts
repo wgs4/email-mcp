@@ -46,6 +46,15 @@ describe('applyBodyFormat', () => {
     expect(applyBodyFormat(src, 'stripped')).toBe('reply body');
   });
 
+  it('html returns the raw HTML part unmodified, preferring it over text', () => {
+    const html = '<table><tr><td>$2,147.32</td></tr></table>';
+    expect(applyBodyFormat({ bodyText: 'plain', bodyHtml: html }, 'html')).toBe(html);
+  });
+
+  it('html falls back to text when there is no HTML part', () => {
+    expect(applyBodyFormat({ bodyText: 'plain only', bodyHtml: '  ' }, 'html')).toBe('plain only');
+  });
+
   it('nothing decodable → visible marker for every format (never silent)', () => {
     const src = { bodyWarning: 'MIME parse error: boom' };
     expect(applyBodyFormat(src, 'full')).toBe('⚠️ body extraction failed: MIME parse error: boom');
