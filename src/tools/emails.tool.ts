@@ -374,10 +374,10 @@ export default function registerEmailsTools(
       emailId: z.string().describe('Email ID from list_emails or search_emails'),
       mailbox: z.string().default('INBOX').describe('Mailbox path (default: INBOX)'),
       format: z
-        .enum(['full', 'text', 'stripped'])
+        .enum(['full', 'text', 'stripped', 'html'])
         .default('full')
         .describe(
-          'Body format: full=full decoded body — text preferred, else HTML; falls back to a visible marker + capped raw RFC822 source if nothing is decodable (default). text=plain text (strips HTML). stripped=plain text without quoted replies or signatures.',
+          'Body format: full=full decoded body — text preferred, else HTML; falls back to a visible marker + capped raw RFC822 source if nothing is decodable (default). text=plain text (strips HTML). stripped=plain text without quoted replies or signatures. html=the raw HTML part unmodified (else the text part) — use when the original HTML must be stored.',
         ),
       maxLength: z
         .number()
