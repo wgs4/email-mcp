@@ -75,6 +75,25 @@ describe('CrossAccountMover guards', () => {
     }
   });
 
+  it('rejects a ticketNumber that is not 3-10 digits', async () => {
+    const r = await mover.moveOne({ ...base, ticketNumber: '12a' });
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      expect(r.error_kind).toBe(ERROR_KIND.INVALID_TICKET_NUMBER);
+    }
+  });
+
+  it('rejects a ticketNumber outside the 3-10 digit length', async () => {
+    const tooShort = await mover.moveOne({ ...base, ticketNumber: '12' });
+    const tooLong = await mover.moveOne({ ...base, ticketNumber: '12345678901' });
+    expect(tooShort.success).toBe(false);
+    expect(tooLong.success).toBe(false);
+    if (!tooShort.success && !tooLong.success) {
+      expect(tooShort.error_kind).toBe(ERROR_KIND.INVALID_TICKET_NUMBER);
+      expect(tooLong.error_kind).toBe(ERROR_KIND.INVALID_TICKET_NUMBER);
+    }
+  });
+
   it('moveMany returns one result per input, preserving order', async () => {
     const results = await mover.moveMany([
       { ...base, emailId: 'x' },

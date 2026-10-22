@@ -37,6 +37,10 @@ export const ERROR_KIND = {
   SOURCE_CLEANUP_UNSAFE: 'source_cleanup_unsafe',
   /** Source account has no SPECIAL-USE \Trash mailbox to MOVE into (D18). */
   TRASH_MAILBOX_NOT_FOUND: 'trash_mailbox_not_found',
+  /** ticketNumber is not a 3–10 digit osTicket ticket number. */
+  INVALID_TICKET_NUMBER: 'invalid_ticket_number',
+  /** Subject already carries a different osTicket tag — that mail belongs elsewhere. */
+  TICKET_TAG_CONFLICT: 'ticket_tag_conflict',
 } as const;
 
 export type ErrorKind = (typeof ERROR_KIND)[keyof typeof ERROR_KIND];

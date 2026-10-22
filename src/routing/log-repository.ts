@@ -34,6 +34,10 @@ export interface MoveLogEntry {
   size_bytes: number | null;
   status: 'success' | 'failed' | 'duplicate_skipped' | 'not_found';
   manual: boolean;
+  /** TRUE when the Subject was rewritten to carry an osTicket tag (migration 003). */
+  subject_rewritten?: boolean;
+  /** The osTicket ticket number appended to the Subject, if requested (migration 003). */
+  ticket_tag?: string | null;
 }
 
 export interface ExistingMove {
@@ -111,13 +115,14 @@ export class MoveLogRepository {
           source_account, source_mailbox, source_uid,
           dest_account, dest_mailbox, dest_uid,
           message_id, subject, from_addr, email_date, size_bytes,
-          manual, status, source_deleted
+          manual, status, source_deleted, subject_rewritten, ticket_tag
         ) VALUES (
           ${entry.source_account}, ${entry.source_mailbox}, ${entry.source_uid},
           ${entry.dest_account}, ${entry.dest_mailbox}, ${entry.dest_uid},
           ${entry.message_id}, ${entry.subject}, ${entry.from_addr},
           ${entry.email_date}, ${entry.size_bytes},
-          ${entry.manual}, ${entry.status}, FALSE
+          ${entry.manual}, ${entry.status}, FALSE,
+          ${entry.subject_rewritten ?? false}, ${entry.ticket_tag ?? null}
         )
         RETURNING id`;
       return { ok: true, id: rows[0].id };

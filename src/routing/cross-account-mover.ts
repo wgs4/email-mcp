@@ -10,6 +10,9 @@
  *
  * MOVE — atomic sequence (D18):
  *   1. FETCH source: raw RFC822 + flags + INTERNALDATE + Message-ID + UIDVALIDITY
+ *   1a. Optional: tag the top-level Subject with the caller's osTicket ticket
+ *      number (`[#N]`) — pure rewrite, see subject-tag.ts. A subject already
+ *      tagged for a different ticket aborts the move before anything is sent.
  *   2. Pre-flight dedup on destination by Message-ID
  *   3. APPEND to destination (preserve flags + INTERNALDATE), capture dest_uid
  *   4. STORE $Routed on dest if PERMANENTFLAGS allows (else warn)
@@ -48,6 +51,7 @@ import type ConnectionManager from '../connections/manager.js';
 import type { ErrorKind, MoveWarning, SourceCleanup } from './error-kinds.js';
 import { ERROR_KIND, MoveError, WARNING_KIND } from './error-kinds.js';
 import type { MoveLogEntry, MoveLogRepository } from './log-repository.js';
+import { tagSubject } from './subject-tag.js';
 
 export interface MoveArgs {
   sourceAccount: string;
@@ -55,6 +59,12 @@ export interface MoveArgs {
   emailId: string;
   destAccount: string;
   destMailbox: string;
+  /**
+   * Optional osTicket ticket number. When set, the top-level Subject is tagged
+   * with `[#N]` before APPEND so osTicket threads the message onto that ticket
+   * instead of opening a new one.
+   */
+  ticketNumber?: string;
 }
 
 /** Copy takes exactly the same inputs as a move; the alias reads better at call sites. */
@@ -79,6 +89,10 @@ export type MoveResult =
       size_bytes: number | null;
       source_cleanup: SourceCleanup;
       move_log_id: number;
+      /** TRUE when this move changed the Subject before APPEND. */
+      subject_rewritten: boolean;
+      /** osTicket ticket number requested for this move, if any. */
+      ticket_tag: string | null;
       warnings: MoveWarning[];
     }
   | {
@@ -142,6 +156,8 @@ interface StagedMessage {
   src: FetchedSource;
   destUid: number | null;
   dedupHit: boolean;
+  subjectRewritten: boolean;
+  ticketTag: string | null;
 }
 
 function toDate(v: unknown): Date | undefined {
@@ -218,7 +234,12 @@ export class CrossAccountMover {
 
     try {
       // 1-4. FETCH source, dedup, APPEND, $Routed.
-      const { src, destUid, dedupHit } = await this.stageAtDestination(args, uid, 'move', warnings);
+      const { src, destUid, dedupHit, subjectRewritten, ticketTag } = await this.stageAtDestination(
+        args,
+        uid,
+        'move',
+        warnings,
+      );
 
       // 5. Synchronous audit INSERT (D-Premise-2 — part of the move contract).
       // claim() throws a typed MoveError on DB-down/misconfig (→ outer catch);
@@ -238,6 +259,8 @@ export class CrossAccountMover {
         size_bytes: src.sizeBytes,
         status,
         manual: true,
+        subject_rewritten: !dedupHit && subjectRewritten,
+        ticket_tag: ticketTag,
       });
       if (!claimed.ok) {
         // A concurrent move won the race after our pre-flight dedup passed.
@@ -266,6 +289,8 @@ export class CrossAccountMover {
           size_bytes: src.sizeBytes,
           source_cleanup: 'skipped_unsafe',
           move_log_id: claimed.existing.id,
+          subject_rewritten: false,
+          ticket_tag: ticketTag,
           warnings,
         };
       }
@@ -298,6 +323,8 @@ export class CrossAccountMover {
         size_bytes: src.sizeBytes,
         source_cleanup: cleanup.kind,
         move_log_id: moveLogId,
+        subject_rewritten: !dedupHit && subjectRewritten,
+        ticket_tag: ticketTag,
         warnings,
       };
     } catch (err) {
@@ -417,6 +444,12 @@ export class CrossAccountMover {
         message: `email_id "${emailId}" is not a positive integer`,
       };
     }
+    if (args.ticketNumber !== undefined && !/^\d{3,10}$/.test(args.ticketNumber)) {
+      return {
+        kind: ERROR_KIND.INVALID_TICKET_NUMBER,
+        message: `ticketNumber "${args.ticketNumber}" must be 3-10 digits`,
+      };
+    }
     const accounts = new Set(this.connections.getAccountNames());
     if (!accounts.has(sourceAccount)) {
       return {
@@ -461,6 +494,25 @@ export class CrossAccountMover {
 
     // 1. FETCH source.
     const src = await this.fetchSource(sourceAccount, sourceMailbox, uid);
+
+    // 1a. osTicket threading: rewrite ONLY the top-level Subject before dedup
+    // and APPEND. A subject already tagged for a different ticket is not ours
+    // to move — fail the message before anything is appended.
+    let subjectRewritten = false;
+    let ticketTag: string | null = null;
+    if (mode === 'move' && args.ticketNumber) {
+      const tagged = tagSubject(src.raw, args.ticketNumber);
+      if (tagged.status === 'conflict') {
+        throw new MoveError(
+          ERROR_KIND.TICKET_TAG_CONFLICT,
+          `subject already carries osTicket tag [#${tagged.existingTicket}]; refusing to add [#${args.ticketNumber}]`,
+        );
+      }
+      src.raw = tagged.raw;
+      src.subject = tagged.subject;
+      subjectRewritten = tagged.rewritten;
+      ticketTag = args.ticketNumber;
+    }
 
     // 2-4. Destination work: dedup, APPEND, $Routed.
     const destClient = await this.connections.getImapClient(destAccount);
@@ -515,7 +567,7 @@ export class CrossAccountMover {
       destLock.release();
     }
 
-    return { src, destUid, dedupHit };
+    return { src, destUid, dedupHit, subjectRewritten, ticketTag };
   }
 
   /**
