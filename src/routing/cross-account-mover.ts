@@ -10,13 +10,15 @@
  *
  * MOVE — atomic sequence (D18):
  *   1. FETCH source: raw RFC822 + flags + INTERNALDATE + Message-ID + UIDVALIDITY
- *   1a. Optional: tag the top-level Subject with the caller's osTicket ticket
- *      number (`[#N]`) — pure rewrite, see subject-tag.ts. A subject already
- *      tagged for a different ticket aborts the move before anything is sent.
- *   2. Pre-flight dedup on destination by Message-ID
+ *   1a. Optional: prepend the caller's osTicket ticket tag (`[#N]`) to the
+ *      top-level Subject — pure rewrite, see subject-tag.ts. A subject already
+ *      belonging to a different ticket aborts the move before anything lands.
+ *   2. Pre-flight dedup on destination by Message-ID (a tagged re-move also
+ *      verifies the destination copy's first osTicket token)
  *   3. APPEND to destination (preserve flags + INTERNALDATE), capture dest_uid
  *   4. STORE $Routed on dest if PERMANENTFLAGS allows (else warn)
  *   5. Synchronous audit INSERT (claim). 23505 → clean up our dup, duplicate_skipped.
+ *      For a tagged move the winner's destination Subject is verified first.
  *      Other DB failure → audit_log_insert_failed, source untouched.
  *   6. Re-verify source UIDVALIDITY unchanged
  *   7. Resolve source \Trash (SPECIAL-USE)
@@ -47,11 +49,13 @@
  * `audit_log_skipped` warning and the copy still reports success.
  */
 
+import type { ImapFlow } from 'imapflow';
+
 import type ConnectionManager from '../connections/manager.js';
 import type { ErrorKind, MoveWarning, SourceCleanup } from './error-kinds.js';
 import { ERROR_KIND, MoveError, WARNING_KIND } from './error-kinds.js';
 import type { MoveLogEntry, MoveLogRepository } from './log-repository.js';
-import { tagSubject } from './subject-tag.js';
+import { inspectSubject, tagSubject } from './subject-tag.js';
 
 export interface MoveArgs {
   sourceAccount: string;
@@ -194,6 +198,43 @@ function classifyImapError(err: unknown, fallback: ErrorKind): MoveError {
   return new MoveError(fallback, msg);
 }
 
+/**
+ * Verify that the destination copy osTicket is going to keep already resolves
+ * to the requested ticket. Reads the destination's raw Subject header and
+ * applies osTicket's own "first hash token" rule. A mismatch must never be
+ * reported as a successful dedup, because the source would then be trashed
+ * while the surviving copy still threads elsewhere (or opens a new ticket).
+ */
+async function assertDestinationTagWithClient(
+  client: ImapFlow,
+  uid: number,
+  ticketNumber: string,
+): Promise<void> {
+  const msg = await client.fetchOne(
+    String(uid),
+    { uid: true, headers: ['subject'] },
+    { uid: true },
+  );
+  const bytes = msg ? (msg.headers ?? msg.source) : undefined;
+  if (!bytes) {
+    throw new MoveError(
+      ERROR_KIND.DEDUP_TAG_MISMATCH,
+      `destination copy (uid ${uid}) could not be read to verify its osTicket tag`,
+    );
+  }
+  const inspection = inspectSubject(Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes));
+  if (
+    inspection.subjectFieldCount !== 1 ||
+    inspection.malformedEol ||
+    inspection.firstToken !== ticketNumber
+  ) {
+    throw new MoveError(
+      ERROR_KIND.DEDUP_TAG_MISMATCH,
+      `destination already has this Message-ID (uid ${uid}) but its first osTicket token is ${inspection.firstToken === null ? 'none' : `#${inspection.firstToken}`}, not [#${ticketNumber}]; refusing to remove the source`,
+    );
+  }
+}
+
 export class CrossAccountMover {
   constructor(
     private readonly connections: ConnectionManager,
@@ -233,6 +274,12 @@ export class CrossAccountMover {
     const warnings: MoveWarning[] = [];
 
     try {
+      // 0. A tagged move must be able to write its audit columns. Fail BEFORE
+      // any destination APPEND, so schema 002 never leaves an unlogged copy.
+      if (args.ticketNumber !== undefined) {
+        await this.logRepo.ensureTicketTagColumns();
+      }
+
       // 1-4. FETCH source, dedup, APPEND, $Routed.
       const { src, destUid, dedupHit, subjectRewritten, ticketTag } = await this.stageAtDestination(
         args,
@@ -273,6 +320,23 @@ export class CrossAccountMover {
             ERROR_KIND.AUDIT_LOG_INSERT_FAILED,
             'duplicate detected but winner row not found',
           );
+        }
+        if (ticketTag !== null) {
+          // The winner's copy is the one that stays. Verify ITS subject before
+          // reporting success and leaving the source for cleanup.
+          const winnerUid = await this.resolveWinnerUid(
+            destAccount,
+            destMailbox,
+            claimed.existing.dest_uid,
+            src.messageId,
+          );
+          if (winnerUid === null) {
+            throw new MoveError(
+              ERROR_KIND.DEDUP_TAG_MISMATCH,
+              'duplicate detected but the winning destination copy could not be located to verify its ticket tag',
+            );
+          }
+          await this.assertDestinationTag(destAccount, destMailbox, winnerUid, ticketTag);
         }
         return {
           success: true,
@@ -495,9 +559,9 @@ export class CrossAccountMover {
     // 1. FETCH source.
     const src = await this.fetchSource(sourceAccount, sourceMailbox, uid);
 
-    // 1a. osTicket threading: rewrite ONLY the top-level Subject before dedup
-    // and APPEND. A subject already tagged for a different ticket is not ours
-    // to move — fail the message before anything is appended.
+    // 1a. osTicket threading: prepend the tag to the top-level Subject before
+    // dedup and APPEND. A subject already belonging to a different ticket, or
+    // one osTicket could not unambiguously read, aborts before anything lands.
     let subjectRewritten = false;
     let ticketTag: string | null = null;
     if (mode === 'move' && args.ticketNumber) {
@@ -508,8 +572,22 @@ export class CrossAccountMover {
           `subject already carries osTicket tag [#${tagged.existingTicket}]; refusing to add [#${args.ticketNumber}]`,
         );
       }
+      if (tagged.status === 'duplicate_subject') {
+        throw new MoveError(
+          ERROR_KIND.DUPLICATE_SUBJECT_HEADER,
+          'message has multiple top-level Subject headers; osTicket could pick either one, so refusing to tag it',
+        );
+      }
+      if (tagged.status === 'malformed_subject') {
+        throw new MoveError(
+          ERROR_KIND.MALFORMED_SUBJECT_HEADER,
+          'Subject header contains a bare CR/LF that is not a valid fold; refusing to rewrite it',
+        );
+      }
       src.raw = tagged.raw;
-      src.subject = tagged.subject;
+      if (tagged.subject !== null) {
+        src.subject = tagged.subject;
+      }
       subjectRewritten = tagged.rewritten;
       ticketTag = args.ticketNumber;
     }
@@ -528,6 +606,12 @@ export class CrossAccountMover {
         if (found && found.length > 0) {
           dedupHit = true;
           [destUid] = found;
+          // A dedup hit is only acceptable when the destination copy already
+          // carries the requested ticket as its FIRST osTicket token. Otherwise
+          // the tag would silently be lost and the source cleaned up anyway.
+          if (mode === 'move' && ticketTag !== null) {
+            await assertDestinationTagWithClient(destClient, destUid, ticketTag);
+          }
         }
       }
       if (!dedupHit) {
@@ -568,6 +652,45 @@ export class CrossAccountMover {
     }
 
     return { src, destUid, dedupHit, subjectRewritten, ticketTag };
+  }
+
+  /** Same check, acquiring its own mailbox lock (used after the audit race). */
+  private async assertDestinationTag(
+    account: string,
+    mailbox: string,
+    uid: number,
+    ticketNumber: string,
+  ): Promise<void> {
+    const client = await this.connections.getImapClient(account);
+    const lock = await client.getMailboxLock(mailbox);
+    try {
+      await assertDestinationTagWithClient(client, uid, ticketNumber);
+    } finally {
+      lock.release();
+    }
+  }
+
+  /** Locate the audit-race winner's destination UID when the row lacks it. */
+  private async resolveWinnerUid(
+    account: string,
+    mailbox: string,
+    destUid: number | null,
+    messageId: string | null,
+  ): Promise<number | null> {
+    if (destUid !== null) {
+      return destUid;
+    }
+    if (!messageId) {
+      return null;
+    }
+    const client = await this.connections.getImapClient(account);
+    const lock = await client.getMailboxLock(mailbox);
+    try {
+      const found = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+      return found && found.length > 0 ? found[0] : null;
+    } finally {
+      lock.release();
+    }
   }
 
   /**

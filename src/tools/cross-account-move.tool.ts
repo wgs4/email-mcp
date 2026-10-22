@@ -8,9 +8,10 @@
  * of the move contract — no Postgres, no move (D-Premise-2 / D20).
  *
  * Optional `ticketNumber`: osTicket threads a message onto an existing ticket
- * only when its Subject carries that ticket's `[#N]` tag. Supplying it rewrites
- * the top-level Subject (and nothing else) before APPEND; a subject already
- * tagged for a different ticket fails the move instead.
+ * only when the FIRST hash token in its Subject resolves to that ticket.
+ * Supplying it prepends the literal `[#N]` to the top-level Subject (and
+ * changes nothing else) before APPEND; a subject already tagged for a
+ * different ticket fails the move instead.
  *
  * Registered only when settings.read_only is false (D17 — the read-only gate is
  * registration, not a runtime error). For same-account moves use move_email.
@@ -88,8 +89,9 @@ export default function registerCrossAccountMoveTool(
         .regex(/^\d{3,10}$/, 'ticketNumber must be 3-10 digits')
         .optional()
         .describe(
-          'Existing osTicket ticket number (3-10 digits). The top-level Subject ' +
-            'gets [#N] appended so osTicket threads this email onto that ticket.',
+          'Existing osTicket ticket number (3-10 digits). The literal [#N] is ' +
+            'prepended to the top-level Subject so osTicket threads this email ' +
+            'onto that ticket. The message must be UNREAD.',
         ),
     },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true },

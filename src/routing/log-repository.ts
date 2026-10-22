@@ -36,7 +36,7 @@ export interface MoveLogEntry {
   manual: boolean;
   /** TRUE when the Subject was rewritten to carry an osTicket tag (migration 003). */
   subject_rewritten?: boolean;
-  /** The osTicket ticket number appended to the Subject, if requested (migration 003). */
+  /** The osTicket ticket number prepended to the Subject, if requested (migration 003). */
   ticket_tag?: string | null;
 }
 
@@ -86,6 +86,9 @@ function classifyConnectError(err: unknown): MoveError {
 export class MoveLogRepository {
   private sql: Sql | null = null;
 
+  /** Set once information_schema confirms the migration-003 columns exist. */
+  private ticketTagColumnsVerified = false;
+
   constructor(private readonly url: string | undefined) {}
 
   private client(): Sql {
@@ -103,28 +106,82 @@ export class MoveLogRepository {
   }
 
   /**
+   * Verify migration 003 is applied before a tagged move APPENDs anything.
+   *
+   * A move that requests an osTicket tag must be able to record it in the audit
+   * row, so the columns are checked explicitly instead of discovering the
+   * missing column AFTER the destination copy has already landed. The positive
+   * answer is cached for the process lifetime.
+   */
+  async ensureTicketTagColumns(): Promise<void> {
+    if (this.ticketTagColumnsVerified) {
+      return;
+    }
+    const sql = this.client();
+    let columns: { column_name: string }[];
+    try {
+      columns = await sql<{ column_name: string }[]>`
+        SELECT column_name
+          FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'email_move_log'
+           AND column_name IN ('subject_rewritten', 'ticket_tag')`;
+    } catch (err) {
+      throw classifyConnectError(err);
+    }
+    const found = new Set(columns.map((row) => row.column_name));
+    if (!found.has('subject_rewritten') || !found.has('ticket_tag')) {
+      throw new MoveError(
+        ERROR_KIND.MIGRATION_REQUIRED,
+        'email_move_log is missing subject_rewritten/ticket_tag — run migrations/003_email_move_log_ticket_tag.sql (pnpm db:migrate) before using ticketNumber',
+      );
+    }
+    this.ticketTagColumnsVerified = true;
+  }
+
+  /**
    * Insert the audit row post-APPEND. `{ ok:true, id }` on success;
    * `{ ok:false, existing }` when the unique index fires (concurrent winner).
    * Any other DB failure throws a typed MoveError.
+   *
+   * Untagged moves use the EXACT pre-003 INSERT so this build keeps working
+   * against schema 002. Tagged moves have already passed
+   * ensureTicketTagColumns() and write the two migration-003 columns.
    */
   async claim(entry: MoveLogEntry): Promise<ClaimResult> {
     const sql = this.client();
     try {
-      const rows = await sql<{ id: number }[]>`
-        INSERT INTO email_move_log (
-          source_account, source_mailbox, source_uid,
-          dest_account, dest_mailbox, dest_uid,
-          message_id, subject, from_addr, email_date, size_bytes,
-          manual, status, source_deleted, subject_rewritten, ticket_tag
-        ) VALUES (
-          ${entry.source_account}, ${entry.source_mailbox}, ${entry.source_uid},
-          ${entry.dest_account}, ${entry.dest_mailbox}, ${entry.dest_uid},
-          ${entry.message_id}, ${entry.subject}, ${entry.from_addr},
-          ${entry.email_date}, ${entry.size_bytes},
-          ${entry.manual}, ${entry.status}, FALSE,
-          ${entry.subject_rewritten ?? false}, ${entry.ticket_tag ?? null}
-        )
-        RETURNING id`;
+      const rows =
+        entry.ticket_tag == null
+          ? await sql<{ id: number }[]>`
+              INSERT INTO email_move_log (
+                source_account, source_mailbox, source_uid,
+                dest_account, dest_mailbox, dest_uid,
+                message_id, subject, from_addr, email_date, size_bytes,
+                manual, status, source_deleted
+              ) VALUES (
+                ${entry.source_account}, ${entry.source_mailbox}, ${entry.source_uid},
+                ${entry.dest_account}, ${entry.dest_mailbox}, ${entry.dest_uid},
+                ${entry.message_id}, ${entry.subject}, ${entry.from_addr},
+                ${entry.email_date}, ${entry.size_bytes},
+                ${entry.manual}, ${entry.status}, FALSE
+              )
+              RETURNING id`
+          : await sql<{ id: number }[]>`
+              INSERT INTO email_move_log (
+                source_account, source_mailbox, source_uid,
+                dest_account, dest_mailbox, dest_uid,
+                message_id, subject, from_addr, email_date, size_bytes,
+                manual, status, source_deleted, subject_rewritten, ticket_tag
+              ) VALUES (
+                ${entry.source_account}, ${entry.source_mailbox}, ${entry.source_uid},
+                ${entry.dest_account}, ${entry.dest_mailbox}, ${entry.dest_uid},
+                ${entry.message_id}, ${entry.subject}, ${entry.from_addr},
+                ${entry.email_date}, ${entry.size_bytes},
+                ${entry.manual}, ${entry.status}, FALSE,
+                ${entry.subject_rewritten ?? false}, ${entry.ticket_tag}
+              )
+              RETURNING id`;
       return { ok: true, id: rows[0].id };
     } catch (err) {
       if ((err as { code?: string })?.code === '23505') {

@@ -72,8 +72,12 @@ function successResult(
 }
 
 describe('cross_account_move ticketNumber', () => {
+  let auditLog: ReturnType<typeof vi.spyOn>;
+
   beforeEach(() => {
     vi.restoreAllMocks();
+    // Never write synthetic test activity to ~/.local/share/email-mcp/audit.log.
+    auditLog = vi.spyOn(audit, 'log').mockResolvedValue(undefined);
   });
 
   it('passes ticketNumber through to the mover and summarizes the tag', async () => {
@@ -84,7 +88,6 @@ describe('cross_account_move ticketNumber', () => {
     const moveMany = vi
       .spyOn(CrossAccountMover.prototype, 'moveMany')
       .mockResolvedValue([successResult()]);
-    const auditLog = vi.spyOn(audit, 'log').mockResolvedValue(undefined);
 
     const result = await tool.handler({
       sourceAccount: 'wgs-usa',
