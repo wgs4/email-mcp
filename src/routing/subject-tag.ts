@@ -301,7 +301,12 @@ interface DecodeResult {
  */
 function decodeHeaderValue(value: string): DecodeResult {
   const parts = value.split(ENCODED_WORD_SPLIT_RE);
-  const decoded = parts.reduce<{ text: string; ok: boolean; previousWasEncoded: boolean }>(
+  const decoded = parts.reduce<{
+    text: string;
+    ok: boolean;
+    previousWasEncoded: boolean;
+    suspicious: boolean;
+  }>(
     (acc, part, index) => {
       // split() with one capture group puts matches at odd indices.
       if (index % 2 === 1) {
@@ -309,18 +314,28 @@ function decodeHeaderValue(value: string): DecodeResult {
         if (word === null) {
           return { ...acc, ok: false, previousWasEncoded: true };
         }
-        return { text: acc.text + word, ok: acc.ok, previousWasEncoded: true };
+        return {
+          text: acc.text + word,
+          ok: acc.ok,
+          previousWasEncoded: true,
+          suspicious: acc.suspicious,
+        };
       }
+      // Encoded-word-LIKE text that our strict recognizer would not match
+      // (whitespace inside the payload, for example) must not be trusted as
+      // literal text: mailparser may still decode it and reveal a tag.
+      const suspicious = /=\?[\s\S]*\?=/.test(part);
       const dropWhitespace = acc.previousWasEncoded && /^\s+$/.test(part);
       return {
         text: dropWhitespace ? acc.text : acc.text + part,
         ok: acc.ok,
         previousWasEncoded: false,
+        suspicious: acc.suspicious || suspicious,
       };
     },
-    { text: '', ok: true, previousWasEncoded: false },
+    { text: '', ok: true, previousWasEncoded: false, suspicious: false },
   );
-  if (!decoded.ok) {
+  if (!decoded.ok || decoded.suspicious) {
     return { ok: false, text: null };
   }
   // Literal 8-bit bytes only need the UTF-8/latin1 heuristic when there were no
@@ -447,12 +462,52 @@ function prependTag(message: ParsedMessage, subject: HeaderGroup, tag: string): 
   return Buffer.from(rebuilt.map((line) => line.text + line.eol).join(''), 'binary');
 }
 
-/** Best-effort display subject after prepending, or null when undecodable. */
-function taggedDisplaySubject(inspection: SubjectInspection, tag: string): string | null {
-  if (!inspection.decoded || inspection.subject === null) {
-    return null;
+/**
+ * One shared ticket check, used by BOTH the source tagging path and destination
+ * dedup verification so the two can never drift apart.
+ *
+ * `match` means the first osTicket token is the requested ticket AND no other
+ * bracketed `[#digits]` tag points at a different ticket. Every other status is
+ * a refusal (or, for `no_subject`, a missing header the caller may create).
+ */
+export type SubjectTicketCheck =
+  | { status: 'match'; subject: string | null }
+  | { status: 'no_subject'; subject: null }
+  | { status: 'duplicate_subject'; subject: string | null }
+  | { status: 'malformed_subject'; subject: string | null }
+  | { status: 'undecodable_subject'; subject: null }
+  | { status: 'conflict'; subject: string | null; existingTicket: string }
+  | { status: 'different'; subject: string | null; firstToken: string | null };
+
+export function checkSubjectTicket(raw: Buffer, ticketNumber: string): SubjectTicketCheck {
+  const inspection = inspectSubject(raw);
+  if (inspection.subjectFieldCount === 0) {
+    return { status: 'no_subject', subject: null };
   }
-  return inspection.subject.length > 0 ? `${tag} ${inspection.subject}` : tag;
+  if (inspection.subjectFieldCount > 1) {
+    return { status: 'duplicate_subject', subject: inspection.subject };
+  }
+  if (inspection.malformedEol) {
+    return { status: 'malformed_subject', subject: inspection.subject };
+  }
+  // A trustworthy decode is required to prove there is no conflicting tag. An
+  // unsupported charset (UTF-7), malformed B/Q, or encoded-word-like text that
+  // does not fully decode fails closed.
+  if (!inspection.decoded) {
+    return { status: 'undecodable_subject', subject: null };
+  }
+  // Any bracketed tag for another ticket is a refusal, even when the first
+  // token is already correct: the message demonstrably belongs elsewhere too.
+  const conflicting = inspection.bracketTags.find((number) => number !== ticketNumber);
+  if (conflicting !== undefined) {
+    return { status: 'conflict', subject: inspection.subject, existingTicket: conflicting };
+  }
+  // osTicket only ever resolves the FIRST token, so that is what decides
+  // "already correct".
+  if (inspection.firstToken === ticketNumber) {
+    return { status: 'match', subject: inspection.subject };
+  }
+  return { status: 'different', subject: inspection.subject, firstToken: inspection.firstToken };
 }
 
 /**
@@ -463,51 +518,41 @@ function taggedDisplaySubject(inspection: SubjectInspection, tag: string): strin
  * leave those messages where they are.
  */
 export function tagSubject(raw: Buffer, ticketNumber: string): SubjectTagResult {
-  const inspection = inspectSubject(raw);
-
-  if (inspection.subjectFieldCount > 1) {
-    return { status: 'duplicate_subject', subject: inspection.subject };
-  }
-  if (inspection.malformedEol) {
-    return { status: 'malformed_subject', subject: inspection.subject };
-  }
-
+  const check = checkSubjectTicket(raw, ticketNumber);
   const tag = `[#${ticketNumber}]`;
-  if (inspection.subjectFieldCount === 0) {
-    const message = parseMessage(raw);
-    return {
-      status: 'tagged',
-      raw: insertSubjectLine(message, tag),
-      subject: tag,
-      rewritten: true,
-    };
-  }
 
-  // A trustworthy decode is required to prove there is no conflicting tag. An
-  // unsupported charset (UTF-7) or malformed encoded-word fails closed.
-  if (!inspection.decoded) {
-    return { status: 'undecodable_subject', subject: null };
+  switch (check.status) {
+    case 'duplicate_subject':
+      return { status: 'duplicate_subject', subject: check.subject };
+    case 'malformed_subject':
+      return { status: 'malformed_subject', subject: check.subject };
+    case 'undecodable_subject':
+      return { status: 'undecodable_subject', subject: null };
+    case 'conflict':
+      return { status: 'conflict', subject: check.subject, existingTicket: check.existingTicket };
+    case 'match':
+      return { status: 'unchanged', raw, subject: check.subject, rewritten: false };
+    case 'no_subject': {
+      const message = parseMessage(raw);
+      return {
+        status: 'tagged',
+        raw: insertSubjectLine(message, tag),
+        subject: tag,
+        rewritten: true,
+      };
+    }
+    case 'different': {
+      const message = parseMessage(raw);
+      const [subject] = message.subjectGroups;
+      return {
+        status: 'tagged',
+        raw: prependTag(message, subject, tag),
+        subject:
+          check.subject === null || check.subject.length === 0 ? tag : `${tag} ${check.subject}`,
+        rewritten: true,
+      };
+    }
+    default:
+      throw new Error('unreachable subject ticket status');
   }
-
-  // Any bracketed tag for another ticket is a refusal, even when the first
-  // token is already correct: the message demonstrably belongs elsewhere too.
-  const conflicting = inspection.bracketTags.find((number) => number !== ticketNumber);
-  if (conflicting !== undefined) {
-    return { status: 'conflict', subject: inspection.subject, existingTicket: conflicting };
-  }
-
-  // osTicket only ever resolves the FIRST token, so that is what decides
-  // "already correct".
-  if (inspection.firstToken === ticketNumber) {
-    return { status: 'unchanged', raw, subject: inspection.subject, rewritten: false };
-  }
-
-  const message = parseMessage(raw);
-  const [subject] = message.subjectGroups;
-  return {
-    status: 'tagged',
-    raw: prependTag(message, subject, tag),
-    subject: taggedDisplaySubject(inspection, tag),
-    rewritten: true,
-  };
 }

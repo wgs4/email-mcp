@@ -52,6 +52,28 @@ const UNDECODABLE_RAW = Buffer.from(
     'body bytes',
   'binary',
 );
+const MALFORMED_Q_RAW = Buffer.from(
+  'Message-ID: <order-2026-10@example.com>\r\n' +
+    'Subject: =?UTF-8?Q?=5B=2311111=5D hello?=\r\n' +
+    '\r\n' +
+    'body bytes',
+  'binary',
+);
+const MALFORMED_B_RAW = Buffer.from(
+  'Message-ID: <order-2026-10@example.com>\r\n' +
+    'Subject: =?UTF-8?B?W yMxMTExMV0=?=\r\n' +
+    '\r\n' +
+    'body bytes',
+  'binary',
+);
+const DOUBLE_TAG_RAW = Buffer.from(
+  'Message-ID: <order-2026-10@example.com>\r\n' +
+    'From: Shop <shop@example.com>\r\n' +
+    'Subject: [#31775] [#11111] Your order is out for delivery\r\n' +
+    '\r\n' +
+    'body bytes',
+  'binary',
+);
 const INTERNAL_DATE = new Date('2026-10-20T12:00:00.000Z');
 
 function createFakeClient(raw: Buffer) {
@@ -206,6 +228,22 @@ describe('CrossAccountMover.moveOne — ticketNumber', () => {
     expect(claims).toHaveLength(0);
   });
 
+  it.each([
+    ['Q payload with whitespace', MALFORMED_Q_RAW],
+    ['B payload with whitespace', MALFORMED_B_RAW],
+  ])('fails closed on encoded-word-like text: %s', async (_label, raw) => {
+    const mover = build(raw);
+    const result = await mover.moveOne({ ...base, ticketNumber: '31775' });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error_kind).toBe(ERROR_KIND.UNDECODABLE_SUBJECT);
+    }
+    expect(dest.append).not.toHaveBeenCalled();
+    expect(source.messageMove).not.toHaveBeenCalled();
+    expect(claims).toHaveLength(0);
+  });
+
   it('does not append when the message has duplicate Subject headers', async () => {
     const duplicate = Buffer.from(
       'Message-ID: <order-2026-10@example.com>\r\n' +
@@ -285,6 +323,22 @@ describe('CrossAccountMover.moveOne — ticketNumber', () => {
       expect(result.subject).toBe('[#31775] Changed destination subject');
     }
     expect(claims[0].subject).toBe('[#31775] Changed destination subject');
+  });
+
+  it('rejects a destination copy that also carries a conflicting tag', async () => {
+    const mover = build(SOURCE_RAW, DOUBLE_TAG_RAW);
+    dest.search.mockResolvedValue([77]);
+
+    const result = await mover.moveOne({ ...base, ticketNumber: '31775' });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error_kind).toBe(ERROR_KIND.DEDUP_TAG_MISMATCH);
+      expect(result.error_message).toContain('[#11111]');
+    }
+    expect(dest.append).not.toHaveBeenCalled();
+    expect(source.messageMove).not.toHaveBeenCalled();
+    expect(claims).toHaveLength(0);
   });
 
   it('accepts dedup when the destination copy already has the right first token', async () => {

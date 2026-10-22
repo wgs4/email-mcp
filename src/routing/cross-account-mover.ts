@@ -55,7 +55,8 @@ import type ConnectionManager from '../connections/manager.js';
 import type { ErrorKind, MoveWarning, SourceCleanup } from './error-kinds.js';
 import { ERROR_KIND, MoveError, WARNING_KIND } from './error-kinds.js';
 import type { MoveLogEntry, MoveLogRepository } from './log-repository.js';
-import { inspectSubject, tagSubject } from './subject-tag.js';
+import type { SubjectTicketCheck } from './subject-tag.js';
+import { checkSubjectTicket, tagSubject } from './subject-tag.js';
 
 export interface MoveArgs {
   sourceAccount: string;
@@ -198,6 +199,28 @@ function classifyImapError(err: unknown, fallback: ErrorKind): MoveError {
   return new MoveError(fallback, msg);
 }
 
+/** Human-readable reason a destination Subject failed the shared ticket check. */
+function describeTagMismatch(check: SubjectTicketCheck): string {
+  switch (check.status) {
+    case 'conflict':
+      return `also carries [#${check.existingTicket}]`;
+    case 'different':
+      return `first osTicket token is ${check.firstToken === null ? 'none' : `#${check.firstToken}`}, not the requested ticket`;
+    case 'undecodable_subject':
+      return 'contains an encoded-word this server cannot decode';
+    case 'duplicate_subject':
+      return 'has multiple Subject headers';
+    case 'malformed_subject':
+      return 'has a malformed Subject header';
+    case 'no_subject':
+      return 'has no Subject header';
+    case 'match':
+      return 'already matches the requested ticket';
+    default:
+      return 'failed the ticket check';
+  }
+}
+
 /**
  * Verify that the destination copy osTicket is going to keep already resolves
  * to the requested ticket. Reads the destination's raw Subject header and
@@ -222,32 +245,19 @@ async function assertDestinationTagWithClient(
       `destination copy (uid ${uid}) could not be read to verify its osTicket tag`,
     );
   }
-  const inspection = inspectSubject(Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes));
-  if (inspection.subjectFieldCount !== 1) {
+  // Same check as the source path (first token == n AND no conflicting
+  // bracketed tag). Sharing checkSubjectTicket keeps the two from drifting.
+  const check = checkSubjectTicket(
+    Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes),
+    ticketNumber,
+  );
+  if (check.status !== 'match') {
     throw new MoveError(
       ERROR_KIND.DEDUP_TAG_MISMATCH,
-      `destination copy (uid ${uid}) must have exactly one Subject header to verify its osTicket tag`,
+      `destination copy (uid ${uid}) ${describeTagMismatch(check)} (requested [#${ticketNumber}]); refusing to remove the source`,
     );
   }
-  if (inspection.malformedEol) {
-    throw new MoveError(
-      ERROR_KIND.DEDUP_TAG_MISMATCH,
-      `destination copy (uid ${uid}) has a malformed Subject header; refusing to remove the source`,
-    );
-  }
-  if (!inspection.decoded) {
-    throw new MoveError(
-      ERROR_KIND.UNDECODABLE_SUBJECT,
-      `destination copy (uid ${uid}) has an encoded-word this server cannot decode; refusing to remove the source`,
-    );
-  }
-  if (inspection.firstToken !== ticketNumber) {
-    throw new MoveError(
-      ERROR_KIND.DEDUP_TAG_MISMATCH,
-      `destination already has this Message-ID (uid ${uid}) but its first osTicket token is ${inspection.firstToken === null ? 'none' : `#${inspection.firstToken}`}, not [#${ticketNumber}]; refusing to remove the source`,
-    );
-  }
-  return inspection.subject;
+  return check.subject;
 }
 
 export class CrossAccountMover {

@@ -331,6 +331,22 @@ describe('tagSubject', () => {
     expect(result.status).toBe('undecodable_subject');
   });
 
+  it('fails closed on encoded-word-like Q text containing whitespace', async () => {
+    const encoded = '=?UTF-8?Q?=5B=2311111=5D hello?=';
+    expect(await parsedSubject(message([`Subject: ${encoded}`]))).toBe('[#11111] hello');
+
+    const result = tagSubject(message([`Subject: ${encoded}`]), '31775');
+    expect(result.status).toBe('undecodable_subject');
+  });
+
+  it('fails closed on encoded-word-like B text containing whitespace', async () => {
+    const encoded = '=?UTF-8?B?W yMxMTExMV0=?=';
+    expect(await parsedSubject(message([`Subject: ${encoded}`]))).toBe('[#11111]');
+
+    const result = tagSubject(message([`Subject: ${encoded}`]), '31775');
+    expect(result.status).toBe('undecodable_subject');
+  });
+
   it('fails closed on malformed base64', () => {
     const result = tagSubject(message(['Subject: =?UTF-8?B?!!!!?=']), '31775');
     expect(result.status).toBe('undecodable_subject');
