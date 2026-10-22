@@ -37,6 +37,21 @@ const OTHER_TAGGED_RAW = Buffer.from(
     'body bytes',
   'binary',
 );
+const DIFFERENT_SUBJECT_TAGGED_RAW = Buffer.from(
+  'Message-ID: <order-2026-10@example.com>\r\n' +
+    'From: Shop <shop@example.com>\r\n' +
+    'Subject: [#31775] Changed destination subject\r\n' +
+    '\r\n' +
+    'destination body',
+  'binary',
+);
+const UNDECODABLE_RAW = Buffer.from(
+  'Message-ID: <order-2026-10@example.com>\r\n' +
+    'Subject: =?UTF-7?B?UmU6IFsjMTExMTFdIG9yZGVy?=\r\n' +
+    '\r\n' +
+    'body bytes',
+  'binary',
+);
 const INTERNAL_DATE = new Date('2026-10-20T12:00:00.000Z');
 
 function createFakeClient(raw: Buffer) {
@@ -178,6 +193,19 @@ describe('CrossAccountMover.moveOne — ticketNumber', () => {
     expect(claims).toHaveLength(0);
   });
 
+  it('fails closed when the source Subject cannot be decoded', async () => {
+    const mover = build(UNDECODABLE_RAW);
+    const result = await mover.moveOne({ ...base, ticketNumber: '31775' });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error_kind).toBe(ERROR_KIND.UNDECODABLE_SUBJECT);
+    }
+    expect(dest.append).not.toHaveBeenCalled();
+    expect(source.messageMove).not.toHaveBeenCalled();
+    expect(claims).toHaveLength(0);
+  });
+
   it('does not append when the message has duplicate Subject headers', async () => {
     const duplicate = Buffer.from(
       'Message-ID: <order-2026-10@example.com>\r\n' +
@@ -245,6 +273,20 @@ describe('CrossAccountMover.moveOne — ticketNumber', () => {
     expect(source.messageMove).not.toHaveBeenCalled();
   });
 
+  it('reports the surviving destination subject on dedup, not the source subject', async () => {
+    const mover = build(SOURCE_RAW, DIFFERENT_SUBJECT_TAGGED_RAW);
+    dest.search.mockResolvedValue([77]);
+
+    const result = await mover.moveOne({ ...base, ticketNumber: '31775' });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.status).toBe('duplicate_skipped');
+      expect(result.subject).toBe('[#31775] Changed destination subject');
+    }
+    expect(claims[0].subject).toBe('[#31775] Changed destination subject');
+  });
+
   it('accepts dedup when the destination copy already has the right first token', async () => {
     const mover = build(SOURCE_RAW, TAGGED_RAW);
     dest.search.mockResolvedValue([77]);
@@ -285,7 +327,7 @@ describe('CrossAccountMover.moveOne — ticketNumber', () => {
   });
 
   it('accepts the audit-race winner when its destination copy is tagged', async () => {
-    const mover = build(SOURCE_RAW, TAGGED_RAW, {
+    const mover = build(SOURCE_RAW, DIFFERENT_SUBJECT_TAGGED_RAW, {
       claimResult: { ok: false, existing: { id: 9, dest_uid: 55, status: 'success' } },
     });
 
@@ -295,6 +337,7 @@ describe('CrossAccountMover.moveOne — ticketNumber', () => {
     if (result.success) {
       expect(result.status).toBe('duplicate_skipped');
       expect(result.move_log_id).toBe(9);
+      expect(result.subject).toBe('[#31775] Changed destination subject');
     }
     // The audit-race branch leaves the source untouched (existing semantics).
     expect(source.messageMove).not.toHaveBeenCalled();

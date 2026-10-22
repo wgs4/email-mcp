@@ -118,18 +118,18 @@ export class MoveLogRepository {
       return;
     }
     const sql = this.client();
-    let columns: { column_name: string }[];
+    let columns: { attname: string }[];
     try {
-      columns = await sql<{ column_name: string }[]>`
-        SELECT column_name
-          FROM information_schema.columns
-         WHERE table_schema = current_schema()
-           AND table_name = 'email_move_log'
-           AND column_name IN ('subject_rewritten', 'ticket_tag')`;
+      columns = await sql<{ attname: string }[]>`
+        SELECT attname
+          FROM pg_attribute
+         WHERE attrelid = to_regclass('email_move_log')
+           AND attname IN ('subject_rewritten', 'ticket_tag')
+           AND NOT attisdropped`;
     } catch (err) {
       throw classifyConnectError(err);
     }
-    const found = new Set(columns.map((row) => row.column_name));
+    const found = new Set(columns.map((row) => row.attname));
     if (!found.has('subject_rewritten') || !found.has('ticket_tag')) {
       throw new MoveError(
         ERROR_KIND.MIGRATION_REQUIRED,

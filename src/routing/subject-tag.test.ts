@@ -141,6 +141,49 @@ describe('tagSubject', () => {
     }
   });
 
+  it('folds oversized leading whitespace instead of keeping it on the first line', async () => {
+    const raw = message([`Subject:${' '.repeat(989)}x`]);
+    const result = tagSubject(raw, '31775');
+
+    expect(result.status).toBe('tagged');
+    if (result.status === 'tagged') {
+      const lines = result.raw.toString('binary').split(CRLF);
+      expect(lines[0]).toBe('Subject: [#31775]');
+      expect(lines[1]).toBe(' x');
+      lines.forEach((line) => {
+        expect(line.length).toBeLessThanOrEqual(998);
+      });
+      expect(await parsedSubject(result.raw)).toBe('[#31775] x');
+    }
+  });
+
+  it('folds an empty value preceded by 990 spaces and stays under 998 octets', async () => {
+    const raw = message([`Subject:${' '.repeat(990)}`]);
+    const result = tagSubject(raw, '31775');
+
+    expect(result.status).toBe('tagged');
+    if (result.status === 'tagged') {
+      const lines = result.raw.toString('binary').split(CRLF);
+      expect(lines[0]).toBe('Subject: [#31775]');
+      lines.forEach((line) => {
+        expect(line.length).toBeLessThanOrEqual(998);
+      });
+      expect(await parsedSubject(result.raw)).toBe('[#31775]');
+    }
+  });
+
+  it('uses header line endings only, ignoring CRLF in an LF-only body', async () => {
+    const raw = Buffer.from('Subject: hello\n\nbody\r\nother', 'binary');
+    const result = tagSubject(raw, '31775');
+
+    expect(result.status).toBe('tagged');
+    if (result.status === 'tagged') {
+      expect(
+        result.raw.equals(Buffer.from('Subject: [#31775] hello\n\nbody\r\nother', 'binary')),
+      ).toBe(true);
+    }
+  });
+
   it('creates a Subject header when one is missing', async () => {
     const raw = message(['From: a@example.com', 'To: b@example.com'], ['hello']);
     const expected = message(
@@ -187,6 +230,14 @@ describe('tagSubject', () => {
   it('rejects duplicate Subject fields regardless of field-name case', () => {
     const raw = message(['Subject: first', 'subject: second']);
     expect(tagSubject(raw, '31775').status).toBe('duplicate_subject');
+  });
+
+  it('rejects a later different tag even when the first token is already correct', () => {
+    const result = tagSubject(message(['Subject: [#31775] [#11111]']), '31775');
+    expect(result.status).toBe('conflict');
+    if (result.status === 'conflict') {
+      expect(result.existingTicket).toBe('11111');
+    }
   });
 
   it('rejects a subject tagged for a different ticket', () => {
@@ -263,10 +314,31 @@ describe('tagSubject', () => {
     expect(result.status).toBe('unchanged');
   });
 
-  it('falls back to the raw header when a charset is unsupported', () => {
-    const encoded = '=?x-user-defined?Q?Re=3A_[#31775]?=';
+  it('fails closed when an encoded-word charset is unsupported (UTF-7)', async () => {
+    const encoded = '=?UTF-7?B?UmU6IFsjMTExMTFdIG9yZGVy?=';
+    // Proof the payload really carries a different ticket tag.
+    expect(await parsedSubject(message([`Subject: ${encoded}`]))).toBe('Re: [#11111] order');
+
     const result = tagSubject(message([`Subject: ${encoded}`]), '31775');
-    expect(result.status).toBe('unchanged');
+    expect(result.status).toBe('undecodable_subject');
+  });
+
+  it('fails closed when an unknown charset is requested', () => {
+    const result = tagSubject(
+      message(['Subject: =?x-no-such-charset?Q?Re=3A_[#31775]?=']),
+      '31775',
+    );
+    expect(result.status).toBe('undecodable_subject');
+  });
+
+  it('fails closed on malformed base64', () => {
+    const result = tagSubject(message(['Subject: =?UTF-8?B?!!!!?=']), '31775');
+    expect(result.status).toBe('undecodable_subject');
+  });
+
+  it('fails closed on a malformed Q escape', () => {
+    const result = tagSubject(message(['Subject: =?UTF-8?Q?abc=GZ?=']), '31775');
+    expect(result.status).toBe('undecodable_subject');
   });
 
   it('rejects a Subject field with a bare CR that is not a valid fold', () => {

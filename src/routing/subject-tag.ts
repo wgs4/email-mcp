@@ -26,9 +26,11 @@
  *   - If prepending would push the first physical line past RFC 5322's 998
  *     octets, the tag line is folded immediately after the tag.
  *   - An existing first token for the SAME ticket number is a no-op. Multiple
- *     top-level Subject fields, a `[#N]` tag for a DIFFERENT number, or a raw
- *     Subject field with malformed line endings is a hard failure: the caller
- *     must not move that message.
+ *     top-level Subject fields, a `[#N]` tag for a DIFFERENT number, a raw
+ *     Subject field with malformed line endings, or an encoded-word that
+ *     cannot be decoded (unsupported charset, malformed B/Q) is a hard failure:
+ *     the caller must not move that message. Decode failure fails closed
+ *     because an undecodable word could hide a conflicting tag.
  */
 
 interface RawLine {
@@ -72,17 +74,24 @@ export interface SubjectMalformed {
   subject: string | null;
 }
 
+export interface SubjectUndecodable {
+  status: 'undecodable_subject';
+  subject: null;
+}
+
 export type SubjectTagResult =
   | SubjectTagged
   | SubjectUnchanged
   | SubjectConflict
   | SubjectDuplicate
-  | SubjectMalformed;
+  | SubjectMalformed
+  | SubjectUndecodable;
 
 /**
- * Read-only view of the top-level Subject. `decoded` is false when an
- * encoded-word uses an unsupported charset or undecodable bytes; in that case
- * `firstToken` / `bracketTags` come from the raw (still encoded) header value.
+ * Read-only view of the top-level Subject. `decoded` is false when any
+ * encoded-word uses an unsupported charset or has undecodable bytes. Callers
+ * fail closed in that case: without a trustworthy decode we cannot prove the
+ * subject is free of a conflicting ticket tag.
  */
 export interface SubjectInspection {
   rawValue: string | null;
@@ -190,13 +199,19 @@ function parseMessage(raw: Buffer): ParsedMessage {
   const blankLine = lines.findIndex((line) => line.text === '');
   const headerEnd = blankLine === -1 ? lines.length : blankLine;
   const groups = parseHeaderGroups(lines, headerEnd);
+  // Header line endings are decided by the header block only. A CRLF in the
+  // body must never make an LF-only header block look malformed.
+  const headerText = lines
+    .slice(0, headerEnd)
+    .map((line) => line.text + line.eol)
+    .join('');
   return {
     text,
     lines,
     headerEnd,
     groups,
     subjectGroups: groups.filter((group) => group.name === 'subject'),
-    dominantEol: text.includes('\r\n') ? '\r\n' : '\n',
+    dominantEol: headerText.includes('\r\n') ? '\r\n' : '\n',
   };
 }
 
@@ -235,12 +250,26 @@ function decodeBytes(bytes: Buffer, charset: string): string | null {
   }
 }
 
-function decodeQ(payload: string): string {
+function decodeQ(payload: string): string | null {
+  // In Q encoding a literal '=' must be written as =3D; anything else is a
+  // malformed escape and makes the encoded-word untrustworthy.
+  if (/=(?![0-9A-Fa-f]{2})/.test(payload)) {
+    return null;
+  }
   return payload
     .replace(/_/g, ' ')
     .replace(/=([0-9A-Fa-f]{2})/g, (_whole, hex: string) =>
       String.fromCharCode(Number.parseInt(hex, 16)),
     );
+}
+
+function decodeBase64(payload: string): Buffer | null {
+  // Buffer.from(..., 'base64') silently ignores garbage; reject it instead.
+  const unpadded = payload.replace(/=+$/, '');
+  if (!/^[A-Za-z0-9+/]*$/.test(unpadded) || unpadded.length % 4 === 1) {
+    return null;
+  }
+  return Buffer.from(unpadded, 'base64');
 }
 
 function decodeWord(word: string): string | null {
@@ -249,11 +278,15 @@ function decodeWord(word: string): string | null {
     return null;
   }
   const [, charset, encoding, payload] = match;
-  const bytes =
-    encoding.toLowerCase() === 'b'
-      ? Buffer.from(payload, 'base64')
-      : Buffer.from(decodeQ(payload), 'binary');
-  return decodeBytes(bytes, charset);
+  if (encoding.toLowerCase() === 'b') {
+    const bytes = decodeBase64(payload);
+    return bytes === null ? null : decodeBytes(bytes, charset);
+  }
+  const decodedQ = decodeQ(payload);
+  if (decodedQ === null) {
+    return null;
+  }
+  return decodeBytes(Buffer.from(decodedQ, 'binary'), charset);
 }
 
 interface DecodeResult {
@@ -326,9 +359,9 @@ export function inspectSubject(raw: Buffer): SubjectInspection {
     .slice(subject.start, subject.end)
     .some((line) => line.eol !== '' && line.eol !== message.dominantEol);
   const decodedValue = decodeHeaderValue(subject.value);
-  // Detection falls back to the raw (still encoded) value when a charset is
-  // unsupported. The tag itself is ASCII, so it usually survives either way.
-  const detectionText = decodedValue.ok ? (decodedValue.text ?? '') : subject.value;
+  // No raw fallback: an undecodable word could hide a conflicting tag, so
+  // detection is only meaningful when the whole value decoded cleanly.
+  const detectionText = decodedValue.ok ? (decodedValue.text ?? '') : '';
 
   return {
     rawValue: subject.value,
@@ -373,27 +406,32 @@ function prependTag(message: ParsedMessage, subject: HeaderGroup, tag: string): 
 
   // Insert after `Subject:` and its inline whitespace, at the start of the
   // value. String lengths are byte lengths: the text is latin1.
-  let insertAt = nameMatch[0].length;
-  while (insertAt < firstLine.text.length) {
-    const char = firstLine.text[insertAt];
+  const colonEnd = nameMatch[0].length;
+  let valueStart = colonEnd;
+  while (valueStart < firstLine.text.length) {
+    const char = firstLine.text[valueStart];
     if (char !== ' ' && char !== '\t') {
       break;
     }
-    insertAt += 1;
+    valueStart += 1;
   }
-  const prefix = firstLine.text.slice(0, insertAt);
-  const rest = firstLine.text.slice(insertAt);
-  const lineLength = prefix.length + tag.length + (rest.length > 0 ? rest.length + 1 : 0);
+  const inlineWhitespace = firstLine.text.slice(colonEnd, valueStart);
+  const rest = firstLine.text.slice(valueStart);
+  const lineLength =
+    colonEnd + inlineWhitespace.length + tag.length + (rest.length > 0 ? rest.length + 1 : 0);
 
   let replacement: RawLine[];
   if (lineLength > MAX_LINE_OCTETS) {
-    // Fold immediately after the tag. The continuation line keeps the original
-    // line's terminator so a headers-only message gains no trailing newline.
-    replacement = [{ text: prefix + tag, eol: firstLine.eol || dominantEol }];
+    // Normalize the whitespace after the colon so a huge leading run cannot
+    // survive on the first line. Fold immediately after the tag; the
+    // continuation line keeps the original terminator so headers-only mail
+    // gains no trailing newline.
+    replacement = [{ text: `${nameMatch[1]}: ${tag}`, eol: firstLine.eol || dominantEol }];
     if (rest.length > 0) {
       replacement.push({ text: ` ${rest}`, eol: firstLine.eol });
     }
   } else {
+    const prefix = firstLine.text.slice(0, valueStart);
     replacement = [
       { text: rest.length > 0 ? `${prefix}${tag} ${rest}` : prefix + tag, eol: firstLine.eol },
     ];
@@ -421,8 +459,8 @@ function taggedDisplaySubject(inspection: SubjectInspection, tag: string): strin
  * Prepend `[#ticketNumber]` to the top-level Subject of a raw RFC822 message.
  *
  * Returns the original Buffer untouched for `unchanged`, a rebuilt Buffer for
- * `tagged`, and no Buffer at all for the three failure statuses — the caller
- * must leave those messages where they are.
+ * `tagged`, and no Buffer at all for the failure statuses — the caller must
+ * leave those messages where they are.
  */
 export function tagSubject(raw: Buffer, ticketNumber: string): SubjectTagResult {
   const inspection = inspectSubject(raw);
@@ -445,15 +483,23 @@ export function tagSubject(raw: Buffer, ticketNumber: string): SubjectTagResult 
     };
   }
 
-  // osTicket only ever resolves the FIRST token, so that is what decides
-  // "already correct". Then any bracketed tag for another ticket is a refusal:
-  // the message already belongs to a different ticket.
-  if (inspection.firstToken === ticketNumber) {
-    return { status: 'unchanged', raw, subject: inspection.subject, rewritten: false };
+  // A trustworthy decode is required to prove there is no conflicting tag. An
+  // unsupported charset (UTF-7) or malformed encoded-word fails closed.
+  if (!inspection.decoded) {
+    return { status: 'undecodable_subject', subject: null };
   }
+
+  // Any bracketed tag for another ticket is a refusal, even when the first
+  // token is already correct: the message demonstrably belongs elsewhere too.
   const conflicting = inspection.bracketTags.find((number) => number !== ticketNumber);
   if (conflicting !== undefined) {
     return { status: 'conflict', subject: inspection.subject, existingTicket: conflicting };
+  }
+
+  // osTicket only ever resolves the FIRST token, so that is what decides
+  // "already correct".
+  if (inspection.firstToken === ticketNumber) {
+    return { status: 'unchanged', raw, subject: inspection.subject, rewritten: false };
   }
 
   const message = parseMessage(raw);

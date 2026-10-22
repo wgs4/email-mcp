@@ -79,18 +79,23 @@ describe('MoveLogRepository ensureTicketTagColumns()', () => {
     postgresMock.mockReturnValue(sql);
   });
 
-  it('passes when both columns exist and caches the positive answer', async () => {
-    sql.mockResolvedValue([{ column_name: 'subject_rewritten' }, { column_name: 'ticket_tag' }]);
+  it('resolves the unqualified relation via to_regclass and caches the positive answer', async () => {
+    sql.mockResolvedValue([{ attname: 'subject_rewritten' }, { attname: 'ticket_tag' }]);
     const repo = new MoveLogRepository('postgres://email_mcp@example/db');
 
     await repo.ensureTicketTagColumns();
     await repo.ensureTicketTagColumns();
 
     expect(sql).toHaveBeenCalledTimes(1);
+    const text = queryText(sql.mock.calls[0]);
+    expect(text).toContain("to_regclass('email_move_log')");
+    expect(text).toContain('pg_attribute');
+    expect(text).toContain('NOT attisdropped');
+    expect(text).not.toContain('information_schema');
   });
 
   it('fails with migration_required when a column is missing', async () => {
-    sql.mockResolvedValue([{ column_name: 'subject_rewritten' }]);
+    sql.mockResolvedValue([{ attname: 'subject_rewritten' }]);
     const repo = new MoveLogRepository('postgres://email_mcp@example/db');
 
     await expect(repo.ensureTicketTagColumns()).rejects.toMatchObject({

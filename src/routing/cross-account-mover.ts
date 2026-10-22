@@ -209,7 +209,7 @@ async function assertDestinationTagWithClient(
   client: ImapFlow,
   uid: number,
   ticketNumber: string,
-): Promise<void> {
+): Promise<string | null> {
   const msg = await client.fetchOne(
     String(uid),
     { uid: true, headers: ['subject'] },
@@ -223,16 +223,31 @@ async function assertDestinationTagWithClient(
     );
   }
   const inspection = inspectSubject(Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes));
-  if (
-    inspection.subjectFieldCount !== 1 ||
-    inspection.malformedEol ||
-    inspection.firstToken !== ticketNumber
-  ) {
+  if (inspection.subjectFieldCount !== 1) {
+    throw new MoveError(
+      ERROR_KIND.DEDUP_TAG_MISMATCH,
+      `destination copy (uid ${uid}) must have exactly one Subject header to verify its osTicket tag`,
+    );
+  }
+  if (inspection.malformedEol) {
+    throw new MoveError(
+      ERROR_KIND.DEDUP_TAG_MISMATCH,
+      `destination copy (uid ${uid}) has a malformed Subject header; refusing to remove the source`,
+    );
+  }
+  if (!inspection.decoded) {
+    throw new MoveError(
+      ERROR_KIND.UNDECODABLE_SUBJECT,
+      `destination copy (uid ${uid}) has an encoded-word this server cannot decode; refusing to remove the source`,
+    );
+  }
+  if (inspection.firstToken !== ticketNumber) {
     throw new MoveError(
       ERROR_KIND.DEDUP_TAG_MISMATCH,
       `destination already has this Message-ID (uid ${uid}) but its first osTicket token is ${inspection.firstToken === null ? 'none' : `#${inspection.firstToken}`}, not [#${ticketNumber}]; refusing to remove the source`,
     );
   }
+  return inspection.subject;
 }
 
 export class CrossAccountMover {
@@ -336,7 +351,16 @@ export class CrossAccountMover {
               'duplicate detected but the winning destination copy could not be located to verify its ticket tag',
             );
           }
-          await this.assertDestinationTag(destAccount, destMailbox, winnerUid, ticketTag);
+          const winnerSubject = await this.assertDestinationTag(
+            destAccount,
+            destMailbox,
+            winnerUid,
+            ticketTag,
+          );
+          // Report the copy that actually survives, not the source's subject.
+          if (winnerSubject !== null) {
+            src.subject = winnerSubject;
+          }
         }
         return {
           success: true,
@@ -584,6 +608,12 @@ export class CrossAccountMover {
           'Subject header contains a bare CR/LF that is not a valid fold; refusing to rewrite it',
         );
       }
+      if (tagged.status === 'undecodable_subject') {
+        throw new MoveError(
+          ERROR_KIND.UNDECODABLE_SUBJECT,
+          'Subject contains an encoded-word this server cannot decode; refusing to tag it without a trustworthy conflict check',
+        );
+      }
       src.raw = tagged.raw;
       if (tagged.subject !== null) {
         src.subject = tagged.subject;
@@ -610,7 +640,15 @@ export class CrossAccountMover {
           // carries the requested ticket as its FIRST osTicket token. Otherwise
           // the tag would silently be lost and the source cleaned up anyway.
           if (mode === 'move' && ticketTag !== null) {
-            await assertDestinationTagWithClient(destClient, destUid, ticketTag);
+            const destSubject = await assertDestinationTagWithClient(
+              destClient,
+              destUid,
+              ticketTag,
+            );
+            // Report the copy that actually survives, not the source's subject.
+            if (destSubject !== null) {
+              src.subject = destSubject;
+            }
           }
         }
       }
@@ -660,11 +698,11 @@ export class CrossAccountMover {
     mailbox: string,
     uid: number,
     ticketNumber: string,
-  ): Promise<void> {
+  ): Promise<string | null> {
     const client = await this.connections.getImapClient(account);
     const lock = await client.getMailboxLock(mailbox);
     try {
-      await assertDestinationTagWithClient(client, uid, ticketNumber);
+      return await assertDestinationTagWithClient(client, uid, ticketNumber);
     } finally {
       lock.release();
     }

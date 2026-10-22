@@ -45,6 +45,8 @@ export const ERROR_KIND = {
   DUPLICATE_SUBJECT_HEADER: 'duplicate_subject_header',
   /** Subject field uses a bare CR/LF that is not a valid fold. */
   MALFORMED_SUBJECT_HEADER: 'malformed_subject_header',
+  /** An encoded-word in the Subject cannot be decoded, so conflict detection is impossible. */
+  UNDECODABLE_SUBJECT: 'undecodable_subject',
   /** Destination already had the Message-ID, but its Subject does not carry the requested tag. */
   DEDUP_TAG_MISMATCH: 'dedup_tag_mismatch',
   /** Tagged move requested but migration 003 has not been applied — refuse before APPEND. */
