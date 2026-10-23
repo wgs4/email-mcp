@@ -37,6 +37,20 @@ export const ERROR_KIND = {
   SOURCE_CLEANUP_UNSAFE: 'source_cleanup_unsafe',
   /** Source account has no SPECIAL-USE \Trash mailbox to MOVE into (D18). */
   TRASH_MAILBOX_NOT_FOUND: 'trash_mailbox_not_found',
+  /** ticketNumber is not a 3–10 digit osTicket ticket number. */
+  INVALID_TICKET_NUMBER: 'invalid_ticket_number',
+  /** Subject already carries a different osTicket tag — that mail belongs elsewhere. */
+  TICKET_TAG_CONFLICT: 'ticket_tag_conflict',
+  /** Message has more than one top-level Subject field; osTicket's choice is ambiguous. */
+  DUPLICATE_SUBJECT_HEADER: 'duplicate_subject_header',
+  /** Subject field uses a bare CR/LF that is not a valid fold. */
+  MALFORMED_SUBJECT_HEADER: 'malformed_subject_header',
+  /** An encoded-word in the Subject cannot be decoded, so conflict detection is impossible. */
+  UNDECODABLE_SUBJECT: 'undecodable_subject',
+  /** Destination already had the Message-ID, but its Subject does not carry the requested tag. */
+  DEDUP_TAG_MISMATCH: 'dedup_tag_mismatch',
+  /** Tagged move requested but migration 003 has not been applied — refuse before APPEND. */
+  MIGRATION_REQUIRED: 'migration_required',
 } as const;
 
 export type ErrorKind = (typeof ERROR_KIND)[keyof typeof ERROR_KIND];

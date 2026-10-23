@@ -7,6 +7,12 @@
  * source account's Trash (capability-gated, fail-closed). The audit log is part
  * of the move contract — no Postgres, no move (D-Premise-2 / D20).
  *
+ * Optional `ticketNumber`: osTicket threads a message onto an existing ticket
+ * only when the FIRST hash token in its Subject resolves to that ticket.
+ * Supplying it prepends the literal `[#N]` to the top-level Subject (and
+ * changes nothing else) before APPEND; a subject already tagged for a
+ * different ticket fails the move instead.
+ *
  * Registered only when settings.read_only is false (D17 — the read-only gate is
  * registration, not a runtime error). For same-account moves use move_email.
  */
@@ -28,7 +34,10 @@ function summarize(results: MoveResult[]): string {
   const failed = results.length - ok;
   const lines = results.map((r) => {
     if (r.success) {
-      return `  ✅ uid ${r.source_uid} → ${r.dest_account}/${r.dest_mailbox} (${r.status}, dest_uid ${r.dest_uid ?? '?'}, source ${r.source_cleanup}, log #${r.move_log_id})${r.warnings.length ? ` ⚠️ ${r.warnings.map((w) => w.kind).join(',')}` : ''}`;
+      const tag = r.ticket_tag
+        ? `, ticket [#${r.ticket_tag}]${r.subject_rewritten ? ' subject rewritten' : ''}`
+        : '';
+      return `  ✅ uid ${r.source_uid} → ${r.dest_account}/${r.dest_mailbox} (${r.status}, dest_uid ${r.dest_uid ?? '?'}, source ${r.source_cleanup}, log #${r.move_log_id}${tag})${r.warnings.length ? ` ⚠️ ${r.warnings.map((w) => w.kind).join(',')}` : ''}`;
     }
     return `  ❌ uid ${r.source_uid ?? '?'} — ${r.error_kind}: ${r.error_message}`;
   });
@@ -63,7 +72,10 @@ export default function registerCrossAccountMoveTool(
       'headers, flags, and original date (the message looks natively delivered ' +
       "at the destination). The source copy is moved to the source account's " +
       'Trash. For moves within ONE account use move_email instead. Requires the ' +
-      'routing Postgres database to be configured (the move is audit-logged).',
+      'routing Postgres database to be configured (the move is audit-logged). ' +
+      'Pass ticketNumber to attach this email to an existing osTicket ticket ' +
+      'instead of opening a new one. Find the ticket first (osTicket MCP ' +
+      'findMergeCandidates). The message must be UNREAD for osTicket to fetch it.',
     {
       sourceAccount: z.string().describe('Source account name (from list_accounts)'),
       sourceMailbox: z.string().describe('Source mailbox, e.g. INBOX'),
@@ -72,9 +84,18 @@ export default function registerCrossAccountMoveTool(
         .describe('Source UID, or an array of UIDs for a bulk move (sequential)'),
       destAccount: z.string().describe('Destination account name (must differ from source)'),
       destMailbox: z.string().default('INBOX').describe('Destination mailbox (default INBOX)'),
+      ticketNumber: z
+        .string()
+        .regex(/^\d{3,10}$/, 'ticketNumber must be 3-10 digits')
+        .optional()
+        .describe(
+          'Existing osTicket ticket number (3-10 digits). The literal [#N] is ' +
+            'prepended to the top-level Subject so osTicket threads this email ' +
+            'onto that ticket. The message must be UNREAD.',
+        ),
     },
     { readOnlyHint: false, destructiveHint: true, idempotentHint: true },
-    async ({ sourceAccount, sourceMailbox, emailId, destAccount, destMailbox }) => {
+    async ({ sourceAccount, sourceMailbox, emailId, destAccount, destMailbox, ticketNumber }) => {
       const cleanSource = sanitizeMailboxName(sourceMailbox);
       const cleanDest = sanitizeMailboxName(destMailbox);
       const ids = Array.isArray(emailId) ? emailId : [emailId];
@@ -86,13 +107,14 @@ export default function registerCrossAccountMoveTool(
             emailId: id,
             destAccount,
             destMailbox: cleanDest,
+            ticketNumber,
           })),
         );
         const anyFailed = results.some((r) => !r.success);
         await audit.log(
           'cross_account_move',
           sourceAccount,
-          { sourceMailbox, emailId, destAccount, destMailbox },
+          { sourceMailbox, emailId, destAccount, destMailbox, ticketNumber },
           anyFailed ? 'error' : 'ok',
           anyFailed ? results.find((r) => !r.success)?.error_message : undefined,
         );
@@ -108,7 +130,7 @@ export default function registerCrossAccountMoveTool(
         await audit.log(
           'cross_account_move',
           sourceAccount,
-          { sourceMailbox, emailId, destAccount, destMailbox },
+          { sourceMailbox, emailId, destAccount, destMailbox, ticketNumber },
           'error',
           msg,
         );
