@@ -982,9 +982,23 @@ Run a search and sweep every matching attachment into a dated folder. Great for 
 
 Default destination is `~/Downloads/email-attachments-<ISO-ts>/`. Per-email errors are collected in `errors[]` rather than aborting the whole run — you get a summary with `files_saved`, `total_size`, `skipped`, and the error list.
 
+## Raw Maildir Search (optional)
+
+Three read-only tools search the **Dovecot Maildir store on the mail server directly**, over SSH:
+every mailbox, every folder, every year — including mailboxes that are not configured as IMAP
+accounts here. They are **off by default** and registered only when `[maildir] enabled = true`.
+
+| Tool | Description |
+|------|-------------|
+| `maildir_search` | Header (default) or full-text search, attachment-name search, date range, domain/user/folder scope, paging. Reports `complete: false` with reasons when cut short |
+| `maildir_get_email` | Read one message by id: headers, size-capped text body, attachment list |
+| `maildir_save_attachment` | Save one attachment to a local file (home or tmp dir only) |
+
+Privacy, the sudo rule, limits and performance are in **[docs/maildir-search.md](docs/maildir-search.md)**.
+
 ## API
 
-### Tools (52)
+### Tools (55)
 
 #### Read (19)
 

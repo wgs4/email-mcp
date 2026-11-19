@@ -173,6 +173,33 @@ export interface AppConfig {
    * EMAIL_MCP_DATABASE_URL takes precedence over the TOML value.
    */
   database?: { url: string };
+  /**
+   * Read-only raw Maildir search over SSH (`[maildir]` in config.toml).
+   * Undefined when the section is absent. The maildir_* tools are registered
+   * only when `enabled` is true.
+   */
+  maildir?: MaildirConfig;
+}
+
+/** Camel-cased `[maildir]` section. See docs/maildir-search.md. */
+export interface MaildirConfig {
+  enabled: boolean;
+  sshHost: string;
+  root: string;
+  sudoUser: string;
+  allowedDomains: string[];
+  excludedDomains: string[];
+  /** `user@domain` entries. */
+  allowedUsers: string[];
+  excludedUsers: string[];
+  connectTimeoutSeconds: number;
+  defaultTimeoutSeconds: number;
+  maxTimeoutSeconds: number;
+  maxResults: number;
+  maxOutputBytes: number;
+  maxMessageBytes: number;
+  maxBodyChars: number;
+  concurrency: number;
 }
 
 // ---------------------------------------------------------------------------

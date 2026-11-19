@@ -2,6 +2,7 @@ import {
   AccountConfigSchema,
   AppConfigFileSchema,
   ImapConfigSchema,
+  MaildirConfigSchema,
   SettingsSchema,
   SmtpConfigSchema,
 } from './schema.js';
@@ -166,5 +167,49 @@ describe('AppConfigFileSchema', () => {
     expect(() =>
       AppConfigFileSchema.parse({ accounts: [validAccount()], database: { url: '' } }),
     ).toThrow();
+  });
+});
+
+describe('MaildirConfigSchema', () => {
+  it('is disabled by default with safe defaults', () => {
+    const c = MaildirConfigSchema.parse({});
+    expect(c).toMatchObject({
+      enabled: false,
+      ssh_host: 'mailserver',
+      root: '/var/vmail',
+      sudo_user: 'vmail',
+      allowed_domains: [],
+      excluded_users: [],
+      default_timeout_seconds: 300,
+      concurrency: 3,
+    });
+  });
+
+  it('is optional in the app config', () => {
+    const r = AppConfigFileSchema.parse({ accounts: [validAccount()] });
+    expect(r.maildir).toBeUndefined();
+  });
+
+  it.each([
+    ['ssh_host as an ssh option', { ssh_host: '-oProxyCommand=id' }],
+    ['ssh_host with a space', { ssh_host: 'mail server' }],
+    ['relative root', { root: 'var/vmail' }],
+    ['root with ..', { root: '/var/../etc' }],
+    ['root with a quote', { root: "/var/vmail'" }],
+    ['sudo_user with shell chars', { sudo_user: 'vmail;id' }],
+    ['bad domain', { allowed_domains: ['../x'] }],
+    ['user without domain', { excluded_users: ['justin'] }],
+    ['concurrency too high', { concurrency: 50 }],
+  ])('rejects %s', (_label, input) => {
+    expect(() => MaildirConfigSchema.parse(input)).toThrow();
+  });
+
+  it('lower-cases domains and users', () => {
+    const c = MaildirConfigSchema.parse({
+      allowed_domains: ['WGSUSA.com'],
+      excluded_users: ['Bart@WGSUSA.com'],
+    });
+    expect(c.allowed_domains).toEqual(['wgsusa.com']);
+    expect(c.excluded_users).toEqual(['bart@wgsusa.com']);
   });
 });

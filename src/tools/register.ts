@@ -11,6 +11,7 @@ import type CalendarService from '../services/calendar.service.js';
 import type HooksService from '../services/hooks.service.js';
 import type ImapService from '../services/imap.service.js';
 import type LocalCalendarService from '../services/local-calendar.service.js';
+import MaildirService from '../services/maildir/maildir.service.js';
 import type RemindersService from '../services/reminders.service.js';
 import type SchedulerService from '../services/scheduler.service.js';
 import type { SearchPresetRegistry } from '../services/search-presets.js';
@@ -34,6 +35,7 @@ import registerHealthTools from './health.tool.js';
 import registerLabelTools from './label.tool.js';
 import registerLocateTools from './locate.tool.js';
 import registerMailboxesTools from './mailboxes.tool.js';
+import registerMaildirTools from './maildir.tool.js';
 import registerManageTools from './manage.tool.js';
 import registerSavedSearchesTools from './saved-searches.tool.js';
 import registerSchedulerTools from './scheduler.tool.js';
@@ -80,6 +82,13 @@ export default function registerAllTools(
   registerLocateTools(server, imapService);
   registerWatcherTools(server, watcherService, hooksService, searchPresetRegistry);
   registerSavedSearchesTools(server, imapService, connections, searchPresetRegistry);
+
+  // Raw Maildir search — off unless `[maildir] enabled = true`. Read-only on
+  // the mail server (it only writes local files in maildir_save_attachment,
+  // like save_attachment), so it is also available in read-only mode.
+  if (config.maildir?.enabled) {
+    registerMaildirTools(server, new MaildirService(config.maildir));
+  }
 
   // Write tools — skipped in read-only mode
   if (!readOnly) {

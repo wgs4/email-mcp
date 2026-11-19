@@ -12,6 +12,7 @@ import type {
   AccountConfig,
   AppConfig,
   HookRule,
+  MaildirConfig,
   OAuth2Config,
   SearchPreset,
 } from '../types/index.js';
@@ -272,9 +273,34 @@ function resolveDatabaseConfig(raw: RawAppConfig['database']): { url: string } |
   return undefined;
 }
 
+function normalizeMaildirConfig(raw: RawAppConfig['maildir']): MaildirConfig | undefined {
+  if (!raw) return undefined;
+  // Strip a trailing slash so path joins and prefix checks stay exact.
+  const root = raw.root.length > 1 ? raw.root.replace(/\/+$/, '') : raw.root;
+  return {
+    enabled: raw.enabled,
+    sshHost: raw.ssh_host,
+    root,
+    sudoUser: raw.sudo_user,
+    allowedDomains: raw.allowed_domains,
+    excludedDomains: raw.excluded_domains,
+    allowedUsers: raw.allowed_users,
+    excludedUsers: raw.excluded_users,
+    connectTimeoutSeconds: raw.connect_timeout_seconds,
+    defaultTimeoutSeconds: Math.min(raw.default_timeout_seconds, raw.max_timeout_seconds),
+    maxTimeoutSeconds: raw.max_timeout_seconds,
+    maxResults: raw.max_results,
+    maxOutputBytes: raw.max_output_bytes,
+    maxMessageBytes: raw.max_message_bytes,
+    maxBodyChars: raw.max_body_chars,
+    concurrency: raw.concurrency,
+  };
+}
+
 function normalizeConfig(raw: RawAppConfig): AppConfig {
   return {
     database: resolveDatabaseConfig(raw.database),
+    maildir: normalizeMaildirConfig(raw.maildir),
     settings: {
       rateLimit: raw.settings.rate_limit,
       readOnly: raw.settings.read_only,
