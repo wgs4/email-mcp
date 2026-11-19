@@ -93,11 +93,15 @@ export default function registerMaildirTools(server: McpServer, maildir: Maildir
       since: z
         .string()
         .optional()
-        .describe('Delivered after this date (YYYY-MM-DD[ HH:MM], mail-server local time).'),
+        .describe(
+          'Delivered after this time (YYYY-MM-DD = the start of that day; mail-server local time).',
+        ),
       before: z
         .string()
         .optional()
-        .describe('Delivered on or before this date (YYYY-MM-DD[ HH:MM], mail-server local time).'),
+        .describe(
+          'Delivered before this time (YYYY-MM-DD = the start of that day; YYYY-MM-DD HH:MM; mail-server local time). since=2025-03-01, before=2025-04-01 = all of March.',
+        ),
       offset: z.number().int().min(0).default(0).describe('Paging offset.'),
       limit: z.number().int().min(1).max(200).default(50).describe('Page size (max 200).'),
       max_results: z

@@ -19,9 +19,9 @@
  * reported in `partial_reasons` and `complete: false` — never as "no hits".
  */
 
-import { mkdir, stat, writeFile } from 'node:fs/promises';
-import { homedir, userInfo } from 'node:os';
-import { dirname, join } from 'node:path';
+import { lstat, mkdir, realpath, stat, writeFile } from 'node:fs/promises';
+import { homedir, tmpdir, userInfo } from 'node:os';
+import { basename, dirname, join, sep } from 'node:path';
 
 import { simpleParser } from 'mailparser';
 
@@ -56,7 +56,6 @@ import {
   headerSearchPcre,
   makeLocalMatcher,
   termPcre,
-  termVariants,
 } from './patterns.js';
 import type { RemoteRunner, RemoteRunResult } from './remote.js';
 import { assertRemoteOk, firstLine, SshRemoteRunner } from './remote.js';
@@ -251,16 +250,68 @@ async function pool<T, R>(
   return { done, skipped };
 }
 
-function grepStderrIssues(stderr: string): { vanished: number; other: string[] } {
+const TOOL_ERROR_LINE = /^(?:\/usr\/bin\/)?(?:find|grep|head): /;
+
+/**
+ * Classify remote stderr. `find:`/`grep:` lines are real errors (files not
+ * read), except "No such file or directory" (a message renamed or moved by a
+ * flag change while we searched). Other lines (ssh notices, login banners)
+ * are kept as notes only. `missing` holds the absolute paths that vanished.
+ */
+function grepStderrIssues(stderr: string): {
+  vanished: number;
+  missing: Set<string>;
+  other: string[];
+  notes: string[];
+} {
   let vanished = 0;
+  const missing = new Set<string>();
   const other: string[] = [];
+  const notes: string[] = [];
   stderr.split('\n').forEach((line) => {
     const l = line.trim();
     if (!l) return;
-    if (l.endsWith('No such file or directory')) vanished += 1;
-    else other.push(l.slice(0, 300));
+    if (!TOOL_ERROR_LINE.test(l)) {
+      notes.push(l.slice(0, 300));
+    } else if (l.endsWith(': No such file or directory')) {
+      vanished += 1;
+      const m =
+        /^(?:\/usr\/bin\/)?(?:find|grep|head): (?:‘|')?(.*?)(?:’|')?: No such file or directory$/.exec(
+          l,
+        );
+      if (m) missing.add(m[1]);
+    } else {
+      other.push(l.slice(0, 300));
+    }
   });
-  return { vanished, other };
+  return { vanished, missing, other, notes };
+}
+
+/**
+ * A remote command that ended without our kill and with an exit code that
+ * find/grep/head never use for "no match" (0/1, grep error 2) was killed or
+ * crashed on the server (signal, OOM): its output may be incomplete.
+ */
+function abnormalExit(res: RemoteRunResult): string | null {
+  if (res.timedOut || res.truncated) return null;
+  if (res.exitCode === null) return 'the remote command was killed';
+  if (res.exitCode > 2) return `the remote command ended abnormally (exit ${String(res.exitCode)})`;
+  return null;
+}
+
+/**
+ * find(1) ends `-exec` at an argument that is exactly ";" or "{}" followed by
+ * "+", and substitutes "{}". A pattern argument must never be one of those.
+ */
+function assertExecSafe(args: string[]): void {
+  args.forEach((a) => {
+    if (a === ';' || a === '+' || a.includes('{}')) {
+      throw new MaildirInputError(
+        'The search pattern contains "{}" or is ";" / "+", which find -exec cannot pass safely. ' +
+          'Rephrase it (in a regex write \\{\\} for literal braces).',
+      );
+    }
+  });
 }
 
 function headerMatches(h: HeaderMap, field: HeaderField, match: (v: string) => boolean): boolean {
@@ -285,6 +336,34 @@ function toRow(file: MaildirFile, h: HeaderMap | undefined): Row {
     flags: file.flags,
     attachments: undefined,
   };
+}
+
+async function assertRealPathSafe(target: string): Promise<void> {
+  const realDir = await realpath(dirname(target));
+  const roots = await Promise.all(
+    [homedir(), tmpdir()].map(async (r) => {
+      try {
+        return await realpath(r);
+      } catch {
+        return r;
+      }
+    }),
+  );
+  if (!roots.some((r) => realDir === r || realDir.startsWith(`${r}${sep}`))) {
+    throw new MaildirInputError(
+      `Destination directory resolves to "${realDir}", outside the home and tmp directories — refusing to write.`,
+    );
+  }
+  try {
+    if ((await lstat(target)).isSymbolicLink()) {
+      throw new MaildirInputError(
+        `Destination "${basename(target)}" is a symbolic link — refusing to write.`,
+      );
+    }
+  } catch (err) {
+    if (err instanceof MaildirInputError) throw err;
+    // ENOENT: does not exist yet — fine.
+  }
 }
 
 function safeUser(): string {
@@ -479,6 +558,13 @@ export default class MaildirService {
         maxResults,
         deadline,
         criteria,
+      }).catch(async (err: unknown) => {
+        await this.safeAudit(
+          'maildir_search',
+          { who: safeUser(), criteria, elapsed_ms: Date.now() - started },
+          err instanceof Error ? err.message : String(err),
+        );
+        throw err;
       });
       this.storeEntry(cacheKey, entry);
     }
@@ -587,6 +673,8 @@ export default class MaildirService {
     } else {
       throw new MaildirInputError('No search criteria.');
     }
+    // Input problem → refuse before anything is scanned (not a per-mailbox failure).
+    assertExecSafe(MaildirService.grepArgs(primary, p.regex));
     if (p.attachment && primary.kind !== 'attachment') {
       secondary.push({ kind: 'attachment', term: p.attachment, fields: [] });
     }
@@ -618,8 +706,14 @@ export default class MaildirService {
       p.deadline,
       async (mailbox) => {
         const mdirs = byMailbox.get(mailbox) ?? [];
-        const res = await this.runPrimary(mdirs, primary, p.regex, p.since, p.before, p.deadline);
-        return { mailbox, res };
+        try {
+          const res = await this.runPrimary(mdirs, primary, p.regex, p.since, p.before, p.deadline);
+          return { mailbox, res, error: null };
+        } catch (err) {
+          // One failing mailbox must not hide the others' results — or be
+          // silently dropped: it is reported as not searched.
+          return { mailbox, res: null, error: err instanceof Error ? err.message : String(err) };
+        }
       },
     );
     notSearched.push(...skipped);
@@ -628,7 +722,14 @@ export default class MaildirService {
     mailboxes.forEach((mailbox) => {
       const item = done.get(mailbox);
       if (!item) return;
-      const { res } = item;
+      const { res, error } = item;
+      if (!res) {
+        notSearched.push(mailbox);
+        partialReasons.push(`${mailbox}: not searched: ${error ?? 'unknown error'}`);
+        return;
+      }
+      const abnormal = abnormalExit(res);
+      if (abnormal) partialReasons.push(`${mailbox}: ${abnormal}; results may be incomplete.`);
       if (res.timedOut) {
         notSearched.push(mailbox);
         partialReasons.push(`${mailbox}: timed out before the search finished.`);
@@ -643,6 +744,9 @@ export default class MaildirService {
       if (issues.other.length > 0) {
         partialReasons.push(`${mailbox}: server reported errors: ${issues.other[0]}`);
       }
+      issues.notes.forEach((n) => {
+        if (!warnings.includes(`Server said: ${n}`)) warnings.push(`Server said: ${n}`);
+      });
       this.collectCandidates(res, primary, mailbox, candidates);
     });
     if (skipped.length > 0) {
@@ -760,7 +864,9 @@ export default class MaildirService {
     args.push('-maxdepth', '1', '-type', 'f');
     if (since) args.push('-newermt', since);
     if (before) args.push('!', '-newermt', before);
-    args.push('-exec', '/usr/bin/grep', ...MaildirService.grepArgs(pass, regex), '{}', '+');
+    const grepArgs = MaildirService.grepArgs(pass, regex);
+    assertExecSafe(grepArgs);
+    args.push('-exec', '/usr/bin/grep', ...grepArgs, '{}', '+');
     const res = await this.runner.run('find', args, {
       timeoutMs: Math.max(1000, deadline - Date.now()),
       maxBytes: this.config.maxOutputBytes,
@@ -787,9 +893,8 @@ export default class MaildirService {
       ];
     }
     if (pass.kind === 'full_text') {
-      if (regex) return ['-a', '-P', '-i', '-l', '-Z', '-e', termPcre(pass.term, true), '--'];
-      const es = termVariants(pass.term).flatMap((v) => ['-e', v]);
-      return ['-a', '-F', '-i', '-l', '-Z', ...es, '--'];
+      // Fixed terms are byte-escaped PCRE (never ";", "+" or "{}" — safe in find -exec).
+      return ['-a', '-P', '-i', '-l', '-Z', '-e', termPcre(pass.term, regex), '--'];
     }
     return [
       '-a',
@@ -869,6 +974,8 @@ export default class MaildirService {
         if (issues.other.length > 0) {
           partialReasons.push(`Filter step: server reported errors: ${issues.other[0]}`);
         }
+        const abnormal = abnormalExit(res);
+        if (abnormal) partialReasons.push(`Filter step: ${abnormal}; some matches may be missing.`);
         splitNulList(res.stdout).forEach((abs) => {
           const rel = fromAbsolute(this.config.root, abs);
           if (rel) keep.add(rel);
@@ -955,15 +1062,17 @@ export default class MaildirService {
         list.push(bytesToText(rest));
         byPath.set(path, list);
       });
-      const failed = res.timedOut || res.truncated;
+      const failed = res.timedOut || res.truncated || abnormalExit(res) !== null;
+      const { missing } = grepStderrIssues(res.stderr);
       if (failed) {
         warnings.push('Attachment names could not be read for every result on this page.');
       }
       need.forEach((r) => {
-        const ls = byPath.get(toAbsolute(this.config.root, r.id));
+        const abs = toAbsolute(this.config.root, r.id);
+        const ls = byPath.get(abs);
         let names: string[] | null = [];
         if (ls) names = attachmentNamesFromLines(ls);
-        else if (failed) names = null;
+        else if (failed || missing.has(abs)) names = null; // unknown, not "none"
         // eslint-disable-next-line no-param-reassign
         r.attachments = names;
       });
@@ -1154,6 +1263,10 @@ export default class MaildirService {
     const finalPath = await resolveUniquePath(targetPath, params.overwrite ?? false);
     assertSafeDestination(finalPath);
     await mkdir(dirname(finalPath), { recursive: true });
+    // assertSafeDestination works on the path text; a symlinked directory
+    // (e.g. ~/link -> /etc) would still escape. Check the real directory and
+    // refuse to write through a symlink at the target itself.
+    await assertRealPathSafe(finalPath);
     await writeFile(finalPath, att.content, { flag: params.overwrite ? 'w' : 'wx' });
 
     await this.safeAudit('maildir_save_attachment', {
@@ -1172,9 +1285,13 @@ export default class MaildirService {
     };
   }
 
-  private async safeAudit(tool: string, params: Record<string, unknown>): Promise<void> {
+  private async safeAudit(
+    tool: string,
+    params: Record<string, unknown>,
+    error?: string,
+  ): Promise<void> {
     try {
-      await this.auditLog(tool, 'maildir', params, 'ok');
+      await this.auditLog(tool, 'maildir', params, error ? 'error' : 'ok', error?.slice(0, 300));
     } catch {
       // Audit failures never break a read.
     }

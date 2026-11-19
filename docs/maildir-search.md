@@ -94,13 +94,21 @@ line method was chosen.
 ### 2.3 Term forms (raw-byte matching)
 
 All matching runs on the **raw message bytes** in the C locale (`LC_ALL=C`, ASCII case folding,
-`-a` treats binary as text). A term is searched in these forms:
+`-a` treats binary as text). Fixed terms are sent as PCRE with every non-alphanumeric byte written
+as `\xHH`, so a term can never be read as regex syntax, and never as a `find -exec` terminator
+(`;`, `+`) or placeholder (`{}`). A term is searched in these forms:
 
 | Form | Example for `外` | Finds |
 |---|---|---|
 | plain | bytes `E5 A4 96` | ASCII text, 8-bit UTF-8 headers and bodies |
 | RFC 2047 Q-encoding of the UTF-8 bytes | `=E5=A4=96` (space → `_`) | `=?UTF-8?Q?...?=` headers and names |
 | RFC 2231 / %-encoding of the UTF-8 bytes | `%E5%A4%96` | `filename*=utf-8''...` names |
+
+**The C locale is required.** `LC_ALL=C` is set in front of `sudo`, and sudo keeps it (Ubuntu's
+default `env_keep` includes the `LC_*` variables). Verified 11/19/26: with it, `grep -P '\xe5\xa4\x96'`
+matches the UTF-8 bytes of `外`; without it, grep reads `\xe5` as the code point U+00E5 and finds
+nothing. If a future sudo policy drops `LC_ALL`, non-ASCII searches would silently miss — see
+Troubleshooting.
 
 **Not found:** words inside base64 (B-encoded headers `=?UTF-8?B?...?=`, base64 bodies) and
 non-UTF-8 encodings of non-ASCII terms (for example GBK `=CD=E2`). ASCII parts of a name are still
@@ -201,8 +209,8 @@ are combined with AND. Matching is case-insensitive.
 | `users` | string[] | `"justin"` (any domain) or `"justin@wgsusa.com"`. |
 | `folders` | string[] | Folder globs (`*`, `?`), case-insensitive: `"INBOX"`, `"Sent*"`, `"Archive*"`. |
 | `exclude_folders` | string[] | Folder globs to skip, e.g. `["Junk","spam","Trash"]`. Default: nothing skipped (spam-tagged mail is often real — the PO208780 drawing was tagged `***SPAM***`). |
-| `since` | `YYYY-MM-DD[ HH:MM[:SS]]` | Delivered after this time (server local time). |
-| `before` | same | Delivered on or before this time. |
+| `since` | `YYYY-MM-DD[ HH:MM[:SS]]` | Delivered after this time (server local time). A bare date is the start of that day. |
+| `before` | same | Delivered before this time (`find ! -newermt`). A bare date is the start of that day, so `since=2025-03-01`, `before=2025-04-01` is all of March. |
 | `offset` | int, 0 | Paging offset. |
 | `limit` | int, 50 (max 200) | Page size. |
 | `max_results` | int | Stop after this many hits (capped by config `max_results`). |
@@ -213,7 +221,7 @@ Which criterion drives the scan:
 | Given | Primary scan (per mailbox) | Then |
 |---|---|---|
 | `query`, `mode=headers` | header grep on `fields` | other criteria as filters |
-| `query`, `mode=full_text` | `grep -F -l` (or `-P` with `regex`) | other criteria as filters |
+| `query`, `mode=full_text` | `grep -P -l` (byte-escaped fixed term, or the user regex) | other criteria as filters |
 | no `query`, some of `from`/`to`/`subject` | header grep on the first of them | the rest checked locally on headers |
 | only `attachment_name` | `grep -P -l` on `name=`/`filename=` lines | — |
 
@@ -311,6 +319,8 @@ Allow/deny lists apply everywhere: discovery, search scope and every id passed t
 
 | Limit | Default | Effect when hit |
 |---|---|---|
+| One mailbox fails (ssh error, sudo refusal) | — | That mailbox is listed in `mailboxes_not_searched` with the reason; the other mailboxes still return. `complete: false`. |
+| Remote command killed on the server (exit > 2 or signal) | — | `complete: false` ("ended abnormally"). |
 | Search time (`timeout_seconds`) | 300 s (max 900) | Remaining mailboxes are not started; the running ssh calls are killed (SIGTERM, then SIGKILL after 2 s). `complete: false`, `mailboxes_not_searched` lists them. |
 | Output per remote call | 16 MiB | ssh is killed; `complete: false` ("too many matches"). |
 | Hits per search (`max_results`) | 2000 | `complete: false` ("Result cap reached"). |
@@ -330,10 +340,12 @@ Allow/deny lists apply everywhere: discovery, search scope and every id passed t
 | Read-only | Only `find`, `grep`, `head` run on the server. No write, move, delete or flag change exists in the code. `maildir_save_attachment` writes only a local file. |
 | No shell injection | ssh is spawned with an argv array (no local shell). The remote side runs a shell, so **every** argument — paths, patterns, dates, the sudo user, the tool path — is single-quoted with `'\''` escaping (`shQuote`). Arguments with NUL, CR or LF are refused before anything is sent. The command shape is fixed: `LC_ALL=C sudo -n -u '<user>' '/usr/bin/<tool>' '<arg>' ...` — no pipes, redirects, `;`, `&&` or subshells. `ssh_host`, `root` and `sudo_user` are validated at config load and again before use; `--` precedes the host so it cannot be read as an ssh option. |
 | Allow-listed tools | `buildRemoteCommand` refuses any tool outside `REMOTE_TOOLS = find, grep, head`. |
+| No find primaries from input | The only find primaries are fixed in code (`-mindepth`, `-maxdepth`, `-type`, `-name`, `-prune`, `-newermt`, `-printf`, `-print0`, `-exec /usr/bin/grep ... {} +`). Caller values reach find only as: start directories (validated paths under the root), `-newermt` dates (strict `YYYY-MM-DD[ HH:MM[:SS]]`), `-name` globs (escaped base names) and grep arguments inside `-exec`. A grep argument that is `;`, `+` or contains `{}` is refused before any scan, so input can never end `-exec` early and start new primaries (such as `-delete`). |
+| Local writes stay in home/tmp | `maildir_save_attachment` checks the path text (`assertSafeDestination`), then the **real** directory after symlinks (`realpath`) against the real home and tmp dirs, and refuses a target that is itself a symbolic link. Without `overwrite` the file is opened with `wx` (exclusive create). |
 | Paths stay in the root | Ids must match the Dovecot layout (§3), contain no `..`/`.` segments, no control characters, and (if absolute) start with `<root>/`. Remote output paths are re-validated the same way and must belong to the mailbox that was scanned; anything else is dropped. `find -name` globs built from ids are escaped. |
 | Bounded | Every remote call has a deadline and a byte cap (§7). |
 | Honest results | Anything cut short sets `complete: false` with reasons. A cut-short search with **no** hits returns `isError: true` with the text "Missing results do NOT mean the message does not exist" — the user never reads "not found" after a timeout (lesson from PR #12, search false negatives). Partial results are never cached. Errors say "nothing was found or ruled out". |
-| No body/credential logging | Nothing from message bodies is logged. stderr from the server is used only for error classification and short error messages (paths, not content). |
+| No body/credential logging | Nothing from message bodies is logged. stderr from the server is used only for error classification and short error messages (paths, not content). `find:`/`grep:` error lines make a result partial; "No such file or directory" (a message renamed by a flag change mid-search) is a warning; other stderr lines (banners, ssh notices) are passed on as `Server said: ...` warnings. |
 | Audit | One JSON line per call in `~/.local/share/email-mcp/audit.log` (tool `maildir_search` / `maildir_get_email` / `maildir_save_attachment`, account `maildir`): local OS user, criteria and scope, hit count, `complete`, elapsed time; for get/save the id and saved path. |
 | Off by default | `enabled = false` unless set; with no `[maildir]` section the tools do not exist. |
 
@@ -426,6 +438,8 @@ Next page: repeat the same search with `"offset": <next_offset>` (served from th
 | `complete: false`, "Time limit reached" | Add `since`/`before`, narrow users/folders, or raise `timeout_seconds` (≤ `max_timeout_seconds`). |
 | `complete: false`, "too many matches (output cap)" / "Result cap reached" | The term is too broad; add filters. |
 | Warning "renamed or moved during the search" | Someone read or moved mail while the search ran; run it again. |
+| Non-ASCII term finds nothing, ASCII works | The server's sudo policy may no longer keep `LC_ALL` (see §2.3). Test: `printf '外\n' \| ssh mailserver "LC_ALL=C sudo -n -u vmail /usr/bin/grep -c -P '\\xe5\\xa4\\x96'"` must print `1`. |
+| `The search pattern contains "{}" or is ";" / "+"` | Only in regex mode; write literal braces as `\{\}`. |
 | A known message is not found | The term may only exist inside base64 (B-encoded subject, base64 body) or in a non-UTF-8 encoding. Search an ASCII part of it, use `from`/`message-id`, or `attachment_name` with the ASCII part of the file name. |
 | `Message not found: <id>` | Deleted or moved to another folder since the search; search again. |
 | Save refused: "outside the user's home directory and tmp dir" | Use a path under `~` or `os.tmpdir()` (macOS: `$TMPDIR`, not `/tmp`). |

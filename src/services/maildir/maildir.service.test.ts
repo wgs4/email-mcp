@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -208,6 +208,7 @@ describe('MaildirService.search', () => {
       'maildir',
       expect.objectContaining({ hits: 3, complete: true }),
       'ok',
+      undefined,
     );
   });
 
@@ -342,12 +343,101 @@ describe('MaildirService.search', () => {
     await expect(svc.search(input)).rejects.toBeInstanceOf(MaildirInputError);
   });
 
-  it('full_text uses grep -F with every term variant', async () => {
+  it('full_text uses a byte-escaped PCRE with every term variant', async () => {
     const { svc, runner } = make();
     await svc.search({ query: '外形图', mode: 'full_text', users: ['lisa'] });
     const primary = runner.calls.find((c) => c.args.includes('-exec'));
-    expect(primary?.args).toEqual(
-      expect.arrayContaining(['-F', '-l', '外形图', '=E5=A4=96=E5=BD=A2=E5=9B=BE']),
+    expect(primary?.args).toEqual(expect.arrayContaining(['-P', '-l']));
+    const pattern = primary?.args[primary.args.indexOf('-e') + 1] ?? '';
+    expect(pattern).toContain('\\xe5\\xa4\\x96'); // raw UTF-8
+    expect(pattern).toContain('\\x3dE5\\x3dA4\\x3d96'); // Q-encoded
+    expect(pattern).toContain('\\x25E5\\x25A4\\x2596'); // %-encoded
+  });
+
+  it.each([
+    ';',
+    '+',
+    '{}',
+    'a{}b',
+  ])('never lets a fixed term end or alter find -exec (%j)', async (term) => {
+    const { svc, runner } = make();
+    await svc.search({ query: term, mode: 'full_text', users: ['lisa'] });
+    const primary = runner.calls.find((c) => c.args.includes('-exec'));
+    const execArgs = primary?.args.slice(primary.args.indexOf('-exec') + 1) ?? [];
+    // Only the final placeholder may be "{}" and only the last arg "+".
+    expect(execArgs.slice(-2)).toEqual(['{}', '+']);
+    expect(execArgs.slice(0, -2).some((a) => a === ';' || a === '+' || a.includes('{}'))).toBe(
+      false,
+    );
+  });
+
+  it('refuses a regex that would put "{}" into find -exec', async () => {
+    const { svc } = make();
+    await expect(
+      svc.search({ query: 'a{}', regex: true, mode: 'full_text', users: ['lisa'] }),
+    ).rejects.toThrow(/find -exec/);
+  });
+
+  it('a failing mailbox is reported as not searched; the others still return', async () => {
+    const runner = new FakeRunner();
+    const orig = runner.primary;
+    runner.primary = (args) =>
+      args.some((a) => a.includes('/lisa/'))
+        ? res('', { exitCode: 255, stderr: 'ssh: Connection reset' })
+        : orig(args);
+    const { svc } = make(runner);
+    const r = await svc.search({ query: 'PO208780' });
+    expect(r.complete).toBe(false);
+    expect(r.scope.mailboxes_not_searched).toEqual(['lisa@wgsusa.com']);
+    expect(r.partial_reasons.join(' ')).toMatch(/lisa@wgsusa.com: not searched: SSH/);
+    expect(r.results.map((x) => x.mailbox)).toContain('justin@wgsusa.com');
+  });
+
+  it('a remote command killed on the server makes the result partial', async () => {
+    const runner = new FakeRunner();
+    runner.primary = () => res('', { exitCode: 137 });
+    const { svc } = make(runner);
+    const r = await svc.search({ query: 'x' });
+    expect(r.complete).toBe(false);
+    expect(r.partial_reasons.join(' ')).toMatch(/abnormally \(exit 137\)/);
+  });
+
+  it('login banners on stderr are warnings, not partial results', async () => {
+    const runner = new FakeRunner();
+    const orig = runner.primary;
+    runner.primary = (args) => ({ ...orig(args), stderr: 'Authorized use only\n' });
+    const { svc } = make(runner);
+    const r = await svc.search({ query: 'PO208780' });
+    expect(r.complete).toBe(true);
+    expect(r.warnings).toContain('Server said: Authorized use only');
+  });
+
+  it('attachment names are null (unknown), not [], for a file that vanished', async () => {
+    const runner = new FakeRunner();
+    const origRun = runner.run;
+    runner.run = async (tool, args, o) => {
+      if (tool === 'grep' && args.includes('400')) {
+        return res('', {
+          exitCode: 2,
+          stderr: `/usr/bin/grep: ${LISA_HIT}: No such file or directory\n`,
+        });
+      }
+      return origRun(tool, args, o);
+    };
+    const { svc } = make(runner);
+    const r = await svc.search({ query: 'PO208780', users: ['lisa'] });
+    expect(r.results[0].attachments).toBeNull();
+  });
+
+  it('audits a failed search as an error', async () => {
+    const { svc, auditLog } = make();
+    await expect(svc.search({ query: 'x', users: ['nobody'] })).rejects.toThrow();
+    expect(auditLog).toHaveBeenCalledWith(
+      'maildir_search',
+      'maildir',
+      expect.anything(),
+      'error',
+      expect.stringMatching(/Nothing was searched/),
     );
   });
 });
@@ -398,6 +488,22 @@ describe('MaildirService.getEmail / saveAttachment', () => {
     expect(await readFile(String(a.path), 'utf-8')).toBe('%PDF-1.4 fake');
     const b = await svc.saveAttachment({ id: ID, index: 0, destination: dir });
     expect(b.path).toBe(join(dir, 'RV9110NO-FB12.5A7.0 外形图-1.pdf'));
+  });
+
+  it('refuses to write through a symlinked directory or file', async () => {
+    const { svc } = make();
+    const dir = await mkdtemp(join(tmpdir(), 'maildir-link-'));
+    await symlink('/etc', join(dir, 'etc-link'));
+    await expect(
+      svc.saveAttachment({ id: ID, index: 0, destination: join(dir, 'etc-link', 'x.pdf') }),
+    ).rejects.toThrow(/outside the home and tmp/);
+    const victim = join(dir, 'victim.txt');
+    await writeFile(victim, 'keep');
+    await symlink(victim, join(dir, 'a.pdf'));
+    await expect(
+      svc.saveAttachment({ id: ID, index: 0, destination: join(dir, 'a.pdf'), overwrite: true }),
+    ).rejects.toThrow(/symbolic link/);
+    expect(await readFile(victim, 'utf-8')).toBe('keep');
   });
 
   it('refuses destinations outside home/tmp', async () => {
