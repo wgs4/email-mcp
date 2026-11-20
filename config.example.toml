@@ -115,3 +115,26 @@ tls = true
 # port = 587
 # tls = false
 # starttls = true
+
+# ============================================================
+# RAW MAILDIR SEARCH (optional, OFF by default)
+# Read-only search of the Dovecot Maildir store on the mail server over SSH.
+# It reaches EVERY mailbox on the server (all employees), so enable it only
+# when the mail-store owner has authorized it. Needs an ssh_config alias with
+# key login and a narrow read-only sudo rule. See docs/maildir-search.md.
+# ============================================================
+
+# [maildir]
+# enabled = true
+# ssh_host = "mailserver"          # ssh_config alias or user@host
+# root = "/var/vmail"              # Dovecot: maildir:<root>/%d/%n/Maildir
+# sudo_user = "vmail"
+# allowed_domains = []             # empty = all domains
+# excluded_domains = []
+# allowed_users = []               # "user@domain"; empty = all mailboxes
+# excluded_users = []
+# default_timeout_seconds = 300
+# max_timeout_seconds = 900
+# max_results = 2000
+# concurrency = 3
+

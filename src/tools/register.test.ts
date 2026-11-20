@@ -18,6 +18,7 @@ vi.mock('./health.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./label.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./locate.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./mailboxes.tool.js', () => ({ default: vi.fn() }));
+vi.mock('./maildir.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./manage.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./saved-searches.tool.js', () => ({ default: vi.fn() }));
 vi.mock('./scheduler.tool.js', () => ({ default: vi.fn() }));
@@ -37,6 +38,7 @@ import registerDraftTools from './drafts.tool.js';
 import registerEmailsTools from './emails.tool.js';
 import registerFolderTools from './folders.tool.js';
 import registerLabelTools from './label.tool.js';
+import registerMaildirTools from './maildir.tool.js';
 import registerManageTools from './manage.tool.js';
 import registerSchedulerTools from './scheduler.tool.js';
 import registerSendTools from './send.tool.js';
@@ -136,5 +138,51 @@ describe('registerAllTools', () => {
     expect(registerFolderTools).not.toHaveBeenCalled();
     expect(registerTemplateWriteTools).not.toHaveBeenCalled();
     expect(registerSchedulerTools).not.toHaveBeenCalled();
+  });
+
+  it('registers maildir tools only when [maildir] enabled = true', () => {
+    const args = (cfg: AppConfig) =>
+      registerAllTools(
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        cfg,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+        {} as never,
+      );
+    args(createConfig(false));
+    expect(registerMaildirTools).not.toHaveBeenCalled();
+    args({ ...createConfig(true), maildir: { enabled: false } as AppConfig['maildir'] });
+    expect(registerMaildirTools).not.toHaveBeenCalled();
+    args({
+      ...createConfig(true),
+      maildir: {
+        enabled: true,
+        sshHost: 'mailserver',
+        root: '/var/vmail',
+        sudoUser: 'vmail',
+        allowedDomains: [],
+        excludedDomains: [],
+        allowedUsers: [],
+        excludedUsers: [],
+        connectTimeoutSeconds: 10,
+        defaultTimeoutSeconds: 300,
+        maxTimeoutSeconds: 900,
+        maxResults: 2000,
+        maxOutputBytes: 16_777_216,
+        maxMessageBytes: 67_108_864,
+        maxBodyChars: 20000,
+        concurrency: 3,
+      },
+    });
+    // Read-only on the server: registered even in read_only mode.
+    expect(registerMaildirTools).toHaveBeenCalledTimes(1);
   });
 });

@@ -207,8 +207,69 @@ export const DatabaseConfigSchema = z.object({
   url: z.string().min(1, 'database.url must be a non-empty Postgres connection string'),
 });
 
+// ---------------------------------------------------------------------------
+// Maildir — `[maildir]` in config.toml (read-only raw Dovecot store search)
+// ---------------------------------------------------------------------------
+// Optional and OFF by default. When enabled, the maildir_* tools read every
+// mailbox on the mail server over SSH through a narrow sudo rule. See
+// docs/maildir-search.md for the privacy and safety model.
+
+/** ssh_config host alias or user@host — never an ssh option. */
+const SSH_HOST_RE = /^[A-Za-z0-9_][A-Za-z0-9._@-]{0,252}$/;
+/** Absolute POSIX path with conservative characters and no `..` segments. */
+const ROOT_RE = /^\/[A-Za-z0-9._/-]*$/;
+const UNIX_USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
+const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
+const MAILBOX_ADDR_RE = /^[a-z0-9._+-]{1,64}@[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
+
+export const MaildirConfigSchema = z.object({
+  enabled: z.boolean().default(false),
+  ssh_host: z
+    .string()
+    .regex(SSH_HOST_RE, 'maildir.ssh_host must be an ssh_config alias or user@host')
+    .default('mailserver'),
+  root: z
+    .string()
+    .regex(ROOT_RE, 'maildir.root must be an absolute path of [A-Za-z0-9._/-]')
+    .refine((r) => !r.split('/').some((seg) => seg === '..' || seg === '.'), {
+      message: 'maildir.root must not contain "." or ".." segments',
+    })
+    .default('/var/vmail'),
+  sudo_user: z
+    .string()
+    .regex(UNIX_USER_RE, 'maildir.sudo_user must be a plain Unix user name')
+    .default('vmail'),
+  /** Empty = every domain under root. Lower-case domain names. */
+  allowed_domains: z.array(z.string().toLowerCase().regex(DOMAIN_RE)).default([]),
+  excluded_domains: z.array(z.string().toLowerCase().regex(DOMAIN_RE)).default([]),
+  /** Empty = every mailbox. Entries are `user@domain`. */
+  allowed_users: z.array(z.string().toLowerCase().regex(MAILBOX_ADDR_RE)).default([]),
+  excluded_users: z.array(z.string().toLowerCase().regex(MAILBOX_ADDR_RE)).default([]),
+  connect_timeout_seconds: z.number().int().min(1).max(60).default(10),
+  default_timeout_seconds: z.number().int().min(5).max(1800).default(300),
+  max_timeout_seconds: z.number().int().min(5).max(1800).default(900),
+  max_results: z.number().int().min(1).max(20000).default(2000),
+  /** Cap on stdout bytes read back from any one remote command. */
+  max_output_bytes: z
+    .number()
+    .int()
+    .min(64 * 1024)
+    .max(256 * 1024 * 1024)
+    .default(16 * 1024 * 1024),
+  /** Largest message maildir_get_email / maildir_save_attachment will read. */
+  max_message_bytes: z
+    .number()
+    .int()
+    .min(64 * 1024)
+    .max(512 * 1024 * 1024)
+    .default(64 * 1024 * 1024),
+  max_body_chars: z.number().int().min(1000).max(1_000_000).default(20000),
+  concurrency: z.number().int().min(1).max(8).default(3),
+});
+
 export const AppConfigFileSchema = z.object({
   database: DatabaseConfigSchema.optional(),
+  maildir: MaildirConfigSchema.optional(),
   settings: SettingsSchema.default({
     rate_limit: 10,
     read_only: false,
@@ -245,3 +306,4 @@ export type RawAccountConfig = z.infer<typeof AccountConfigSchema>;
 export type RawAppConfig = z.infer<typeof AppConfigFileSchema>;
 export type RawSearchPreset = z.infer<typeof SearchPresetSchema>;
 export type RawDatabaseConfig = z.infer<typeof DatabaseConfigSchema>;
+export type RawMaildirConfig = z.infer<typeof MaildirConfigSchema>;
