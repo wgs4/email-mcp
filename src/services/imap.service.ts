@@ -365,9 +365,11 @@ export function findMimePartByFilename(
  * `disposition === 'inline'` plus a Content-ID, so `extractAttachmentMeta`
  * and `downloadAttachment` never see it. `updateDraft` uses this walk to
  * carry those parts forward. Part numbers follow `findMimePartByFilename`
- * (prefer `node.part`; otherwise synthesize, and a `message/rfc822` wrapper
- * does not add a numbering level). The Content-ID has one surrounding `<>`
- * pair removed and is otherwise kept as stored.
+ * for the outer message (prefer `node.part`; otherwise synthesize). The walk
+ * stops at a `message/rfc822` attachment: its descendants stay inside that
+ * attachment and are not carried, and they are outside the outer draft's
+ * duplicate content_id check. The Content-ID has one surrounding `<>` pair
+ * removed and is otherwise kept as stored.
  */
 export interface InlineCidPart {
   partId: string;
@@ -413,12 +415,11 @@ export function extractInlineCidParts(bodyStructure: unknown): InlineCidPart[] {
       }
     }
 
-    if (Array.isArray(n.childNodes)) {
-      const isRfc822 = lowerType === 'message/rfc822';
+    // An attached message is its own document. Do not promote its parts.
+    if (Array.isArray(n.childNodes) && lowerType !== 'message/rfc822') {
       n.childNodes.forEach((child, index) => {
         const indexed = effectivePath ? `${effectivePath}.${index + 1}` : String(index + 1);
-        const childPart = isRfc822 ? effectivePath || String(index + 1) : indexed;
-        walk(child, childPart, depth + 1);
+        walk(child, indexed, depth + 1);
       });
     }
   };
@@ -645,6 +646,36 @@ async function messageToEmail(msg: Record<string, unknown>): Promise<Email> {
     attachments: extractAttachmentMeta(msg.bodyStructure),
     headers,
   };
+}
+
+interface RebuildBody {
+  bodyText?: string;
+  bodyHtml?: string;
+}
+
+/**
+ * Body text for a draft rebuild. `skipImageLinks` keeps `cid:` references,
+ * so a subject-only update does not embed a second copy of the image in the
+ * HTML. Display, reply, and forward stay on {@link messageToEmail}, which
+ * still rewrites those references for reading. An empty outer body uses the
+ * same forwarded-message fallback as display, also with `cid:` kept. Images
+ * inside that attached message are still not promoted into the outer draft.
+ * An oversized source returns `undefined` so the caller can fall back.
+ */
+async function parseDraftForRebuild(source: Buffer): Promise<RebuildBody | undefined> {
+  if (source.length > MAX_PARSE_SOURCE_BYTES) return undefined;
+  const parsed = await simpleParser(source, { skipImageLinks: true });
+  let bodyText = nonEmpty(parsed.text);
+  let bodyHtml = nonEmpty(typeof parsed.html === 'string' ? parsed.html : undefined);
+  if (!bodyText && !bodyHtml && Array.isArray(parsed.attachments)) {
+    const fwd = parsed.attachments.find(isRfc822Attachment);
+    if (fwd) {
+      const inner = await simpleParser(fwd.content, { skipImageLinks: true });
+      bodyText = nonEmpty(inner.text);
+      bodyHtml = nonEmpty(typeof inner.html === 'string' ? inner.html : undefined);
+    }
+  }
+  return { bodyText, bodyHtml };
 }
 
 // ---------------------------------------------------------------------------
@@ -2707,6 +2738,24 @@ export default class ImapService {
       options.mailbox,
     );
 
+    // A caller-supplied body is stored as given. Otherwise re-read the raw
+    // draft so cid: references survive. Do not fall back to existing.bodyHtml
+    // after a successful parse: that string has already been rewritten to
+    // data URLs. A parse failure happens before APPEND, so the old draft stays.
+    let rebuild: RebuildBody | undefined;
+    if (options.body === undefined) {
+      try {
+        const raw = await this.fetchDraftRaw(accountName, draftId, draftsPath);
+        const parsed = await parseDraftForRebuild(raw);
+        if (parsed) rebuild = parsed;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Failed to read the old draft for rebuild: ${msg}. Old draft was NOT deleted.`,
+        );
+      }
+    }
+
     // Determine which existing attachments to carry forward.
     const existingFilenames = existing.attachments.map((a) => a.filename);
     const existingSet = new Set(existingFilenames);
@@ -2734,10 +2783,13 @@ export default class ImapService {
     // Download the kept attachment bytes from the old draft (server-side, no MCP wire).
     const kept = await this.fetchKeptAttachments(accountName, draftId, draftsPath, keepFilenames);
 
-    // Inline cid parts are not in existing.attachments. Carry every one of
-    // them, unless attachments_remove names its filename. attachments_keep
-    // does not apply: the default keep set is the regular attachment list,
-    // and filtering inline parts by that set would drop them again.
+    // Inline cid parts are not in existing.attachments. Carry every one that
+    // belongs to the outer draft, unless attachments_remove names its
+    // filename. attachments_keep does not apply: the default keep set is the
+    // regular attachment list, and filtering inline parts by that set would
+    // drop them again. Parts inside a message/rfc822 attachment are not
+    // listed, so they stay in that attachment and are outside this duplicate
+    // check. Two outer parts that share a content id still fail the update.
     const removeFilenames = new Set(options.attachmentsRemove ?? []);
     const inlineParts = (await this.listInlineCidParts(accountName, draftId, draftsPath)).filter(
       (part) => !removeFilenames.has(part.filename),
@@ -2772,9 +2824,17 @@ export default class ImapService {
 
     const allAttachments = [...kept, ...inline, ...added];
 
-    // Merge: omitted fields keep the existing draft's value.
-    const html = options.html ?? !!existing.bodyHtml;
-    const body = options.body ?? (html ? (existing.bodyHtml ?? '') : (existing.bodyText ?? ''));
+    // Merge: omitted fields keep the existing draft's value. The body comes
+    // from the rebuild parse when the caller did not supply one.
+    const html = options.html ?? (rebuild !== undefined ? !!rebuild.bodyHtml : !!existing.bodyHtml);
+    let body: string;
+    if (options.body !== undefined) {
+      body = options.body;
+    } else if (rebuild !== undefined) {
+      body = html ? (rebuild.bodyHtml ?? '') : (rebuild.bodyText ?? '');
+    } else {
+      body = html ? (existing.bodyHtml ?? '') : (existing.bodyText ?? '');
+    }
     const subject = options.subject ?? existing.subject;
     const to = options.to ?? existing.to.map((a) => a.address);
     const cc = options.cc ?? existing.cc?.map((a) => a.address);

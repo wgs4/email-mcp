@@ -171,12 +171,14 @@ describe('extractAttachmentMeta', () => {
     ]);
   });
 
-  it('does not add a numbering level for a message/rfc822 wrapper', () => {
+  it('does not promote inline parts that live inside an attached message', () => {
     const struct = {
       type: 'multipart/mixed',
       childNodes: [
         {
           type: 'message/rfc822',
+          disposition: 'attachment',
+          dispositionParameters: { filename: 'private.eml' },
           childNodes: [
             {
               type: 'multipart/related',
@@ -195,7 +197,57 @@ describe('extractAttachmentMeta', () => {
         },
       ],
     };
-    expect(extractInlineCidParts(struct).map((part) => part.partId)).toEqual(['1.2']);
+    expect(extractInlineCidParts(struct)).toEqual([]);
+  });
+
+  it('still finds an outer inline part beside an attached message', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        {
+          type: 'multipart/related',
+          childNodes: [
+            { type: 'text/html', size: 20 },
+            {
+              type: 'image/png',
+              size: 10,
+              id: '<logo@example.test>',
+              disposition: 'inline',
+              dispositionParameters: { filename: 'logo.png' },
+            },
+          ],
+        },
+        {
+          type: 'message/rfc822',
+          disposition: 'attachment',
+          dispositionParameters: { filename: 'private.eml' },
+          childNodes: [
+            {
+              type: 'multipart/related',
+              childNodes: [
+                { type: 'text/html', size: 20 },
+                {
+                  type: 'image/png',
+                  size: 30,
+                  id: '<logo@example.test>',
+                  disposition: 'inline',
+                  dispositionParameters: { filename: 'inside.png' },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(extractInlineCidParts(struct)).toEqual([
+      {
+        partId: '1.2',
+        filename: 'logo.png',
+        mimeType: 'image/png',
+        size: 10,
+        cid: 'logo@example.test',
+      },
+    ]);
   });
 
   it('ignores inline parts with no content id and attachment parts that have one', () => {

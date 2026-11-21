@@ -1,4 +1,5 @@
 /* eslint-disable n/no-sync -- tests use sync fs helpers for setup/teardown */
+import { simpleParser } from 'mailparser';
 import type { IConnectionManager } from '../connections/types.js';
 import { applyBodyFormat } from '../utils/body-format.js';
 import ImapService from './imap.service.js';
@@ -1262,51 +1263,115 @@ describe('ImapService', () => {
 
   describe('updateDraft inline cid parts', () => {
     const png = Buffer.from('PNGDATA');
+    const pngBase64 = png.toString('base64');
+    const CRLF = '\r\n';
 
-    const inlineImageStructure = {
-      type: 'multipart/mixed',
-      childNodes: [
-        {
-          type: 'multipart/alternative',
-          childNodes: [
-            { type: 'text/plain', size: 100 },
-            {
-              type: 'multipart/related',
-              childNodes: [
-                { type: 'text/html', size: 400 },
-                {
-                  type: 'image/png',
-                  size: png.length,
-                  id: '<logo@example.com>',
-                  disposition: 'inline',
-                  dispositionParameters: { filename: 'logo.png' },
-                },
-              ],
-            },
-          ],
-        },
-      ],
-    };
+    function lines(rows: string[]): string {
+      return rows.join(CRLF);
+    }
 
-    function htmlSource(): Buffer {
+    function relatedImage(cid: string, filename: string): string {
+      return lines([
+        'Content-Type: image/png',
+        'Content-Transfer-Encoding: base64',
+        `Content-ID: <${cid}>`,
+        `Content-Disposition: inline; filename="${filename}"`,
+        '',
+        pngBase64,
+      ]);
+    }
+
+    function relatedSource(html: string, cid = 'logo@example.com', filename = 'logo.png'): Buffer {
       return Buffer.from(
-        'From: Test <test@example.com>\r\n' +
-          'To: geof@example.com\r\n' +
-          'Subject: old subject\r\n' +
-          'MIME-Version: 1.0\r\n' +
-          'Content-Type: text/html; charset=utf-8\r\n' +
-          '\r\n' +
-          '<p>Chart</p><img src="cid:logo@example.com">',
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/related; boundary="rel"',
+          '',
+          '--rel',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          html,
+          '--rel',
+          relatedImage(cid, filename),
+          '--rel--',
+          '',
+        ]),
       );
     }
 
-    async function* pngChunks(): AsyncGenerator<Buffer> {
-      yield png;
+    function relatedStructure(cid = 'logo@example.com', filename = 'logo.png') {
+      return {
+        type: 'multipart/related',
+        childNodes: [
+          { type: 'text/html', size: 40 },
+          {
+            type: 'image/png',
+            size: png.length,
+            id: `<${cid}>`,
+            disposition: 'inline',
+            dispositionParameters: { filename },
+          },
+        ],
+      };
     }
 
-    function primeInlineDraft() {
-      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
-      client.fetchOne.mockResolvedValue({
+    function attachedMessage(filename: string, inner: string): string {
+      return lines([
+        'Content-Type: message/rfc822',
+        `Content-Disposition: attachment; filename="${filename}"`,
+        '',
+        inner,
+      ]);
+    }
+
+    function innerRelated(html: string, cid: string, filename: string): string {
+      return lines([
+        'From: Inner <inner@example.test>',
+        'To: geof@example.com',
+        'Subject: inner',
+        'MIME-Version: 1.0',
+        'Content-Type: multipart/related; boundary="inner"',
+        '',
+        '--inner',
+        'Content-Type: text/html; charset=utf-8',
+        '',
+        html,
+        '--inner',
+        relatedImage(cid, filename),
+        '--inner--',
+        '',
+      ]);
+    }
+
+    function rfc822Node(filename: string, size: number, cid: string, imageName: string) {
+      return {
+        type: 'message/rfc822',
+        disposition: 'attachment',
+        dispositionParameters: { filename },
+        size,
+        childNodes: [
+          {
+            type: 'multipart/related',
+            childNodes: [
+              { type: 'text/html', size: 20 },
+              {
+                type: 'image/png',
+                size: png.length,
+                id: `<${cid}>`,
+                disposition: 'inline',
+                dispositionParameters: { filename: imageName },
+              },
+            ],
+          },
+        ],
+      };
+    }
+
+    function draftFetch(source: Buffer, bodyStructure: unknown) {
+      return {
         uid: 7,
         envelope: {
           subject: 'old subject',
@@ -1315,15 +1380,35 @@ describe('ImapService', () => {
           messageId: '<old@example.com>',
         },
         flags: new Set(['\\Draft', '\\Seen']),
-        bodyStructure: inlineImageStructure,
-        source: htmlSource(),
-      });
-      client.download.mockImplementation(async () => ({ content: pngChunks() }));
+        bodyStructure,
+        source,
+      };
+    }
+
+    async function* oneChunk(buf: Buffer): AsyncGenerator<Buffer> {
+      yield buf;
+    }
+
+    function primeInlineDraft() {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      const html = '<p>Original</p><img src="cid:logo@example.com">';
+      client.fetchOne.mockResolvedValue(draftFetch(relatedSource(html), relatedStructure()));
+      client.download.mockImplementation(async () => ({ content: oneChunk(png) }));
     }
 
     function appendedRaw(): string {
       const [, raw] = client.append.mock.calls[0] as [string, Buffer];
       return raw.toString('binary');
+    }
+
+    async function storedHtml(): Promise<string> {
+      const [, raw] = client.append.mock.calls[0] as [string, Buffer];
+      const parsed = await simpleParser(raw, { skipImageLinks: true });
+      return typeof parsed.html === 'string' ? parsed.html : '';
+    }
+
+    function downloadParts(): string[] {
+      return client.download.mock.calls.map((call) => String(call[1]));
     }
 
     it('carries an inline cid part forward when only the subject changes', async () => {
@@ -1334,12 +1419,16 @@ describe('ImapService', () => {
         subject: 'Fixed typo',
       });
 
-      expect(client.download).toHaveBeenCalledWith('7', '1.2.2', { uid: true });
+      expect(client.download).toHaveBeenCalledWith('7', '2', { uid: true });
       const text = appendedRaw();
       expect(text).toContain('Fixed typo');
       expect(text).toMatch(/content-id:\s*<logo@example.com>/i);
       expect(text).toMatch(/content-disposition:\s*inline/i);
-      expect(text).toContain(png.toString('base64'));
+      expect(text).toContain(pngBase64);
+      const html = await storedHtml();
+      expect(html).toContain('src="cid:logo@example.com"');
+      expect(html).not.toMatch(/data:image/i);
+      expect(html).not.toContain(pngBase64);
       expect(updated.warnings).toEqual([]);
       expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
     });
@@ -1353,8 +1442,11 @@ describe('ImapService', () => {
         attachmentsKeep: [],
       });
 
-      expect(client.download).toHaveBeenCalledWith('7', '1.2.2', { uid: true });
+      expect(client.download).toHaveBeenCalledWith('7', '2', { uid: true });
       expect(appendedRaw()).toMatch(/content-id:\s*<logo@example.com>/i);
+      const html = await storedHtml();
+      expect(html).toContain('src="cid:logo@example.com"');
+      expect(html).not.toMatch(/data:image/i);
       expect(updated.warnings).toEqual([]);
     });
 
@@ -1368,7 +1460,13 @@ describe('ImapService', () => {
       });
 
       expect(client.download).not.toHaveBeenCalled();
-      expect(appendedRaw()).not.toMatch(/content-id:\s*<logo@example.com>/i);
+      const text = appendedRaw();
+      expect(text).not.toMatch(/content-id:\s*<logo@example.com>/i);
+      expect(text).not.toContain(pngBase64);
+      const html = await storedHtml();
+      expect(html).toContain('src="cid:logo@example.com"');
+      expect(html).not.toMatch(/data:image/i);
+      expect(html).not.toContain(pngBase64);
       expect(updated.warnings).toEqual([
         'Body references cid:logo@example.com but no attachment has content_id "logo@example.com".',
       ]);
@@ -1431,7 +1529,7 @@ describe('ImapService', () => {
         },
         flags: new Set(['\\Draft', '\\Seen']),
         bodyStructure: doubled,
-        source: htmlSource(),
+        source: relatedSource('<p>Original</p><img src="cid:logo@example.com">'),
       });
 
       await expect(
@@ -1455,6 +1553,212 @@ describe('ImapService', () => {
 
       expect(client.append).not.toHaveBeenCalled();
       expect(client.messageDelete).not.toHaveBeenCalled();
+    });
+
+    it('leaves get_email display rewriting of cid refs unchanged', async () => {
+      primeInlineDraft();
+
+      const email = await service.getEmail('test', '7', 'Drafts');
+
+      expect(email.bodyHtml).toContain('data:image/png;base64,UE5HREFUQQ==');
+      expect(email.bodyHtml).not.toContain('cid:logo@example.com');
+    });
+
+    it('does not promote an inline image out of a removed attached message', async () => {
+      const inner = innerRelated('<p>Secret</p>', 'private@example.test', 'private.png');
+      const source = Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/mixed; boundary="mix"',
+          '',
+          '--mix',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          '<p>Public</p>',
+          '--mix',
+          attachedMessage('private.eml', inner),
+          '--mix--',
+          '',
+        ]),
+      );
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'text/html', size: 15 },
+          rfc822Node(
+            'private.eml',
+            Buffer.byteLength(inner),
+            'private@example.test',
+            'private.png',
+          ),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(source, bodyStructure));
+      client.download.mockImplementation(async () => ({ content: oneChunk(png) }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+        attachmentsRemove: ['private.eml'],
+      });
+
+      expect(client.download).not.toHaveBeenCalled();
+      const text = appendedRaw();
+      expect(text).toContain('Public');
+      expect(text).not.toContain('private@example.test');
+      expect(text).not.toContain(pngBase64);
+      expect(text).not.toMatch(/content-disposition:\s*inline/i);
+      expect(updated.warnings).toEqual([]);
+    });
+
+    it('keeps an attached message intact without promoting its inline image', async () => {
+      const inner = innerRelated('<p>Secret</p>', 'private@example.test', 'private.png');
+      const innerBytes = Buffer.from(inner);
+      const source = Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/mixed; boundary="mix"',
+          '',
+          '--mix',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          '<p>Public</p>',
+          '--mix',
+          attachedMessage('private.eml', inner),
+          '--mix--',
+          '',
+        ]),
+      );
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'text/html', size: 15 },
+          rfc822Node('private.eml', innerBytes.length, 'private@example.test', 'private.png'),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(source, bodyStructure));
+      client.download.mockImplementation(async (_uid: string, part: string) => ({
+        content: oneChunk(part === '2' ? innerBytes : png),
+      }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      expect(downloadParts()).toEqual(['2']);
+      expect(appendedRaw()).toContain('Public');
+      expect(updated.warnings).toEqual([]);
+      expect(client.append).toHaveBeenCalled();
+    });
+
+    it('does not treat an attached message content id as a duplicate of the outer draft', async () => {
+      const inner = innerRelated('<p>Secret</p>', 'logo@example.test', 'inside.png');
+      const innerBytes = Buffer.from(inner);
+      const outerHtml = '<p>Public</p><img src="cid:logo@example.test">';
+      const source = Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/mixed; boundary="mix"',
+          '',
+          '--mix',
+          'Content-Type: multipart/related; boundary="rel"',
+          '',
+          '--rel',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          outerHtml,
+          '--rel',
+          relatedImage('logo@example.test', 'logo.png'),
+          '--rel--',
+          '--mix',
+          attachedMessage('private.eml', inner),
+          '--mix--',
+          '',
+        ]),
+      );
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          relatedStructure('logo@example.test', 'logo.png'),
+          rfc822Node('private.eml', innerBytes.length, 'logo@example.test', 'inside.png'),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(source, bodyStructure));
+      client.download.mockImplementation(async (_uid: string, part: string) => ({
+        content: oneChunk(part === '2' ? innerBytes : png),
+      }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      expect(downloadParts()).toEqual(['2', '1.2']);
+      const html = await storedHtml();
+      expect(html).toContain('src="cid:logo@example.test"');
+      expect(html).not.toMatch(/data:image/i);
+      expect(html).not.toContain(pngBase64);
+      expect(updated.warnings).toEqual([]);
+      expect(client.append).toHaveBeenCalled();
+      expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+    });
+
+    it('keeps cid refs when the editable body is an embedded message and does not promote its images', async () => {
+      const inner = innerRelated(
+        '<p>Forwarded</p><img src="cid:logo@example.test">',
+        'logo@example.test',
+        'logo.png',
+      );
+      const innerBytes = Buffer.from(inner);
+      const source = Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/mixed; boundary="mix"',
+          '',
+          '--mix',
+          attachedMessage('fwd.eml', inner),
+          '--mix--',
+          '',
+        ]),
+      );
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [rfc822Node('fwd.eml', innerBytes.length, 'logo@example.test', 'logo.png')],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(source, bodyStructure));
+      client.download.mockImplementation(async (_uid: string, part: string) => ({
+        content: oneChunk(part === '1' ? innerBytes : png),
+      }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      expect(downloadParts()).toEqual(['1']);
+      const html = await storedHtml();
+      expect(html).toContain('src="cid:logo@example.test"');
+      expect(html).not.toMatch(/data:image/i);
+      expect(updated.warnings).toEqual([
+        'Body references cid:logo@example.test but no attachment has content_id "logo@example.test".',
+      ]);
     });
   });
 
