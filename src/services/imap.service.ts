@@ -322,7 +322,10 @@ export function inlineCidWarnings(
  * introduces, so that is preferred. The synthesized fallback (used only
  * when `part` is absent) accounts for `message/rfc822`: the embedded
  * message's root keeps the wrapper's section number rather than gaining
- * an extra `.1` level.
+ * an extra `.1` level. A non-multipart root has no section at all. Its
+ * body is TEXT (the section imapflow uses for a childless section 1).
+ * Section 1 itself is the first encapsulated part once that root has
+ * children, which a `message/rfc822` attachment does.
  */
 export function findMimePartByFilename(
   bodyStructure: unknown,
@@ -341,7 +344,10 @@ export function findMimePartByFilename(
 
   const classified = classifyAttachmentNode(bs);
   if (classified?.filename === targetFilename) {
-    return effectivePath || undefined;
+    // The root attachment is the message body. imapflow leaves `part` unset
+    // there, and section 1 would select the first child of a root .eml.
+    if (!effectivePath) return 'TEXT';
+    return effectivePath;
   }
 
   if (Array.isArray(bs.childNodes)) {
@@ -2509,6 +2515,19 @@ export default class ImapService {
 
     const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
     const hasDraftAttachments = !!options.attachments && options.attachments.length > 0;
+    const blankBody = options.body.trim().length === 0;
+    // Nodemailer drops an empty string, then promotes a lone attachment to
+    // the MIME root. That root has no section, so the next update cannot
+    // download it. A real empty text part keeps multipart/mixed. The attached
+    // message is not copied into this part.
+    let bodyOption: { text: string | { content: Buffer } } | { html: string };
+    if (hasDraftAttachments && blankBody) {
+      bodyOption = { text: { content: Buffer.alloc(0) } };
+    } else if (options.html) {
+      bodyOption = { html: options.body };
+    } else {
+      bodyOption = { text: options.body };
+    }
 
     const mailOptions = {
       from: fromAddr,
@@ -2518,7 +2537,7 @@ export default class ImapService {
       subject: options.subject,
       inReplyTo: options.inReplyTo,
       date: new Date(),
-      ...(options.html ? { html: options.body } : { text: options.body }),
+      ...bodyOption,
       ...(hasDraftAttachments ? { attachments: options.attachments } : {}),
     };
 

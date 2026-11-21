@@ -573,6 +573,46 @@ describe('findMimePartByFilename', () => {
     // returned undefined → "Could not locate MIME part").
     expect(findMimePartByFilename(appleMail, 'motorbass2023.pdf')).toBe('2.2');
   });
+
+  it('addresses a root message/rfc822 attachment as TEXT, not its first child', () => {
+    // imapflow assigns no part to the root. The encapsulated HTML is section
+    // 1; the .eml itself is the message body (TEXT).
+    const root = {
+      type: 'message/rfc822',
+      disposition: 'inline',
+      parameters: { name: 'private.eml' },
+      dispositionParameters: { filename: 'private.eml' },
+      size: 400,
+      childNodes: [
+        {
+          type: 'multipart/related',
+          childNodes: [
+            { type: 'text/html', part: '1', size: 20 },
+            {
+              type: 'image/png',
+              part: '2',
+              size: 8,
+              id: '<private@example.test>',
+              disposition: 'inline',
+              dispositionParameters: { filename: 'private.png' },
+            },
+          ],
+        },
+      ],
+    };
+    expect(findMimePartByFilename(root, 'private.eml')).toBe('TEXT');
+    expect(findMimePartByFilename(root, 'private.png')).toBeUndefined();
+  });
+
+  it('addresses a childless root attachment as TEXT', () => {
+    const root = {
+      type: 'application/pdf',
+      disposition: 'attachment',
+      dispositionParameters: { filename: 'notes.pdf' },
+      size: 100,
+    };
+    expect(findMimePartByFilename(root, 'notes.pdf')).toBe('TEXT');
+  });
 });
 
 // ---------------------------------------------------------------------------
