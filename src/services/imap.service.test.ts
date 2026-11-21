@@ -1237,6 +1237,225 @@ describe('ImapService', () => {
 
       expect(client.append).not.toHaveBeenCalled();
     });
+
+    it('rejects a non-ASCII content_id before APPEND', async () => {
+      await expect(
+        service.saveDraftWithAttachments('test', {
+          to: ['geof@example.com'],
+          subject: 'chart',
+          html: true,
+          body: '<img src="cid:café">',
+          attachments: [
+            {
+              contentBase64: Buffer.from('png').toString('base64'),
+              filename: 'chart.png',
+              mimeType: 'image/png',
+              contentId: 'café',
+            },
+          ],
+        }),
+      ).rejects.toThrow(/printable ASCII/);
+
+      expect(client.append).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('updateDraft inline cid parts', () => {
+    const png = Buffer.from('PNGDATA');
+
+    const inlineImageStructure = {
+      type: 'multipart/mixed',
+      childNodes: [
+        {
+          type: 'multipart/alternative',
+          childNodes: [
+            { type: 'text/plain', size: 100 },
+            {
+              type: 'multipart/related',
+              childNodes: [
+                { type: 'text/html', size: 400 },
+                {
+                  type: 'image/png',
+                  size: png.length,
+                  id: '<logo@example.com>',
+                  disposition: 'inline',
+                  dispositionParameters: { filename: 'logo.png' },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+
+    function htmlSource(): Buffer {
+      return Buffer.from(
+        'From: Test <test@example.com>\r\n' +
+          'To: geof@example.com\r\n' +
+          'Subject: old subject\r\n' +
+          'MIME-Version: 1.0\r\n' +
+          'Content-Type: text/html; charset=utf-8\r\n' +
+          '\r\n' +
+          '<p>Chart</p><img src="cid:logo@example.com">',
+      );
+    }
+
+    async function* pngChunks(): AsyncGenerator<Buffer> {
+      yield png;
+    }
+
+    function primeInlineDraft() {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue({
+        uid: 7,
+        envelope: {
+          subject: 'old subject',
+          from: [{ name: 'Test', address: 'test@example.com' }],
+          to: [{ address: 'geof@example.com' }],
+          messageId: '<old@example.com>',
+        },
+        flags: new Set(['\\Draft', '\\Seen']),
+        bodyStructure: inlineImageStructure,
+        source: htmlSource(),
+      });
+      client.download.mockImplementation(async () => ({ content: pngChunks() }));
+    }
+
+    function appendedRaw(): string {
+      const [, raw] = client.append.mock.calls[0] as [string, Buffer];
+      return raw.toString('binary');
+    }
+
+    it('carries an inline cid part forward when only the subject changes', async () => {
+      primeInlineDraft();
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      expect(client.download).toHaveBeenCalledWith('7', '1.2.2', { uid: true });
+      const text = appendedRaw();
+      expect(text).toContain('Fixed typo');
+      expect(text).toMatch(/content-id:\s*<logo@example.com>/i);
+      expect(text).toMatch(/content-disposition:\s*inline/i);
+      expect(text).toContain(png.toString('base64'));
+      expect(updated.warnings).toEqual([]);
+      expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+    });
+
+    it('still carries inline cid parts when attachments_keep is empty', async () => {
+      primeInlineDraft();
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+        attachmentsKeep: [],
+      });
+
+      expect(client.download).toHaveBeenCalledWith('7', '1.2.2', { uid: true });
+      expect(appendedRaw()).toMatch(/content-id:\s*<logo@example.com>/i);
+      expect(updated.warnings).toEqual([]);
+    });
+
+    it('drops an inline cid part named in attachments_remove and warns about the missing cid', async () => {
+      primeInlineDraft();
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+        attachmentsRemove: ['logo.png'],
+      });
+
+      expect(client.download).not.toHaveBeenCalled();
+      expect(appendedRaw()).not.toMatch(/content-id:\s*<logo@example.com>/i);
+      expect(updated.warnings).toEqual([
+        'Body references cid:logo@example.com but no attachment has content_id "logo@example.com".',
+      ]);
+    });
+
+    it('rejects a new content_id that duplicates a carried inline part before APPEND', async () => {
+      primeInlineDraft();
+
+      await expect(
+        service.updateDraft('test', 7, {
+          mailbox: 'Drafts',
+          attachmentsAdd: [
+            {
+              contentBase64: Buffer.from('new').toString('base64'),
+              filename: 'other.png',
+              contentId: '<logo@example.com>',
+            },
+          ],
+        }),
+      ).rejects.toThrow(/duplicate content_id "logo@example.com"[\s\S]*Old draft was NOT deleted/);
+
+      expect(client.append).not.toHaveBeenCalled();
+      expect(client.messageDelete).not.toHaveBeenCalled();
+    });
+
+    it('rejects two carried inline parts that share a content id before APPEND', async () => {
+      const doubled = {
+        type: 'multipart/mixed',
+        childNodes: [
+          {
+            type: 'multipart/related',
+            childNodes: [
+              { type: 'text/html', size: 40 },
+              {
+                type: 'image/png',
+                size: png.length,
+                id: '<logo@example.com>',
+                disposition: 'inline',
+                dispositionParameters: { filename: 'logo.png' },
+              },
+              {
+                type: 'image/png',
+                size: png.length,
+                id: 'logo@example.com',
+                disposition: 'inline',
+                dispositionParameters: { filename: 'other.png' },
+              },
+            ],
+          },
+        ],
+      };
+      primeInlineDraft();
+      client.fetchOne.mockResolvedValue({
+        uid: 7,
+        envelope: {
+          subject: 'old subject',
+          from: [{ name: 'Test', address: 'test@example.com' }],
+          to: [{ address: 'geof@example.com' }],
+          messageId: '<old@example.com>',
+        },
+        flags: new Set(['\\Draft', '\\Seen']),
+        bodyStructure: doubled,
+        source: htmlSource(),
+      });
+
+      await expect(
+        service.updateDraft('test', 7, { mailbox: 'Drafts', subject: 'Fixed typo' }),
+      ).rejects.toThrow(/duplicate content_id "logo@example.com"[\s\S]*Old draft was NOT deleted/);
+
+      expect(client.append).not.toHaveBeenCalled();
+      expect(client.messageDelete).not.toHaveBeenCalled();
+    });
+
+    it('leaves the old draft in place when an inline part cannot be downloaded', async () => {
+      primeInlineDraft();
+      client.download.mockResolvedValue({ content: null });
+
+      await expect(
+        service.updateDraft('test', 7, {
+          mailbox: 'Drafts',
+          subject: 'Fixed typo',
+        }),
+      ).rejects.toThrow(/Old draft was NOT deleted/);
+
+      expect(client.append).not.toHaveBeenCalled();
+      expect(client.messageDelete).not.toHaveBeenCalled();
+    });
   });
 
   describe('appendToSent', () => {

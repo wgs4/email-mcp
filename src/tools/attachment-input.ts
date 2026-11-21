@@ -15,7 +15,7 @@ const contentIdField = z
   .string()
   .optional()
   .describe(
-    'Makes the attachment an inline part; reference it from the HTML body as <img src="cid:VALUE">.',
+    'Makes the attachment an inline part; reference it from the HTML body as <img src="cid:VALUE">. VALUE must be printable ASCII with no space, double quote, or angle brackets (one surrounding <> pair is stripped).',
   );
 
 const attachmentFromPath = z.object({

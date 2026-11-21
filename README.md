@@ -1051,7 +1051,7 @@ Privacy, the sudo rule, limits and performance are in **[docs/maildir-search.md]
 }
 ```
 
-The chart is a `multipart/related` part with `Content-ID: <chart1>` and `Content-Disposition: inline`. `notes.pdf` stays a normal attachment. The tool warns, and still saves or sends, when the HTML body references a `cid:` that no attachment has, or when `content_id` is set but `html` is false. Rebuilding an existing draft still flattens inline parts that were already stored on the old draft.
+The chart is a `multipart/related` part with `Content-ID: <chart1>` and `Content-Disposition: inline`. `notes.pdf` stays a normal attachment. `content_id` must be printable ASCII with no space, double quote, or angle brackets, so the Content-ID header is stored unchanged. One surrounding `<>` pair is stripped. The tool warns, and still saves or sends, when the HTML body references a `cid:` that no attachment has, or when `content_id` is set but `html` is false. Rebuilding a draft carries forward each inline cid part already stored on the old draft (Content-Disposition inline and a Content-ID): the part is downloaded by MIME part number and re-attached with the same Content-ID. `attachments_keep` does not apply to those parts. `attachments_remove` drops one when its filename matches. A new attachment whose `content_id` duplicates a carried part is rejected and the old draft is left in place.
 
 #### Manage (7)
 

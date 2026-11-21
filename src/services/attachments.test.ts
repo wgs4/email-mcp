@@ -8,6 +8,7 @@ import type ImapService from './imap.service.js';
 import {
   extractAttachmentMeta,
   extractCidReferences,
+  extractInlineCidParts,
   findMimePartByFilename,
   hasAttachments,
   inlineCidWarnings,
@@ -131,6 +132,92 @@ describe('extractAttachmentMeta', () => {
   it('skips inline images (disposition=inline + content-id)', () => {
     const result = extractAttachmentMeta(multipartMixedWithInlineImage);
     expect(result).toEqual([]);
+  });
+
+  it('locates that same inline image for draft rebuild, with one bracket pair removed', () => {
+    expect(extractInlineCidParts(multipartMixedWithInlineImage)).toEqual([
+      {
+        partId: '1.2.2',
+        filename: 'logo.png',
+        mimeType: 'image/png',
+        size: 8000,
+        cid: 'logo@example.com',
+      },
+    ]);
+  });
+
+  it('prefers node.part over a synthesized section number', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        {
+          type: 'image/png',
+          part: '2.1',
+          size: 10,
+          id: 'chart1',
+          disposition: 'INLINE',
+          parameters: { name: 'chart.png' },
+        },
+      ],
+    };
+    expect(extractInlineCidParts(struct)).toEqual([
+      {
+        partId: '2.1',
+        filename: 'chart.png',
+        mimeType: 'image/png',
+        size: 10,
+        cid: 'chart1',
+      },
+    ]);
+  });
+
+  it('does not add a numbering level for a message/rfc822 wrapper', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        {
+          type: 'message/rfc822',
+          childNodes: [
+            {
+              type: 'multipart/related',
+              childNodes: [
+                { type: 'text/html', size: 20 },
+                {
+                  type: 'image/gif',
+                  size: 30,
+                  id: '<logo@x>',
+                  disposition: 'inline',
+                  dispositionParameters: { filename: 'logo.gif' },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(extractInlineCidParts(struct).map((part) => part.partId)).toEqual(['1.2']);
+  });
+
+  it('ignores inline parts with no content id and attachment parts that have one', () => {
+    const struct = {
+      type: 'multipart/related',
+      childNodes: [
+        {
+          type: 'image/gif',
+          size: 30,
+          disposition: 'inline',
+          dispositionParameters: { filename: 'banner.gif' },
+        },
+        {
+          type: 'image/png',
+          size: 40,
+          id: '<file@x>',
+          disposition: 'attachment',
+          dispositionParameters: { filename: 'file.png' },
+        },
+      ],
+    };
+    expect(extractInlineCidParts(struct)).toEqual([]);
   });
 
   it('finds a PDF buried two multipart levels deep', () => {
@@ -536,7 +623,7 @@ describe('resolveUniquePath', () => {
 });
 
 // ---------------------------------------------------------------------------
-// extractCidReferences — used by update_draft to warn on inline image flattening
+// extractCidReferences — cid: refs compared with attachment content ids
 // ---------------------------------------------------------------------------
 
 describe('extractCidReferences', () => {
@@ -739,6 +826,49 @@ describe('resolveAttachments', () => {
     });
 
     expect(imap.downloadAttachment).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-ASCII and C1 content ids without reading files', async () => {
+    const imap = {
+      downloadAttachment: vi.fn(),
+    } as unknown as ImapService;
+    const cases = ['café', 'grafik-ä', 'chart\u0085x', 'chart\u009Fx'];
+
+    const results = await Promise.all(
+      cases.map(async (contentId) =>
+        resolveAttachments(imap, 'acct', [
+          {
+            sourceEmailId: '1',
+            sourceMailbox: 'INBOX',
+            filename: 'chart.png',
+            contentId,
+          },
+        ]),
+      ),
+    );
+
+    results.forEach((result) => {
+      expect(result.resolved).toEqual([]);
+      expect(result.failures).toHaveLength(1);
+      expect(result.failures[0].label).toBe('chart.png');
+      expect(result.failures[0].reason).toMatch(/printable ASCII/);
+    });
+
+    expect(imap.downloadAttachment).not.toHaveBeenCalled();
+  });
+
+  it('accepts printable ASCII content ids, including apostrophe and parentheses', async () => {
+    const result = await resolveAttachments(stubImap, 'acct', [
+      {
+        contentBase64: Buffer.from('x').toString('base64'),
+        filename: 'a.bin',
+        contentId: "o'brien(1)",
+      },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.resolved[0].cid).toBe("o'brien(1)");
+    expect(result.resolved[0].contentDisposition).toBe('inline');
   });
 
   it('accepts a 200-character content id', async () => {

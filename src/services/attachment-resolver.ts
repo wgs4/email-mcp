@@ -45,20 +45,23 @@ export interface ResolvedAttachment {
 /** Content-ID length cap after one surrounding pair of angle brackets is removed. */
 const CONTENT_ID_MAX_LENGTH = 200;
 
-/** Whitespace, angle brackets, or a double quote. Control characters are checked by code point. */
-const INVALID_CONTENT_ID_CHARS = /[\s<>"]/;
-
+/**
+ * Printable ASCII is 0x21-0x7E. Anything outside that (space, C0, DEL, C1,
+ * non-ASCII) is rejected, as are `"` `<` and `>` inside the range.
+ * Nodemailer RFC 2047-encodes a non-ASCII Content-ID, so the header no longer
+ * matches the HTML `cid:` reference. Apostrophe and parentheses stay allowed.
+ */
 function hasIllegalContentIdChar(cid: string): boolean {
-  if (INVALID_CONTENT_ID_CHARS.test(cid)) return true;
   return Array.from(cid).some((char) => {
-    const code = char.charCodeAt(0);
-    return code <= 0x1f || code === 0x7f;
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 0x21 || code > 0x7e) return true;
+    return code === 0x22 || code === 0x3c || code === 0x3e;
   });
 }
 
 /**
  * Strip one surrounding `<` `>` pair, then reject an empty, overlong, or
- * illegal Content-ID. Callers fail the whole operation when this returns
+ * non-ASCII Content-ID. Callers fail the whole operation when this returns
  * an error. A bad content_id is not a partial-success case.
  */
 function normalizeContentId(
@@ -77,8 +80,7 @@ function normalizeContentId(
   if (hasIllegalContentIdChar(cid)) {
     return {
       ok: false,
-      reason:
-        'content_id must not contain whitespace, angle brackets, quotes, or control characters',
+      reason: 'content_id must be printable ASCII without spaces, double quotes, or angle brackets',
     };
   }
   return { ok: true, cid };

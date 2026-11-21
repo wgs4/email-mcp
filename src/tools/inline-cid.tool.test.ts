@@ -2,6 +2,8 @@ vi.mock('../safety/audit.js', () => ({
   default: { log: vi.fn().mockResolvedValue(undefined) },
 }));
 
+import type { IConnectionManager } from '../connections/types.js';
+import ImapService from '../services/imap.service.js';
 import registerDraftTools from './drafts.tool.js';
 import registerSendTools from './send.tool.js';
 
@@ -174,5 +176,35 @@ describe('inline cid tool results', () => {
     });
 
     expect(result.content[0].text).not.toContain('Warnings:');
+  });
+
+  it('send_email rejects a non-ASCII content_id before SMTP', async () => {
+    const imap = new ImapService({
+      getAccount: vi.fn(),
+      getAccountNames: vi.fn(),
+      getImapClient: vi.fn(),
+      createEphemeralImapClient: vi.fn(),
+      getSmtpTransport: vi.fn(),
+      closeAll: vi.fn(),
+    } as unknown as IConnectionManager);
+    const smtp = {
+      sendEmail: vi.fn().mockResolvedValue({ messageId: '<m@example.com>', status: 'sent' }),
+    };
+    const handlers = captureTools(registerSendTools as unknown as ToolRegistrar, smtp, imap);
+    const result = await requireHandler(
+      handlers,
+      'send_email',
+    )({
+      account: 'acct',
+      to: ['a@example.com'],
+      subject: 'Chart',
+      body: '<img src="cid:café">',
+      html: true,
+      attachments: [{ content_base64: 'cG5n', filename: 'chart.png', content_id: 'café' }],
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toMatch(/printable ASCII/);
+    expect(smtp.sendEmail).not.toHaveBeenCalled();
   });
 });

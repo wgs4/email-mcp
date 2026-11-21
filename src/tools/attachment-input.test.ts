@@ -5,6 +5,7 @@ describe('attachment content_id schema', () => {
     for (const option of attachmentInputSchema.options) {
       expect(option.shape.content_id.description).toMatch(/inline part/);
       expect(option.shape.content_id.description).toContain('<img src="cid:VALUE">');
+      expect(option.shape.content_id.description).toMatch(/printable ASCII/);
     }
   });
 
