@@ -30,7 +30,7 @@ import type {
 import { nonEmpty, RAW_CAP } from '../utils/body-format.js';
 import { refoldParamHeaders } from '../utils/mime-headers.js';
 import type { AttachmentInput, ResolvedAttachment } from './attachment-resolver.js';
-import { resolveAttachments } from './attachment-resolver.js';
+import { REBUILD_ATTACHMENT_CAP_BYTES, resolveAttachments } from './attachment-resolver.js';
 import { assertSafeDestination, resolveUniquePath, sanitizeFilename } from './file-paths.js';
 import type { LabelStrategy } from './label-strategy.js';
 import { detectLabelStrategy } from './label-strategy.js';
@@ -260,9 +260,8 @@ export function hasAttachments(bodyStructure: unknown): boolean {
 
 /**
  * Extract `cid:` references from an HTML body. Returns unique CIDs in order
- * of first appearance. Used by update_draft to warn callers when an HTML
- * draft references inline images — v1 flattens those to plain attachments,
- * which means the recipient's mail client will show broken image icons.
+ * of first appearance. Callers compare these with attachment content ids and
+ * warn when the HTML body references a cid that no part carries.
  */
 export function extractCidReferences(html: string): string[] {
   const re = /cid:([^"'\s>)]+)/gi;
@@ -281,6 +280,34 @@ export function extractCidReferences(html: string): string[] {
 }
 
 /**
+ * Non-fatal inline Content-ID checks. The message is still saved or sent.
+ *
+ * (a) An HTML body references cid:X and no attachment carries that content_id.
+ * (b) An attachment has a content_id but the message is not HTML.
+ */
+export function inlineCidWarnings(
+  html: boolean | undefined,
+  body: string,
+  attachments: readonly { filename?: string; cid?: string }[],
+): string[] {
+  const inline = attachments.filter(
+    (attachment): attachment is { filename?: string; cid: string } => Boolean(attachment.cid),
+  );
+
+  if (html) {
+    const have = new Set(inline.map((attachment) => attachment.cid));
+    return extractCidReferences(body)
+      .filter((ref) => !have.has(ref))
+      .map((ref) => `Body references cid:${ref} but no attachment has content_id "${ref}".`);
+  }
+
+  return inline.map((attachment) => {
+    const name = attachment.filename ? ` "${attachment.filename}"` : '';
+    return `Attachment${name} has content_id "${attachment.cid}" but html is false; it is still attached.`;
+  });
+}
+
+/**
  * Find the IMAP MIME part number for an attachment by filename.
  *
  * Detection uses the exact same lenient predicate as
@@ -295,7 +322,10 @@ export function extractCidReferences(html: string): string[] {
  * introduces, so that is preferred. The synthesized fallback (used only
  * when `part` is absent) accounts for `message/rfc822`: the embedded
  * message's root keeps the wrapper's section number rather than gaining
- * an extra `.1` level.
+ * an extra `.1` level. A non-multipart root has no section at all. Its
+ * body is TEXT (the section imapflow uses for a childless section 1).
+ * Section 1 itself is the first encapsulated part once that root has
+ * children, which a `message/rfc822` attachment does.
  */
 export function findMimePartByFilename(
   bodyStructure: unknown,
@@ -314,7 +344,10 @@ export function findMimePartByFilename(
 
   const classified = classifyAttachmentNode(bs);
   if (classified?.filename === targetFilename) {
-    return effectivePath || undefined;
+    // The root attachment is the message body. imapflow leaves `part` unset
+    // there, and section 1 would select the first child of a root .eml.
+    if (!effectivePath) return 'TEXT';
+    return effectivePath;
   }
 
   if (Array.isArray(bs.childNodes)) {
@@ -331,6 +364,92 @@ export function findMimePartByFilename(
   }
 
   return undefined;
+}
+
+/**
+ * An inline cid part is not an attachment: `classifyAttachmentNode` skips
+ * `disposition === 'inline'` plus a Content-ID, so `extractAttachmentMeta`
+ * and `downloadAttachment` never see it. `updateDraft` uses this walk to
+ * carry those parts forward. Part numbers follow `findMimePartByFilename`
+ * for the outer message (prefer `node.part`; otherwise synthesize). The walk
+ * stops at a `message/rfc822` attachment: its descendants stay inside that
+ * attachment and are not carried, and they are outside the outer draft's
+ * duplicate content_id check. The Content-ID has one surrounding `<>` pair
+ * removed and is otherwise kept as stored.
+ */
+export interface InlineCidPart {
+  partId: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  cid: string;
+}
+
+export function extractInlineCidParts(bodyStructure: unknown): InlineCidPart[] {
+  const out: InlineCidPart[] = [];
+
+  const walk = (node: unknown, partPath: string, depth: number): void => {
+    if (depth > MAX_MIME_DEPTH || !node || typeof node !== 'object') return;
+    const n = node as Record<string, unknown>;
+    const currentPart = typeof n.part === 'string' ? n.part : undefined;
+    const effectivePath = currentPart ?? partPath;
+    const lowerType = (typeof n.type === 'string' ? n.type : '').toLowerCase();
+    const disposition = typeof n.disposition === 'string' ? n.disposition.toLowerCase() : undefined;
+    const rawId = typeof n.id === 'string' ? n.id : undefined;
+
+    if (disposition === 'inline' && rawId && rawId.length > 0) {
+      let cid = rawId;
+      if (cid.startsWith('<') && cid.endsWith('>') && cid.length >= 2) {
+        cid = cid.slice(1, -1);
+      }
+      if (cid.length > 0) {
+        const dispParams = (n.dispositionParameters ?? {}) as Record<string, string>;
+        const typeParams = (n.parameters ?? {}) as Record<string, string>;
+        const filename = dispParams.filename ?? dispParams.name ?? typeParams.name ?? 'inline';
+        let mimeType = lowerType;
+        if (!mimeType) {
+          const sub = typeof n.subtype === 'string' ? n.subtype.toLowerCase() : '';
+          mimeType = sub ? `application/${sub}` : 'application/octet-stream';
+        }
+        out.push({
+          partId: effectivePath,
+          filename,
+          mimeType,
+          size: typeof n.size === 'number' ? n.size : 0,
+          cid,
+        });
+      }
+    }
+
+    // An attached message is its own document. Do not promote its parts.
+    if (Array.isArray(n.childNodes) && lowerType !== 'message/rfc822') {
+      n.childNodes.forEach((child, index) => {
+        const indexed = effectivePath ? `${effectivePath}.${index + 1}` : String(index + 1);
+        walk(child, indexed, depth + 1);
+      });
+    }
+  };
+
+  walk(bodyStructure, '', 0);
+  return out;
+}
+
+/** First content id that appears twice. Comparison is case-sensitive and exact. */
+function firstDuplicateContentId(
+  parts: { filename: string; cid?: string }[],
+): { filename: string; cid: string; previous: string } | undefined {
+  const seen = new Map<string, string>();
+  let found: { filename: string; cid: string; previous: string } | undefined;
+  parts.forEach((part) => {
+    if (found || part.cid === undefined || part.cid.length === 0) return;
+    const previous = seen.get(part.cid);
+    if (previous !== undefined) {
+      found = { filename: part.filename, cid: part.cid, previous };
+      return;
+    }
+    seen.set(part.cid, part.filename);
+  });
+  return found;
 }
 
 /**
@@ -532,6 +651,31 @@ async function messageToEmail(msg: Record<string, unknown>): Promise<Email> {
     references: parsedReferences ?? headers.references?.split(/\s+/).filter(Boolean),
     attachments: extractAttachmentMeta(msg.bodyStructure),
     headers,
+  };
+}
+
+interface RebuildBody {
+  bodyText?: string;
+  bodyHtml?: string;
+}
+
+/**
+ * Body text for a draft rebuild, taken from the outer MIME tree only.
+ * `skipImageLinks` keeps `cid:` references in that outer HTML.
+ * `ignoreEmbedded` leaves each `message/rfc822` opaque, so an attached
+ * message is not copied into the outer body. An empty outer body stays
+ * empty. Display, reply, and forward stay on {@link messageToEmail}.
+ * An oversized source returns `undefined` so the caller can fall back.
+ */
+async function parseDraftForRebuild(source: Buffer): Promise<RebuildBody | undefined> {
+  if (source.length > MAX_PARSE_SOURCE_BYTES) return undefined;
+  // ignoreEmbedded is a mailsplit option. The installed mailparser forwards
+  // its constructor options to the splitter, but the published types omit it.
+  const parserOptions = { skipImageLinks: true, ignoreEmbedded: true };
+  const parsed = await simpleParser(source, parserOptions);
+  return {
+    bodyText: nonEmpty(parsed.text),
+    bodyHtml: nonEmpty(typeof parsed.html === 'string' ? parsed.html : undefined),
   };
 }
 
@@ -2360,7 +2504,7 @@ export default class ImapService {
       inReplyTo?: string;
       attachments?: ResolvedAttachment[];
     },
-  ): Promise<{ id: number; mailbox: string }> {
+  ): Promise<{ id: number; mailbox: string; warnings: string[] }> {
     const client = await this.connections.getImapClient(accountName);
     const account = this.connections.getAccount(accountName);
 
@@ -2371,6 +2515,19 @@ export default class ImapService {
 
     const fromAddr = account.fullName ? `"${account.fullName}" <${account.email}>` : account.email;
     const hasDraftAttachments = !!options.attachments && options.attachments.length > 0;
+    const blankBody = options.body.trim().length === 0;
+    // Nodemailer drops an empty string, then promotes a lone attachment to
+    // the MIME root. That root has no section, so the next update cannot
+    // download it. A real empty text part keeps multipart/mixed. The attached
+    // message is not copied into this part.
+    let bodyOption: { text: string | { content: Buffer } } | { html: string };
+    if (hasDraftAttachments && blankBody) {
+      bodyOption = { text: { content: Buffer.alloc(0) } };
+    } else if (options.html) {
+      bodyOption = { html: options.body };
+    } else {
+      bodyOption = { text: options.body };
+    }
 
     const mailOptions = {
       from: fromAddr,
@@ -2380,7 +2537,7 @@ export default class ImapService {
       subject: options.subject,
       inReplyTo: options.inReplyTo,
       date: new Date(),
-      ...(options.html ? { html: options.body } : { text: options.body }),
+      ...bodyOption,
       ...(hasDraftAttachments ? { attachments: options.attachments } : {}),
     };
 
@@ -2414,6 +2571,7 @@ export default class ImapService {
     return {
       id: (appendResult as unknown as { uid?: number }).uid ?? 0,
       mailbox: draftsPath,
+      warnings: inlineCidWarnings(options.html, options.body, options.attachments ?? []),
     };
   }
 
@@ -2461,7 +2619,7 @@ export default class ImapService {
       inReplyTo?: string;
       attachments?: AttachmentInput[];
     },
-  ): Promise<{ id: number; mailbox: string }> {
+  ): Promise<{ id: number; mailbox: string; warnings: string[] }> {
     let resolved: ResolvedAttachment[] = [];
 
     if (options.attachments && options.attachments.length > 0) {
@@ -2594,6 +2752,25 @@ export default class ImapService {
       options.mailbox,
     );
 
+    // A caller-supplied body is stored as given. Otherwise re-read the raw
+    // draft so cid: references survive and attached messages stay opaque.
+    // Do not fall back to existing.bodyHtml after a successful parse: that
+    // string is the display parse. A parse failure happens before APPEND,
+    // so the old draft stays.
+    let rebuild: RebuildBody | undefined;
+    if (options.body === undefined) {
+      try {
+        const raw = await this.fetchDraftRaw(accountName, draftId, draftsPath);
+        const parsed = await parseDraftForRebuild(raw);
+        if (parsed) rebuild = parsed;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new Error(
+          `Failed to read the old draft for rebuild: ${msg}. Old draft was NOT deleted.`,
+        );
+      }
+    }
+
     // Determine which existing attachments to carry forward.
     const existingFilenames = existing.attachments.map((a) => a.filename);
     const existingSet = new Set(existingFilenames);
@@ -2621,6 +2798,18 @@ export default class ImapService {
     // Download the kept attachment bytes from the old draft (server-side, no MCP wire).
     const kept = await this.fetchKeptAttachments(accountName, draftId, draftsPath, keepFilenames);
 
+    // Inline cid parts are not in existing.attachments. Carry every one that
+    // belongs to the outer draft, unless attachments_remove names its
+    // filename. attachments_keep does not apply: the default keep set is the
+    // regular attachment list, and filtering inline parts by that set would
+    // drop them again. Parts inside a message/rfc822 attachment are not
+    // listed, so they stay in that attachment and are outside this duplicate
+    // check. Two outer parts that share a content id still fail the update.
+    const removeFilenames = new Set(options.attachmentsRemove ?? []);
+    const inlineParts = (await this.listInlineCidParts(accountName, draftId, draftsPath)).filter(
+      (part) => !removeFilenames.has(part.filename),
+    );
+
     // Resolve the add list (path | base64 | source-message-reference).
     let added: ResolvedAttachment[] = [];
     if (options.attachmentsAdd && options.attachmentsAdd.length > 0) {
@@ -2634,29 +2823,43 @@ export default class ImapService {
       added = result.resolved;
     }
 
-    const allAttachments = [...kept, ...added];
+    const duplicate = firstDuplicateContentId([
+      ...inlineParts.map((part) => ({ filename: part.filename, cid: part.cid })),
+      ...added.map((part) => ({ filename: part.filename, cid: part.cid })),
+    ]);
+    if (duplicate) {
+      throw new Error(
+        `Failed to resolve 1 attachment(s): ${duplicate.filename}: duplicate content_id "${duplicate.cid}" (also used by "${duplicate.previous}"). Old draft was NOT deleted.`,
+      );
+    }
 
-    // Merge: omitted fields keep the existing draft's value.
-    const html = options.html ?? !!existing.bodyHtml;
-    const body = options.body ?? (html ? (existing.bodyHtml ?? '') : (existing.bodyText ?? ''));
+    // Download by part number and re-attach with the stored Content-ID.
+    // A stored id is not re-checked against the printable-ASCII rule.
+    const inline = await this.downloadInlineCidParts(accountName, draftId, draftsPath, inlineParts);
+
+    const allAttachments = [...kept, ...inline, ...added];
+
+    // Merge: omitted fields keep the existing draft's value. The body comes
+    // from the rebuild parse when the caller did not supply one.
+    const html = options.html ?? (rebuild !== undefined ? !!rebuild.bodyHtml : !!existing.bodyHtml);
+    let body: string;
+    if (options.body !== undefined) {
+      body = options.body;
+    } else if (rebuild !== undefined) {
+      body = html ? (rebuild.bodyHtml ?? '') : (rebuild.bodyText ?? '');
+    } else {
+      body = html ? (existing.bodyHtml ?? '') : (existing.bodyText ?? '');
+    }
     const subject = options.subject ?? existing.subject;
     const to = options.to ?? existing.to.map((a) => a.address);
     const cc = options.cc ?? existing.cc?.map((a) => a.address);
     const bcc = options.bcc ?? existing.bcc?.map((a) => a.address);
     const inReplyTo = options.inReplyTo ?? existing.inReplyTo;
 
-    // Inline image detection — warn when the body references cid: parts that
-    // won't survive the rebuild (v1 treats them as plain attachments only).
-    if (html && typeof body === 'string') {
-      const cidRefs = extractCidReferences(body);
-      if (cidRefs.length > 0) {
-        warnings.push(
-          `Body has ${cidRefs.length} cid: reference(s) (${cidRefs.slice(0, 3).join(', ')}${cidRefs.length > 3 ? ', …' : ''}). Inline images are flattened in v1 — recipient may see broken image icons.`,
-        );
-      }
-    }
-
     // APPEND the new draft. On failure, the old draft stays intact.
+    // Carried inline parts are real inline MIME with their original
+    // Content-ID. A body cid with no carried or added part is warning (a)
+    // from saveDraft.
     const newId = await this.saveDraft(accountName, {
       to,
       subject,
@@ -2667,6 +2870,7 @@ export default class ImapService {
       inReplyTo,
       attachments: allAttachments,
     });
+    warnings.push(...newId.warnings);
 
     // Only after confirmed APPEND, delete the old UID.
     let oldDraftDeleted = false;
@@ -2714,6 +2918,110 @@ export default class ImapService {
       );
     }
     return result.resolved;
+  }
+
+  /**
+   * BODYSTRUCTURE walk for inline cid parts on the draft being rebuilt.
+   * Any failure aborts before APPEND, so the old draft is still there.
+   */
+  private async listInlineCidParts(
+    accountName: string,
+    emailId: number,
+    mailbox: string,
+  ): Promise<InlineCidPart[]> {
+    const client = await this.connections.getImapClient(accountName);
+    const safeMailbox = sanitizeMailboxName(mailbox);
+    const lock = await client.getMailboxLock(safeMailbox);
+    try {
+      const msg = await client.fetchOne(
+        String(emailId),
+        { uid: true, bodyStructure: true },
+        { uid: true },
+      );
+      if (!msg) {
+        throw new Error(`Draft ${emailId} not found in ${mailbox}`);
+      }
+      return extractInlineCidParts(msg.bodyStructure);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(
+        `Failed to carry inline cid part(s) forward from the old draft: ${msg}. Old draft was NOT deleted.`,
+      );
+    } finally {
+      lock.release();
+    }
+  }
+
+  /**
+   * Download inline cid parts by the section numbers from {@link extractInlineCidParts}
+   * and re-stamp each one inline with its stored Content-ID.
+   */
+  private async downloadInlineCidParts(
+    accountName: string,
+    emailId: number,
+    mailbox: string,
+    parts: InlineCidPart[],
+  ): Promise<ResolvedAttachment[]> {
+    if (parts.length === 0) return [];
+
+    const problems = [
+      ...parts
+        .filter((part) => part.partId.length === 0)
+        .map((part) => `${part.filename}: could not locate MIME part for content_id "${part.cid}"`),
+      ...parts
+        .filter((part) => part.size > REBUILD_ATTACHMENT_CAP_BYTES)
+        .map(
+          (part) =>
+            `${part.filename}: is ${Math.round(part.size / 1024 / 1024)}MB, exceeds ${Math.round(REBUILD_ATTACHMENT_CAP_BYTES / 1024 / 1024)}MB limit`,
+        ),
+    ];
+    if (problems.length > 0) {
+      throw new Error(
+        `Failed to carry ${problems.length} inline cid part(s) forward from the old draft: ${problems.join('; ')}. Old draft was NOT deleted.`,
+      );
+    }
+
+    const client = await this.connections.getImapClient(accountName);
+    const safeMailbox = sanitizeMailboxName(mailbox);
+    const lock = await client.getMailboxLock(safeMailbox);
+    try {
+      return await parts.reduce<Promise<ResolvedAttachment[]>>(async (previous, part) => {
+        const acc = await previous;
+        const downloadResult = await client.download(String(emailId), part.partId, { uid: true });
+        if (!downloadResult?.content) {
+          throw new Error(`Failed to download inline part "${part.filename}" (${part.partId})`);
+        }
+        const chunks: Buffer[] = [];
+        // eslint-disable-next-line no-restricted-syntax
+        for await (const chunk of downloadResult.content) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        const content = Buffer.concat(chunks);
+        if (content.length > REBUILD_ATTACHMENT_CAP_BYTES) {
+          throw new Error(
+            `Inline part "${part.filename}" is ${Math.round(content.length / 1024 / 1024)}MB, exceeds ${Math.round(REBUILD_ATTACHMENT_CAP_BYTES / 1024 / 1024)}MB limit`,
+          );
+        }
+        acc.push({
+          filename: part.filename,
+          content,
+          contentType: part.mimeType,
+          cid: part.cid,
+          contentDisposition: 'inline',
+        });
+        return acc;
+      }, Promise.resolve([]));
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const already = msg.includes('Old draft was NOT deleted');
+      throw new Error(
+        already
+          ? msg
+          : `Failed to carry inline cid part(s) forward from the old draft: ${msg}. Old draft was NOT deleted.`,
+      );
+    } finally {
+      lock.release();
+    }
   }
 
   // -------------------------------------------------------------------------

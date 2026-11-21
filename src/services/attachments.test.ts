@@ -8,8 +8,10 @@ import type ImapService from './imap.service.js';
 import {
   extractAttachmentMeta,
   extractCidReferences,
+  extractInlineCidParts,
   findMimePartByFilename,
   hasAttachments,
+  inlineCidWarnings,
 } from './imap.service.js';
 
 // ---------------------------------------------------------------------------
@@ -130,6 +132,144 @@ describe('extractAttachmentMeta', () => {
   it('skips inline images (disposition=inline + content-id)', () => {
     const result = extractAttachmentMeta(multipartMixedWithInlineImage);
     expect(result).toEqual([]);
+  });
+
+  it('locates that same inline image for draft rebuild, with one bracket pair removed', () => {
+    expect(extractInlineCidParts(multipartMixedWithInlineImage)).toEqual([
+      {
+        partId: '1.2.2',
+        filename: 'logo.png',
+        mimeType: 'image/png',
+        size: 8000,
+        cid: 'logo@example.com',
+      },
+    ]);
+  });
+
+  it('prefers node.part over a synthesized section number', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        {
+          type: 'image/png',
+          part: '2.1',
+          size: 10,
+          id: 'chart1',
+          disposition: 'INLINE',
+          parameters: { name: 'chart.png' },
+        },
+      ],
+    };
+    expect(extractInlineCidParts(struct)).toEqual([
+      {
+        partId: '2.1',
+        filename: 'chart.png',
+        mimeType: 'image/png',
+        size: 10,
+        cid: 'chart1',
+      },
+    ]);
+  });
+
+  it('does not promote inline parts that live inside an attached message', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        {
+          type: 'message/rfc822',
+          disposition: 'attachment',
+          dispositionParameters: { filename: 'private.eml' },
+          childNodes: [
+            {
+              type: 'multipart/related',
+              childNodes: [
+                { type: 'text/html', size: 20 },
+                {
+                  type: 'image/gif',
+                  size: 30,
+                  id: '<logo@x>',
+                  disposition: 'inline',
+                  dispositionParameters: { filename: 'logo.gif' },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(extractInlineCidParts(struct)).toEqual([]);
+  });
+
+  it('still finds an outer inline part beside an attached message', () => {
+    const struct = {
+      type: 'multipart/mixed',
+      childNodes: [
+        {
+          type: 'multipart/related',
+          childNodes: [
+            { type: 'text/html', size: 20 },
+            {
+              type: 'image/png',
+              size: 10,
+              id: '<logo@example.test>',
+              disposition: 'inline',
+              dispositionParameters: { filename: 'logo.png' },
+            },
+          ],
+        },
+        {
+          type: 'message/rfc822',
+          disposition: 'attachment',
+          dispositionParameters: { filename: 'private.eml' },
+          childNodes: [
+            {
+              type: 'multipart/related',
+              childNodes: [
+                { type: 'text/html', size: 20 },
+                {
+                  type: 'image/png',
+                  size: 30,
+                  id: '<logo@example.test>',
+                  disposition: 'inline',
+                  dispositionParameters: { filename: 'inside.png' },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    expect(extractInlineCidParts(struct)).toEqual([
+      {
+        partId: '1.2',
+        filename: 'logo.png',
+        mimeType: 'image/png',
+        size: 10,
+        cid: 'logo@example.test',
+      },
+    ]);
+  });
+
+  it('ignores inline parts with no content id and attachment parts that have one', () => {
+    const struct = {
+      type: 'multipart/related',
+      childNodes: [
+        {
+          type: 'image/gif',
+          size: 30,
+          disposition: 'inline',
+          dispositionParameters: { filename: 'banner.gif' },
+        },
+        {
+          type: 'image/png',
+          size: 40,
+          id: '<file@x>',
+          disposition: 'attachment',
+          dispositionParameters: { filename: 'file.png' },
+        },
+      ],
+    };
+    expect(extractInlineCidParts(struct)).toEqual([]);
   });
 
   it('finds a PDF buried two multipart levels deep', () => {
@@ -433,6 +573,46 @@ describe('findMimePartByFilename', () => {
     // returned undefined → "Could not locate MIME part").
     expect(findMimePartByFilename(appleMail, 'motorbass2023.pdf')).toBe('2.2');
   });
+
+  it('addresses a root message/rfc822 attachment as TEXT, not its first child', () => {
+    // imapflow assigns no part to the root. The encapsulated HTML is section
+    // 1; the .eml itself is the message body (TEXT).
+    const root = {
+      type: 'message/rfc822',
+      disposition: 'inline',
+      parameters: { name: 'private.eml' },
+      dispositionParameters: { filename: 'private.eml' },
+      size: 400,
+      childNodes: [
+        {
+          type: 'multipart/related',
+          childNodes: [
+            { type: 'text/html', part: '1', size: 20 },
+            {
+              type: 'image/png',
+              part: '2',
+              size: 8,
+              id: '<private@example.test>',
+              disposition: 'inline',
+              dispositionParameters: { filename: 'private.png' },
+            },
+          ],
+        },
+      ],
+    };
+    expect(findMimePartByFilename(root, 'private.eml')).toBe('TEXT');
+    expect(findMimePartByFilename(root, 'private.png')).toBeUndefined();
+  });
+
+  it('addresses a childless root attachment as TEXT', () => {
+    const root = {
+      type: 'application/pdf',
+      disposition: 'attachment',
+      dispositionParameters: { filename: 'notes.pdf' },
+      size: 100,
+    };
+    expect(findMimePartByFilename(root, 'notes.pdf')).toBe('TEXT');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -535,7 +715,7 @@ describe('resolveUniquePath', () => {
 });
 
 // ---------------------------------------------------------------------------
-// extractCidReferences — used by update_draft to warn on inline image flattening
+// extractCidReferences — cid: refs compared with attachment content ids
 // ---------------------------------------------------------------------------
 
 describe('extractCidReferences', () => {
@@ -648,5 +828,216 @@ describe('resolveAttachments', () => {
     const result = await resolveAttachments(stubImap, 'acct', [{ path: filePath }]);
 
     expect(result.resolved[0].contentType).toBe('application/pdf');
+  });
+
+  it('passes cid and inline disposition, stripping one pair of angle brackets', async () => {
+    const filePath = join(tmp, 'chart.png');
+    writeFileSync(filePath, 'png');
+
+    const result = await resolveAttachments(stubImap, 'acct', [
+      { path: filePath, contentId: '<chart1>' },
+      {
+        contentBase64: Buffer.from('%PDF').toString('base64'),
+        filename: 'notes.pdf',
+        mimeType: 'application/pdf',
+      },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.resolved[0]).toMatchObject({
+      filename: 'chart.png',
+      cid: 'chart1',
+      contentDisposition: 'inline',
+    });
+    expect(result.resolved[1].cid).toBeUndefined();
+    expect(result.resolved[1].contentDisposition).toBeUndefined();
+  });
+
+  it('stamps cid on a source-message attachment', async () => {
+    const imap = {
+      downloadAttachment: vi.fn().mockResolvedValue({
+        filename: 'chart.png',
+        contentBase64: Buffer.from('png').toString('base64'),
+        mimeType: 'image/png',
+      }),
+    } as unknown as ImapService;
+
+    const result = await resolveAttachments(imap, 'acct', [
+      {
+        sourceEmailId: '9',
+        sourceMailbox: 'INBOX',
+        filename: 'chart.png',
+        contentId: 'logo@example.com',
+      },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.resolved[0]).toMatchObject({
+      filename: 'chart.png',
+      contentType: 'image/png',
+      cid: 'logo@example.com',
+      contentDisposition: 'inline',
+    });
+  });
+
+  it('rejects empty, overlong, and illegal content ids without reading files', async () => {
+    const imap = {
+      downloadAttachment: vi.fn(),
+    } as unknown as ImapService;
+    const cases = [
+      '',
+      '<>',
+      'chart 1',
+      'a<b',
+      'a>b',
+      'say"hi',
+      'a\nb',
+      'a\u0001b',
+      'x'.repeat(201),
+      '<<chart1>>',
+    ];
+
+    const results = await Promise.all(
+      cases.map(async (contentId) =>
+        resolveAttachments(imap, 'acct', [
+          {
+            sourceEmailId: '1',
+            sourceMailbox: 'INBOX',
+            filename: 'chart.png',
+            contentId,
+          },
+        ]),
+      ),
+    );
+
+    results.forEach((result) => {
+      expect(result.resolved).toEqual([]);
+      expect(result.failures).toHaveLength(1);
+      expect(result.failures[0].label).toBe('chart.png');
+      expect(result.failures[0].reason).toMatch(/content_id/);
+    });
+
+    expect(imap.downloadAttachment).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-ASCII and C1 content ids without reading files', async () => {
+    const imap = {
+      downloadAttachment: vi.fn(),
+    } as unknown as ImapService;
+    const cases = ['café', 'grafik-ä', 'chart\u0085x', 'chart\u009Fx'];
+
+    const results = await Promise.all(
+      cases.map(async (contentId) =>
+        resolveAttachments(imap, 'acct', [
+          {
+            sourceEmailId: '1',
+            sourceMailbox: 'INBOX',
+            filename: 'chart.png',
+            contentId,
+          },
+        ]),
+      ),
+    );
+
+    results.forEach((result) => {
+      expect(result.resolved).toEqual([]);
+      expect(result.failures).toHaveLength(1);
+      expect(result.failures[0].label).toBe('chart.png');
+      expect(result.failures[0].reason).toMatch(/printable ASCII/);
+    });
+
+    expect(imap.downloadAttachment).not.toHaveBeenCalled();
+  });
+
+  it('accepts printable ASCII content ids, including apostrophe and parentheses', async () => {
+    const result = await resolveAttachments(stubImap, 'acct', [
+      {
+        contentBase64: Buffer.from('x').toString('base64'),
+        filename: 'a.bin',
+        contentId: "o'brien(1)",
+      },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.resolved[0].cid).toBe("o'brien(1)");
+    expect(result.resolved[0].contentDisposition).toBe('inline');
+  });
+
+  it('accepts a 200-character content id', async () => {
+    const cid = 'a'.repeat(200);
+    const result = await resolveAttachments(stubImap, 'acct', [
+      { contentBase64: Buffer.from('x').toString('base64'), filename: 'a.bin', contentId: cid },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.resolved[0].cid).toBe(cid);
+    expect(result.resolved[0].contentDisposition).toBe('inline');
+  });
+
+  it('rejects duplicate content ids, including after bracket stripping', async () => {
+    const result = await resolveAttachments(stubImap, 'acct', [
+      {
+        contentBase64: Buffer.from('a').toString('base64'),
+        filename: 'a.png',
+        contentId: 'chart1',
+      },
+      {
+        contentBase64: Buffer.from('b').toString('base64'),
+        filename: 'b.png',
+        contentId: '<chart1>',
+      },
+    ]);
+
+    expect(result.resolved).toEqual([]);
+    expect(result.failures).toHaveLength(1);
+    expect(result.failures[0].reason).toMatch(/duplicate content_id "chart1"/);
+    expect(result.failures[0].reason).toContain('a.png');
+  });
+
+  it('treats differing content-id case as distinct', async () => {
+    const result = await resolveAttachments(stubImap, 'acct', [
+      {
+        contentBase64: Buffer.from('a').toString('base64'),
+        filename: 'a.png',
+        contentId: 'Chart1',
+      },
+      {
+        contentBase64: Buffer.from('b').toString('base64'),
+        filename: 'b.png',
+        contentId: 'chart1',
+      },
+    ]);
+
+    expect(result.failures).toEqual([]);
+    expect(result.resolved.map((attachment) => attachment.cid)).toEqual(['Chart1', 'chart1']);
+  });
+});
+
+describe('inlineCidWarnings', () => {
+  const inline = {
+    filename: 'chart.png',
+    cid: 'chart1',
+  };
+
+  it('warns when the HTML body references a cid no attachment has', () => {
+    const warnings = inlineCidWarnings(true, '<img src="cid:chart1"><img src="cid:missing">', [
+      inline,
+    ]);
+
+    expect(warnings).toEqual([
+      'Body references cid:missing but no attachment has content_id "missing".',
+    ]);
+  });
+
+  it('stays quiet when every cid reference has a matching content_id', () => {
+    expect(inlineCidWarnings(true, '<img src="cid:chart1">', [inline])).toEqual([]);
+  });
+
+  it('warns when a content_id is set but html is false, and still names the part', () => {
+    const warnings = inlineCidWarnings(false, 'plain text mentioning cid:chart1', [inline]);
+
+    expect(warnings).toEqual([
+      'Attachment "chart.png" has content_id "chart1" but html is false; it is still attached.',
+    ]);
   });
 });

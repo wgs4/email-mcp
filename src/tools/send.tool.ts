@@ -6,8 +6,8 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import audit from '../safety/audit.js';
 import { validateInputLength } from '../safety/validation.js';
-
 import type ImapService from '../services/imap.service.js';
+import { inlineCidWarnings } from '../services/imap.service.js';
 import type SmtpService from '../services/smtp.service.js';
 import { adaptAttachmentInput, attachmentInputSchema } from './attachment-input.js';
 
@@ -39,8 +39,9 @@ export default function registerSendTools(
             '{ path }: read bytes from a local file (use absolute path); ' +
             '{ content_base64, filename }: provide bytes inline; ' +
             '{ source_email_id, source_mailbox, filename }: carry an attachment from another message ' +
-            'without round-tripping bytes through this MCP. Strict failure: if any attachment cannot ' +
-            'be resolved, the email is NOT sent.',
+            'without round-tripping bytes through this MCP. Optional content_id makes the part inline; ' +
+            'reference it from the HTML body as <img src="cid:VALUE">. Strict failure: if any attachment ' +
+            'cannot be resolved, the email is NOT sent.',
         ),
     },
     { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
@@ -63,6 +64,9 @@ export default function registerSendTools(
           ...params,
           attachments: resolvedAttachments,
         });
+        const warnings = inlineCidWarnings(params.html, params.body, resolvedAttachments ?? []);
+        const warningBlock =
+          warnings.length > 0 ? `\n\nWarnings:\n  - ${warnings.join('\n  - ')}` : '';
         await audit.log(
           'send_email',
           params.account,
@@ -77,7 +81,7 @@ export default function registerSendTools(
           content: [
             {
               type: 'text' as const,
-              text: `✅ Email sent successfully!\nTo: ${params.to.join(', ')}\nSubject: ${params.subject}\nMessage-ID: ${result.messageId}`,
+              text: `✅ Email sent successfully!\nTo: ${params.to.join(', ')}\nSubject: ${params.subject}\nMessage-ID: ${result.messageId}${warningBlock}`,
             },
           ],
         };

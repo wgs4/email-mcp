@@ -1,8 +1,15 @@
 /* eslint-disable n/no-sync -- tests use sync fs helpers for setup/teardown */
+import { createRequire } from 'node:module';
+import { simpleParser } from 'mailparser';
 import type { IConnectionManager } from '../connections/types.js';
 import { applyBodyFormat } from '../utils/body-format.js';
-import ImapService from './imap.service.js';
+import ImapService, { findMimePartByFilename } from './imap.service.js';
 import { SearchFailedError } from './search-status.js';
+
+const require = createRequire(import.meta.url);
+const { parseBodystructure } = require('imapflow/lib/tools') as {
+  parseBodystructure: (entry: unknown) => { type?: string };
+};
 
 // ---------------------------------------------------------------------------
 // Mock helpers
@@ -1133,6 +1140,1090 @@ describe('ImapService', () => {
 
       expect(raw).toContain('filename="Farmpedals Statement 08-07-2026.pdf"');
       expect(raw).not.toMatch(/filename="[^"]*\r\n/);
+    });
+
+    it('emits multipart/related for a cid part and leaves a normal attachment', async () => {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+
+      const saved = await service.saveDraftWithAttachments('test', {
+        to: ['geof@example.com'],
+        subject: 'chart',
+        html: true,
+        body: '<p>Chart</p><img src="cid:chart1">',
+        attachments: [
+          {
+            contentBase64: Buffer.from('png-bytes').toString('base64'),
+            filename: 'chart.png',
+            mimeType: 'image/png',
+            contentId: '<chart1>',
+          },
+          {
+            contentBase64: Buffer.from('%PDF').toString('base64'),
+            filename: 'notes.pdf',
+            mimeType: 'application/pdf',
+          },
+        ],
+      });
+
+      expect(saved.warnings).toEqual([]);
+      const [, raw] = client.append.mock.calls[0] as [string, Buffer];
+      const text = raw.toString('binary');
+      expect(text).toMatch(/multipart\/related/i);
+      expect(text).toMatch(/content-id:\s*<chart1>/i);
+      expect(text).toMatch(/content-disposition:\s*inline/i);
+      expect(text).toMatch(/content-disposition:\s*attachment/i);
+      expect(text).toContain('chart.png');
+      expect(text).toContain('notes.pdf');
+    });
+
+    it('returns a warning when the HTML body references a missing cid', async () => {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+
+      const saved = await service.saveDraftWithAttachments('test', {
+        to: ['geof@example.com'],
+        subject: 'chart',
+        html: true,
+        body: '<img src="cid:missing">',
+        attachments: [
+          {
+            contentBase64: Buffer.from('%PDF').toString('base64'),
+            filename: 'notes.pdf',
+          },
+        ],
+      });
+
+      expect(saved.warnings).toEqual([
+        'Body references cid:missing but no attachment has content_id "missing".',
+      ]);
+      expect(client.append).toHaveBeenCalled();
+    });
+
+    it('returns a warning when content_id is set on a plain-text draft', async () => {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+
+      const saved = await service.saveDraftWithAttachments('test', {
+        to: ['geof@example.com'],
+        subject: 'chart',
+        html: false,
+        body: 'no html',
+        attachments: [
+          {
+            contentBase64: Buffer.from('png').toString('base64'),
+            filename: 'chart.png',
+            contentId: 'chart1',
+          },
+        ],
+      });
+
+      expect(saved.warnings).toEqual([
+        'Attachment "chart.png" has content_id "chart1" but html is false; it is still attached.',
+      ]);
+      expect(client.append).toHaveBeenCalled();
+    });
+
+    it('fails the whole save when content ids are duplicated', async () => {
+      await expect(
+        service.saveDraftWithAttachments('test', {
+          to: ['geof@example.com'],
+          subject: 'chart',
+          body: 'x',
+          attachments: [
+            {
+              contentBase64: Buffer.from('a').toString('base64'),
+              filename: 'a.png',
+              contentId: 'chart1',
+            },
+            {
+              contentBase64: Buffer.from('b').toString('base64'),
+              filename: 'b.png',
+              contentId: '<chart1>',
+            },
+          ],
+        }),
+      ).rejects.toThrow(/duplicate content_id "chart1"/);
+
+      expect(client.append).not.toHaveBeenCalled();
+    });
+
+    it('rejects a non-ASCII content_id before APPEND', async () => {
+      await expect(
+        service.saveDraftWithAttachments('test', {
+          to: ['geof@example.com'],
+          subject: 'chart',
+          html: true,
+          body: '<img src="cid:café">',
+          attachments: [
+            {
+              contentBase64: Buffer.from('png').toString('base64'),
+              filename: 'chart.png',
+              mimeType: 'image/png',
+              contentId: 'café',
+            },
+          ],
+        }),
+      ).rejects.toThrow(/printable ASCII/);
+
+      expect(client.append).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('updateDraft inline cid parts', () => {
+    const png = Buffer.from('PNGDATA');
+    const pngBase64 = png.toString('base64');
+    const CRLF = '\r\n';
+
+    function lines(rows: string[]): string {
+      return rows.join(CRLF);
+    }
+
+    function relatedImage(cid: string, filename: string): string {
+      return lines([
+        'Content-Type: image/png',
+        'Content-Transfer-Encoding: base64',
+        `Content-ID: <${cid}>`,
+        `Content-Disposition: inline; filename="${filename}"`,
+        '',
+        pngBase64,
+      ]);
+    }
+
+    function relatedSource(html: string, cid = 'logo@example.com', filename = 'logo.png'): Buffer {
+      return Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/related; boundary="rel"',
+          '',
+          '--rel',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          html,
+          '--rel',
+          relatedImage(cid, filename),
+          '--rel--',
+          '',
+        ]),
+      );
+    }
+
+    function relatedStructure(cid = 'logo@example.com', filename = 'logo.png') {
+      return {
+        type: 'multipart/related',
+        childNodes: [
+          { type: 'text/html', size: 40 },
+          {
+            type: 'image/png',
+            size: png.length,
+            id: `<${cid}>`,
+            disposition: 'inline',
+            dispositionParameters: { filename },
+          },
+        ],
+      };
+    }
+
+    function attachedMessage(filename: string, inner: string, disposition = 'attachment'): string {
+      return lines([
+        'Content-Type: message/rfc822',
+        `Content-Disposition: ${disposition}; filename="${filename}"`,
+        '',
+        inner,
+      ]);
+    }
+
+    function innerRelated(html: string, cid: string, filename: string): string {
+      return lines([
+        'From: Inner <inner@example.test>',
+        'To: geof@example.com',
+        'Subject: inner',
+        'MIME-Version: 1.0',
+        'Content-Type: multipart/related; boundary="inner"',
+        '',
+        '--inner',
+        'Content-Type: text/html; charset=utf-8',
+        '',
+        html,
+        '--inner',
+        relatedImage(cid, filename),
+        '--inner--',
+        '',
+      ]);
+    }
+
+    function rfc822Node(
+      filename: string,
+      size: number,
+      cid: string,
+      imageName: string,
+      disposition = 'attachment',
+    ) {
+      return {
+        type: 'message/rfc822',
+        disposition,
+        dispositionParameters: { filename },
+        size,
+        childNodes: [
+          {
+            type: 'multipart/related',
+            childNodes: [
+              { type: 'text/html', size: 20 },
+              {
+                type: 'image/png',
+                size: png.length,
+                id: `<${cid}>`,
+                disposition: 'inline',
+                dispositionParameters: { filename: imageName },
+              },
+            ],
+          },
+        ],
+      };
+    }
+
+    function draftFetch(source: Buffer, bodyStructure: unknown) {
+      return {
+        uid: 7,
+        envelope: {
+          subject: 'old subject',
+          from: [{ name: 'Test', address: 'test@example.com' }],
+          to: [{ address: 'geof@example.com' }],
+          messageId: '<old@example.com>',
+        },
+        flags: new Set(['\\Draft', '\\Seen']),
+        bodyStructure,
+        source,
+      };
+    }
+
+    async function* oneChunk(buf: Buffer): AsyncGenerator<Buffer> {
+      yield buf;
+    }
+
+    function primeInlineDraft() {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      const html = '<p>Original</p><img src="cid:logo@example.com">';
+      client.fetchOne.mockResolvedValue(draftFetch(relatedSource(html), relatedStructure()));
+      client.download.mockImplementation(async () => ({ content: oneChunk(png) }));
+    }
+
+    function appendedRaw(): string {
+      const [, raw] = client.append.mock.calls[0] as [string, Buffer];
+      return raw.toString('binary');
+    }
+
+    async function storedHtml(): Promise<string> {
+      const [, raw] = client.append.mock.calls[0] as [string, Buffer];
+      const parsed = await simpleParser(raw, { skipImageLinks: true });
+      return typeof parsed.html === 'string' ? parsed.html : '';
+    }
+
+    async function outerBody(): Promise<{ html: string; text: string }> {
+      const [, raw] = client.append.mock.calls[0] as [string, Buffer];
+      // Keep encapsulated messages opaque, so a kept .eml is not mistaken
+      // for outer-body text. Nodemailer stores message/rfc822 as inline.
+      const parserOptions = { skipImageLinks: true, ignoreEmbedded: true };
+      const parsed = await simpleParser(raw, parserOptions);
+      return {
+        html: typeof parsed.html === 'string' ? parsed.html : '',
+        text: typeof parsed.text === 'string' ? parsed.text : '',
+      };
+    }
+
+    function downloadParts(): string[] {
+      return client.download.mock.calls.map((call) => String(call[1]));
+    }
+
+    it('carries an inline cid part forward when only the subject changes', async () => {
+      primeInlineDraft();
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      expect(client.download).toHaveBeenCalledWith('7', '2', { uid: true });
+      const text = appendedRaw();
+      expect(text).toContain('Fixed typo');
+      expect(text).toMatch(/content-id:\s*<logo@example.com>/i);
+      expect(text).toMatch(/content-disposition:\s*inline/i);
+      expect(text).toContain(pngBase64);
+      const html = await storedHtml();
+      expect(html).toContain('src="cid:logo@example.com"');
+      expect(html).not.toMatch(/data:image/i);
+      expect(html).not.toContain(pngBase64);
+      expect(updated.warnings).toEqual([]);
+      expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+    });
+
+    it('still carries inline cid parts when attachments_keep is empty', async () => {
+      primeInlineDraft();
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+        attachmentsKeep: [],
+      });
+
+      expect(client.download).toHaveBeenCalledWith('7', '2', { uid: true });
+      expect(appendedRaw()).toMatch(/content-id:\s*<logo@example.com>/i);
+      const html = await storedHtml();
+      expect(html).toContain('src="cid:logo@example.com"');
+      expect(html).not.toMatch(/data:image/i);
+      expect(updated.warnings).toEqual([]);
+    });
+
+    it('drops an inline cid part named in attachments_remove and warns about the missing cid', async () => {
+      primeInlineDraft();
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+        attachmentsRemove: ['logo.png'],
+      });
+
+      expect(client.download).not.toHaveBeenCalled();
+      const text = appendedRaw();
+      expect(text).not.toMatch(/content-id:\s*<logo@example.com>/i);
+      expect(text).not.toContain(pngBase64);
+      const html = await storedHtml();
+      expect(html).toContain('src="cid:logo@example.com"');
+      expect(html).not.toMatch(/data:image/i);
+      expect(html).not.toContain(pngBase64);
+      expect(updated.warnings).toEqual([
+        'Body references cid:logo@example.com but no attachment has content_id "logo@example.com".',
+      ]);
+    });
+
+    it('rejects a new content_id that duplicates a carried inline part before APPEND', async () => {
+      primeInlineDraft();
+
+      await expect(
+        service.updateDraft('test', 7, {
+          mailbox: 'Drafts',
+          attachmentsAdd: [
+            {
+              contentBase64: Buffer.from('new').toString('base64'),
+              filename: 'other.png',
+              contentId: '<logo@example.com>',
+            },
+          ],
+        }),
+      ).rejects.toThrow(/duplicate content_id "logo@example.com"[\s\S]*Old draft was NOT deleted/);
+
+      expect(client.append).not.toHaveBeenCalled();
+      expect(client.messageDelete).not.toHaveBeenCalled();
+    });
+
+    it('rejects two carried inline parts that share a content id before APPEND', async () => {
+      const doubled = {
+        type: 'multipart/mixed',
+        childNodes: [
+          {
+            type: 'multipart/related',
+            childNodes: [
+              { type: 'text/html', size: 40 },
+              {
+                type: 'image/png',
+                size: png.length,
+                id: '<logo@example.com>',
+                disposition: 'inline',
+                dispositionParameters: { filename: 'logo.png' },
+              },
+              {
+                type: 'image/png',
+                size: png.length,
+                id: 'logo@example.com',
+                disposition: 'inline',
+                dispositionParameters: { filename: 'other.png' },
+              },
+            ],
+          },
+        ],
+      };
+      primeInlineDraft();
+      client.fetchOne.mockResolvedValue({
+        uid: 7,
+        envelope: {
+          subject: 'old subject',
+          from: [{ name: 'Test', address: 'test@example.com' }],
+          to: [{ address: 'geof@example.com' }],
+          messageId: '<old@example.com>',
+        },
+        flags: new Set(['\\Draft', '\\Seen']),
+        bodyStructure: doubled,
+        source: relatedSource('<p>Original</p><img src="cid:logo@example.com">'),
+      });
+
+      await expect(
+        service.updateDraft('test', 7, { mailbox: 'Drafts', subject: 'Fixed typo' }),
+      ).rejects.toThrow(/duplicate content_id "logo@example.com"[\s\S]*Old draft was NOT deleted/);
+
+      expect(client.append).not.toHaveBeenCalled();
+      expect(client.messageDelete).not.toHaveBeenCalled();
+    });
+
+    it('leaves the old draft in place when an inline part cannot be downloaded', async () => {
+      primeInlineDraft();
+      client.download.mockResolvedValue({ content: null });
+
+      await expect(
+        service.updateDraft('test', 7, {
+          mailbox: 'Drafts',
+          subject: 'Fixed typo',
+        }),
+      ).rejects.toThrow(/Old draft was NOT deleted/);
+
+      expect(client.append).not.toHaveBeenCalled();
+      expect(client.messageDelete).not.toHaveBeenCalled();
+    });
+
+    it('leaves get_email display rewriting of cid refs unchanged', async () => {
+      primeInlineDraft();
+
+      const email = await service.getEmail('test', '7', 'Drafts');
+
+      expect(email.bodyHtml).toContain('data:image/png;base64,UE5HREFUQQ==');
+      expect(email.bodyHtml).not.toContain('cid:logo@example.com');
+    });
+
+    it('does not promote an inline image out of a removed attached message', async () => {
+      const inner = innerRelated('<p>Secret</p>', 'private@example.test', 'private.png');
+      const source = Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/mixed; boundary="mix"',
+          '',
+          '--mix',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          '<p>Public</p>',
+          '--mix',
+          attachedMessage('private.eml', inner),
+          '--mix--',
+          '',
+        ]),
+      );
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'text/html', size: 15 },
+          rfc822Node(
+            'private.eml',
+            Buffer.byteLength(inner),
+            'private@example.test',
+            'private.png',
+          ),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(source, bodyStructure));
+      client.download.mockImplementation(async () => ({ content: oneChunk(png) }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+        attachmentsRemove: ['private.eml'],
+      });
+
+      expect(client.download).not.toHaveBeenCalled();
+      const text = appendedRaw();
+      expect(text).toContain('Public');
+      expect(text).not.toContain('private@example.test');
+      expect(text).not.toContain(pngBase64);
+      expect(text).not.toMatch(/content-disposition:\s*inline/i);
+      expect(updated.warnings).toEqual([]);
+    });
+
+    it('keeps an attached message intact without promoting its inline image', async () => {
+      const inner = innerRelated('<p>Secret</p>', 'private@example.test', 'private.png');
+      const innerBytes = Buffer.from(inner);
+      const source = Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/mixed; boundary="mix"',
+          '',
+          '--mix',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          '<p>Public</p>',
+          '--mix',
+          attachedMessage('private.eml', inner),
+          '--mix--',
+          '',
+        ]),
+      );
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'text/html', size: 15 },
+          rfc822Node('private.eml', innerBytes.length, 'private@example.test', 'private.png'),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(source, bodyStructure));
+      client.download.mockImplementation(async (_uid: string, part: string) => ({
+        content: oneChunk(part === '2' ? innerBytes : png),
+      }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      expect(downloadParts()).toEqual(['2']);
+      expect(appendedRaw()).toContain('Public');
+      expect(updated.warnings).toEqual([]);
+      expect(client.append).toHaveBeenCalled();
+    });
+
+    it('does not treat an attached message content id as a duplicate of the outer draft', async () => {
+      const inner = innerRelated('<p>Secret</p>', 'logo@example.test', 'inside.png');
+      const innerBytes = Buffer.from(inner);
+      const outerHtml = '<p>Public</p><img src="cid:logo@example.test">';
+      const source = Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/mixed; boundary="mix"',
+          '',
+          '--mix',
+          'Content-Type: multipart/related; boundary="rel"',
+          '',
+          '--rel',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          outerHtml,
+          '--rel',
+          relatedImage('logo@example.test', 'logo.png'),
+          '--rel--',
+          '--mix',
+          attachedMessage('private.eml', inner),
+          '--mix--',
+          '',
+        ]),
+      );
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          relatedStructure('logo@example.test', 'logo.png'),
+          rfc822Node('private.eml', innerBytes.length, 'logo@example.test', 'inside.png'),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(source, bodyStructure));
+      client.download.mockImplementation(async (_uid: string, part: string) => ({
+        content: oneChunk(part === '2' ? innerBytes : png),
+      }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      expect(downloadParts()).toEqual(['2', '1.2']);
+      const html = await storedHtml();
+      expect(html).toContain('src="cid:logo@example.test"');
+      expect(html).not.toMatch(/data:image/i);
+      expect(html).not.toContain(pngBase64);
+      expect(updated.warnings).toEqual([]);
+      expect(client.append).toHaveBeenCalled();
+      expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
+    });
+
+    function emlOnlySource(inner: string): Buffer {
+      return Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/mixed; boundary="mix"',
+          '',
+          '--mix',
+          attachedMessage('private.eml', inner),
+          '--mix--',
+          '',
+        ]),
+      );
+    }
+
+    it('keeps an attached-message-only draft body empty on a subject change', async () => {
+      const inner = innerRelated(
+        '<p>Secret</p><img src="cid:private@example.test">',
+        'private@example.test',
+        'private.png',
+      );
+      const innerBytes = Buffer.from(inner);
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          rfc822Node('private.eml', innerBytes.length, 'private@example.test', 'private.png'),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(emlOnlySource(inner), bodyStructure));
+      client.download.mockImplementation(async (_uid: string, part: string) => ({
+        content: oneChunk(part === '1' ? innerBytes : png),
+      }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      expect(downloadParts()).toEqual(['1']);
+      const body = await outerBody();
+      expect(body.html).not.toContain('Secret');
+      expect(body.html).not.toContain('cid:private@example.test');
+      expect(body.text).not.toContain('Secret');
+      expect(updated.warnings).toEqual([]);
+      const [, raw] = client.append.mock.calls[0] as [string, Buffer];
+      const parserOptions = { skipImageLinks: true, ignoreEmbedded: true };
+      const parsed = await simpleParser(raw, parserOptions);
+      const eml = parsed.attachments.find((part) => part.filename === 'private.eml');
+      expect(eml?.content.toString('utf8')).toContain('<p>Secret</p>');
+      expect(eml?.content.toString('utf8')).toContain('cid:private@example.test');
+    });
+
+    it('does not copy a removed attached message into an empty outer body', async () => {
+      const inner = innerRelated(
+        '<p>Secret</p><img src="cid:private@example.test">',
+        'private@example.test',
+        'private.png',
+      );
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          rfc822Node(
+            'private.eml',
+            Buffer.byteLength(inner),
+            'private@example.test',
+            'private.png',
+          ),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(emlOnlySource(inner), bodyStructure));
+      client.download.mockImplementation(async () => ({ content: oneChunk(png) }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+        attachmentsRemove: ['private.eml'],
+      });
+
+      expect(client.download).not.toHaveBeenCalled();
+      const body = await outerBody();
+      expect(body.html).not.toContain('Secret');
+      expect(body.html).not.toContain('cid:private@example.test');
+      expect(body.text).not.toContain('Secret');
+      expect(appendedRaw()).not.toContain('private@example.test');
+      expect(updated.warnings).toEqual([]);
+    });
+
+    it('does not merge a removed inline-disposition message into the outer body', async () => {
+      const inner = innerRelated(
+        '<p>Secret</p><img src="cid:private@example.test">',
+        'private@example.test',
+        'private.png',
+      );
+      const source = Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: multipart/mixed; boundary="mix"',
+          '',
+          '--mix',
+          'Content-Type: text/html; charset=utf-8',
+          '',
+          '<p>Public</p>',
+          '--mix',
+          attachedMessage('private.eml', inner, 'inline'),
+          '--mix--',
+          '',
+        ]),
+      );
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          { type: 'text/html', size: 15 },
+          rfc822Node(
+            'private.eml',
+            Buffer.byteLength(inner),
+            'private@example.test',
+            'private.png',
+            'inline',
+          ),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(source, bodyStructure));
+      client.download.mockImplementation(async () => ({ content: oneChunk(png) }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+        attachmentsRemove: ['private.eml'],
+      });
+
+      expect(client.download).not.toHaveBeenCalled();
+      const body = await outerBody();
+      expect(body.html).toContain('Public');
+      expect(body.html).not.toContain('Secret');
+      expect(body.html).not.toContain('cid:private@example.test');
+      expect(body.html).not.toContain('inner@example.test');
+      expect(body.text).not.toContain('Secret');
+      expect(updated.warnings).toEqual([]);
+    });
+
+    // Turn the bytes a draft was actually saved as into the BODYSTRUCTURE
+    // imapflow would hand back. Part numbers come from parseBodystructure,
+    // not from the fixture the first edit started with.
+    interface ImapValue {
+      value: string;
+    }
+    type ImapToken = ImapValue | ImapToken[] | null;
+    interface MimeEntity {
+      type: string;
+      params: Record<string, string>;
+      id?: string;
+      encoding: string;
+      disposition?: string;
+      dispositionParams: Record<string, string>;
+      body: Buffer;
+      children: MimeEntity[];
+      headers: Map<string, string>;
+    }
+
+    function token(value: string): ImapValue {
+      return { value };
+    }
+
+    function splitHeaders(raw: Buffer): { headerText: string; body: Buffer } {
+      const latin1 = raw.toString('latin1');
+      const match = /\r?\n\r?\n/.exec(latin1);
+      if (match?.index === undefined) {
+        return { headerText: latin1, body: Buffer.alloc(0) };
+      }
+      return {
+        headerText: latin1.slice(0, match.index),
+        body: raw.subarray(match.index + match[0].length),
+      };
+    }
+
+    function headerMap(headerText: string): Map<string, string> {
+      const map = new Map<string, string>();
+      headerText
+        .replace(/\r?\n[ \t]+/g, ' ')
+        .split(/\r?\n/)
+        .forEach((line) => {
+          const idx = line.indexOf(':');
+          if (idx < 0) return;
+          map.set(line.slice(0, idx).trim().toLowerCase(), line.slice(idx + 1).trim());
+        });
+      return map;
+    }
+
+    function parseHeaderValue(value: string | undefined): {
+      kind: string;
+      params: Record<string, string>;
+    } {
+      if (!value) return { kind: '', params: {} };
+      const [kind, ...rest] = value.split(';');
+      const params: Record<string, string> = {};
+      rest.forEach((piece) => {
+        const eq = piece.indexOf('=');
+        if (eq < 0) return;
+        const key = piece.slice(0, eq).trim().toLowerCase();
+        let paramValue = piece.slice(eq + 1).trim();
+        if (paramValue.startsWith('"') && paramValue.endsWith('"') && paramValue.length >= 2) {
+          paramValue = paramValue.slice(1, -1);
+        }
+        params[key] = paramValue;
+      });
+      return { kind: (kind ?? '').trim().toLowerCase(), params };
+    }
+
+    function paramTokens(params: Record<string, string>): ImapToken[] | null {
+      const keys = Object.keys(params);
+      if (keys.length === 0) return null;
+      return keys.flatMap((key) => [token(key), token(params[key] ?? '')]);
+    }
+
+    function addressList(value: string | undefined): ImapToken[] | null {
+      if (!value) return null;
+      const match = /([^<>\s@]+)@([^<>\s>]+)/.exec(value);
+      if (!match) return null;
+      const nameMatch = /^\s*"?([^"<]+?)"?\s*</.exec(value);
+      const name = nameMatch?.[1]?.trim() ?? '';
+      const entry: ImapToken[] = [
+        name ? token(name) : null,
+        null,
+        token(match[1] ?? ''),
+        token(match[2] ?? ''),
+      ];
+      return [entry];
+    }
+
+    function envelopeTokens(headers: Map<string, string>): ImapToken[] {
+      return [
+        headers.get('date') ? token(headers.get('date') ?? '') : null,
+        headers.get('subject') ? token(headers.get('subject') ?? '') : null,
+        addressList(headers.get('from')),
+        null,
+        null,
+        addressList(headers.get('to')),
+        null,
+        null,
+        headers.get('in-reply-to') ? token(headers.get('in-reply-to') ?? '') : null,
+        headers.get('message-id') ? token(headers.get('message-id') ?? '') : null,
+      ];
+    }
+
+    function dispositionTokens(
+      disposition: string | undefined,
+      params: Record<string, string>,
+    ): ImapToken[] | null {
+      if (!disposition) return null;
+      const list = paramTokens(params);
+      return list ? [token(disposition), list] : [token(disposition)];
+    }
+
+    function splitMultipart(body: Buffer, boundary: string): Buffer[] {
+      const marker = `--${boundary}`;
+      const end = `--${boundary}--`;
+      const linesOf = body
+        .toString('latin1')
+        .split('\n')
+        .map((line) => line.replace(/\r$/, ''));
+      const chunks: string[][] = [];
+      let current: string[] | undefined;
+      linesOf.forEach((line) => {
+        const trimmed = line.trim();
+        if (trimmed === end) {
+          if (current) chunks.push(current);
+          current = undefined;
+          return;
+        }
+        if (trimmed === marker) {
+          if (current) chunks.push(current);
+          current = [];
+          return;
+        }
+        if (current) current.push(line);
+      });
+      if (current) chunks.push(current);
+      return chunks.map((chunk) => Buffer.from(chunk.join('\r\n'), 'latin1'));
+    }
+
+    function parseEntity(raw: Buffer): MimeEntity {
+      const { headerText, body } = splitHeaders(raw);
+      const headers = headerMap(headerText);
+      const contentType = parseHeaderValue(headers.get('content-type'));
+      const disposition = parseHeaderValue(headers.get('content-disposition'));
+      const type = contentType.kind || 'text/plain';
+      const children =
+        type.startsWith('multipart/') && contentType.params.boundary
+          ? splitMultipart(body, contentType.params.boundary).map((part) => parseEntity(part))
+          : [];
+      return {
+        type,
+        params: contentType.params,
+        id: headers.get('content-id'),
+        encoding: (headers.get('content-transfer-encoding') ?? '7bit').toLowerCase(),
+        disposition: disposition.kind || undefined,
+        dispositionParams: disposition.params,
+        body,
+        children,
+        headers,
+      };
+    }
+
+    function bodyLineCount(body: Buffer): number {
+      if (body.length === 0) return 0;
+      return body.toString('latin1').split('\n').length;
+    }
+
+    function buildBodyTokens(part: MimeEntity): ImapToken[] {
+      if (part.type.startsWith('multipart/')) {
+        const subtype = part.type.split('/')[1] || 'mixed';
+        return [...part.children.map((child) => buildBodyTokens(child)), token(subtype)];
+      }
+      const [main, sub] = part.type.split('/');
+      const tokens: ImapToken[] = [
+        token((main || 'application').toUpperCase()),
+        token((sub || 'octet-stream').toUpperCase()),
+        paramTokens(part.params),
+        part.id ? token(part.id) : null,
+        null,
+        token(part.encoding.toUpperCase()),
+        token(String(part.body.length)),
+      ];
+      if (part.type === 'message/rfc822') {
+        const nested = parseEntity(part.body);
+        tokens.push(
+          envelopeTokens(nested.headers),
+          buildBodyTokens(nested),
+          token(String(bodyLineCount(part.body))),
+        );
+      } else if (part.type.startsWith('text/')) {
+        tokens.push(token(String(bodyLineCount(part.body))));
+      }
+      tokens.push(null, dispositionTokens(part.disposition, part.dispositionParams), null, null);
+      return tokens;
+    }
+
+    function imapBodyStructure(raw: Buffer): { type?: string } {
+      return parseBodystructure(buildBodyTokens(parseEntity(raw)));
+    }
+
+    async function opaqueParts(raw: Buffer): Promise<{ html: string; text: string; eml?: Buffer }> {
+      const parserOptions = { skipImageLinks: true, ignoreEmbedded: true };
+      const parsed = await simpleParser(raw, parserOptions);
+      const eml = parsed.attachments.find((part) => part.filename === 'private.eml');
+      return {
+        html: typeof parsed.html === 'string' ? parsed.html : '',
+        text: typeof parsed.text === 'string' ? parsed.text : '',
+        eml: eml?.content,
+      };
+    }
+
+    function rootEmlSource(inner: string): Buffer {
+      return Buffer.from(
+        lines([
+          'From: Test <test@example.com>',
+          'To: geof@example.com',
+          'Subject: old subject',
+          'MIME-Version: 1.0',
+          'Content-Type: message/rfc822; name="private.eml"',
+          'Content-Disposition: inline; filename="private.eml"',
+          'Content-Transfer-Encoding: 8bit',
+          '',
+          inner,
+        ]),
+      );
+    }
+
+    it('updates an attached-message-only draft twice from the saved MIME', async () => {
+      const inner = innerRelated(
+        '<p>Secret</p><img src="cid:private@example.test">',
+        'private@example.test',
+        'private.png',
+      );
+      const innerBytes = Buffer.from(inner);
+      const bodyStructure = {
+        type: 'multipart/mixed',
+        childNodes: [
+          rfc822Node('private.eml', innerBytes.length, 'private@example.test', 'private.png'),
+        ],
+      };
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(emlOnlySource(inner), bodyStructure));
+      client.download.mockImplementation(async (_uid: string, part: string) => ({
+        content: oneChunk(part === '1' ? innerBytes : png),
+      }));
+
+      const first = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      const saved = (client.append.mock.calls[0] as [string, Buffer])[1];
+      const savedStructure = imapBodyStructure(saved);
+      const savedPart = findMimePartByFilename(savedStructure, 'private.eml');
+      const firstBody = await opaqueParts(saved);
+      client.fetchOne.mockResolvedValue(draftFetch(saved, savedStructure));
+      client.download.mockImplementation(async (_uid: string, part: string) => ({
+        content: oneChunk(
+          part === savedPart ? (firstBody.eml ?? Buffer.alloc(0)) : Buffer.from('x'),
+        ),
+      }));
+      client.messageDelete.mockClear();
+
+      const second = await service.updateDraft('test', first.id, {
+        mailbox: 'Drafts',
+        subject: 'Second edit',
+      });
+
+      const resaved = (client.append.mock.calls[1] as [string, Buffer])[1];
+      const resavedStructure = imapBodyStructure(resaved);
+      const secondBody = await opaqueParts(resaved);
+      expect(savedStructure.type).toBe('multipart/mixed');
+      expect(resavedStructure.type).toBe('multipart/mixed');
+      expect(savedPart).toBe('2');
+      expect(firstBody.html.trim()).toBe('');
+      expect(firstBody.text.trim()).toBe('');
+      expect(secondBody.html.trim()).toBe('');
+      expect(secondBody.text.trim()).toBe('');
+      expect(firstBody.html).not.toContain('Secret');
+      expect(secondBody.html).not.toContain('Secret');
+      expect(firstBody.html).not.toContain('cid:');
+      expect(secondBody.html).not.toContain('cid:');
+      expect(firstBody.text).not.toContain('Secret');
+      expect(secondBody.text).not.toContain('Secret');
+      expect(firstBody.eml?.toString('utf8')).toContain('<p>Secret</p>');
+      expect(firstBody.eml?.toString('utf8')).toContain('cid:private@example.test');
+      expect(secondBody.eml).toBeInstanceOf(Buffer);
+      expect(firstBody.eml).toBeInstanceOf(Buffer);
+      expect(secondBody.eml?.equals(firstBody.eml as Buffer)).toBe(true);
+      expect(first.warnings).toEqual([]);
+      expect(second.warnings).toEqual([]);
+      expect(second.oldDraftDeleted).toBe(true);
+      expect(client.messageDelete).toHaveBeenCalledWith(String(first.id), { uid: true });
+      expect(client.append).toHaveBeenCalledTimes(2);
+    });
+
+    it('updates a draft already saved with the .eml as the MIME root', async () => {
+      const inner = innerRelated(
+        '<p>Secret</p><img src="cid:private@example.test">',
+        'private@example.test',
+        'private.png',
+      );
+      const innerBytes = Buffer.from(inner);
+      const source = rootEmlSource(inner);
+      const structure = imapBodyStructure(source);
+      // Section 1 of this message is the encapsulated HTML. The attachment
+      // bytes are the message body, which imapflow reads as TEXT.
+      expect(structure.type).toBe('message/rfc822');
+      expect(findMimePartByFilename(structure, 'private.eml')).toBe('TEXT');
+
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+      client.fetchOne.mockResolvedValue(draftFetch(source, structure));
+      client.download.mockImplementation(async (_uid: string, part: string) => ({
+        content: oneChunk(part === 'TEXT' ? innerBytes : Buffer.from('<p>Secret</p>')),
+      }));
+
+      const updated = await service.updateDraft('test', 7, {
+        mailbox: 'Drafts',
+        subject: 'Fixed typo',
+      });
+
+      expect(client.download).toHaveBeenCalledWith('7', 'TEXT', { uid: true });
+      const saved = (client.append.mock.calls[0] as [string, Buffer])[1];
+      const body = await opaqueParts(saved);
+      expect(body.html.trim()).toBe('');
+      expect(body.text.trim()).toBe('');
+      expect(body.html).not.toContain('Secret');
+      expect(body.html).not.toContain('cid:');
+      expect(body.text).not.toContain('Secret');
+      expect(body.eml?.toString('utf8')).toContain('<p>Secret</p>');
+      expect(body.eml?.toString('utf8')).toContain('cid:private@example.test');
+      expect(body.eml?.toString('utf8')).toContain('private.png');
+      expect(updated.warnings).toEqual([]);
+      expect(updated.oldDraftDeleted).toBe(true);
+      expect(client.messageDelete).toHaveBeenCalledWith('7', { uid: true });
     });
   });
 

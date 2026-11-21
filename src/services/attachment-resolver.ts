@@ -1,7 +1,9 @@
 /**
  * Attachment resolver — turns the polymorphic AttachmentInput shape accepted
- * by save_draft / update_draft into the {filename, content, contentType}
- * triple that nodemailer's MailComposer expects.
+ * by save_draft / update_draft / send_email into the {filename, content,
+ * contentType} triple that nodemailer's MailComposer expects. A contentId
+ * also sets `cid` and `contentDisposition: 'inline'` so the part is placed
+ * in multipart/related.
  *
  * Three input variants are supported:
  *
@@ -21,14 +23,67 @@ import type ImapService from './imap.service.js';
 export const REBUILD_ATTACHMENT_CAP_BYTES = 25 * 1024 * 1024;
 
 export type AttachmentInput =
-  | { path: string; filename?: string; mimeType?: string }
-  | { contentBase64: string; filename: string; mimeType?: string }
-  | { sourceEmailId: string; sourceMailbox: string; filename: string };
+  | { path: string; filename?: string; mimeType?: string; contentId?: string }
+  | { contentBase64: string; filename: string; mimeType?: string; contentId?: string }
+  | {
+      sourceEmailId: string;
+      sourceMailbox: string;
+      filename: string;
+      contentId?: string;
+    };
 
 export interface ResolvedAttachment {
   filename: string;
   content: Buffer;
   contentType: string;
+  /** Set when contentId was provided. MailComposer writes Content-ID: <cid>. */
+  cid?: string;
+  /** 'inline' when cid is set. Omitted on ordinary attachments. */
+  contentDisposition?: 'inline';
+}
+
+/** Content-ID length cap after one surrounding pair of angle brackets is removed. */
+const CONTENT_ID_MAX_LENGTH = 200;
+
+/**
+ * Printable ASCII is 0x21-0x7E. Anything outside that (space, C0, DEL, C1,
+ * non-ASCII) is rejected, as are `"` `<` and `>` inside the range.
+ * Nodemailer RFC 2047-encodes a non-ASCII Content-ID, so the header no longer
+ * matches the HTML `cid:` reference. Apostrophe and parentheses stay allowed.
+ */
+function hasIllegalContentIdChar(cid: string): boolean {
+  return Array.from(cid).some((char) => {
+    const code = char.codePointAt(0) ?? 0;
+    if (code < 0x21 || code > 0x7e) return true;
+    return code === 0x22 || code === 0x3c || code === 0x3e;
+  });
+}
+
+/**
+ * Strip one surrounding `<` `>` pair, then reject an empty, overlong, or
+ * non-ASCII Content-ID. Callers fail the whole operation when this returns
+ * an error. A bad content_id is not a partial-success case.
+ */
+function normalizeContentId(
+  raw: string,
+): { ok: true; cid: string } | { ok: false; reason: string } {
+  let cid = raw;
+  if (cid.startsWith('<') && cid.endsWith('>') && cid.length >= 2) {
+    cid = cid.slice(1, -1);
+  }
+  if (cid.length === 0) {
+    return { ok: false, reason: 'content_id is empty' };
+  }
+  if (cid.length > CONTENT_ID_MAX_LENGTH) {
+    return { ok: false, reason: `content_id exceeds ${CONTENT_ID_MAX_LENGTH} characters` };
+  }
+  if (hasIllegalContentIdChar(cid)) {
+    return {
+      ok: false,
+      reason: 'content_id must be printable ASCII without spaces, double quotes, or angle brackets',
+    };
+  }
+  return { ok: true, cid };
 }
 
 export interface AttachmentFailure {
@@ -72,6 +127,53 @@ function inputLabel(input: AttachmentInput): string {
   return input.filename;
 }
 
+/**
+ * Invalid or duplicate content_id values. Returned as resolver failures so
+ * save/send abort the whole operation with the same strict-failure message
+ * they already use for unreadable attachments. Checked before any I/O.
+ */
+function collectContentIdFailures(inputs: AttachmentInput[]): AttachmentFailure[] {
+  const failures: AttachmentFailure[] = [];
+  const seen = new Map<string, string>();
+
+  inputs.forEach((input) => {
+    if (input.contentId === undefined) return;
+    const normalized = normalizeContentId(input.contentId);
+    if (!normalized.ok) {
+      failures.push({ label: inputLabel(input), reason: normalized.reason });
+      return;
+    }
+    const previous = seen.get(normalized.cid);
+    if (previous !== undefined) {
+      failures.push({
+        label: inputLabel(input),
+        reason: `duplicate content_id "${normalized.cid}" (also used by "${previous}")`,
+      });
+      return;
+    }
+    seen.set(normalized.cid, inputLabel(input));
+  });
+
+  return failures;
+}
+
+/** Attach cid + inline disposition when the caller set contentId. */
+function stampInline(
+  input: AttachmentInput,
+  resolved: { filename: string; content: Buffer; contentType: string },
+): ResolvedAttachment {
+  if (input.contentId === undefined) return resolved;
+  const normalized = normalizeContentId(input.contentId);
+  // collectContentIdFailures already rejected bad ids. This throw is a
+  // backstop so a stamped part can never carry a Content-ID we would refuse.
+  if (!normalized.ok) throw new Error(normalized.reason);
+  return {
+    ...resolved,
+    cid: normalized.cid,
+    contentDisposition: 'inline',
+  };
+}
+
 async function resolveOne(
   imapService: ImapService,
   accountName: string,
@@ -87,11 +189,11 @@ async function resolveOne(
       );
     }
     const filename = input.filename ?? path.basename(absolute);
-    return {
+    return stampInline(input, {
       filename,
       content,
       contentType: input.mimeType ?? guessMimeType(filename),
-    };
+    });
   }
 
   if ('contentBase64' in input) {
@@ -101,11 +203,11 @@ async function resolveOne(
         `Attachment "${input.filename}" is ${Math.round(content.length / 1024 / 1024)}MB, exceeds ${Math.round(maxSizeBytes / 1024 / 1024)}MB limit`,
       );
     }
-    return {
+    return stampInline(input, {
       filename: input.filename,
       content,
       contentType: input.mimeType ?? guessMimeType(input.filename),
-    };
+    });
   }
 
   // sourceEmailId — fetch from IMAP without round-tripping through MCP
@@ -116,11 +218,11 @@ async function resolveOne(
     input.filename,
     maxSizeBytes,
   );
-  return {
+  return stampInline(input, {
     filename: downloaded.filename,
     content: Buffer.from(downloaded.contentBase64, 'base64'),
     contentType: downloaded.mimeType,
-  };
+  });
 }
 
 /**
@@ -135,6 +237,11 @@ export async function resolveAttachments(
   maxSizeBytes: number = REBUILD_ATTACHMENT_CAP_BYTES,
 ): Promise<ResolveResult> {
   if (inputs.length === 0) return { resolved: [], failures: [] };
+
+  const cidFailures = collectContentIdFailures(inputs);
+  if (cidFailures.length > 0) {
+    return { resolved: [], failures: cidFailures };
+  }
 
   const settled = await Promise.allSettled(
     inputs.map(async (input) => resolveOne(imapService, accountName, input, maxSizeBytes)),

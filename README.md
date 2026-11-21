@@ -1028,15 +1028,30 @@ Privacy, the sudo rule, limits and performance are in **[docs/maildir-search.md]
 
 | Tool | Description |
 |------|-------------|
-| `send_email` | Send a new email (plain text or HTML, CC/BCC) |
+| `send_email` | Send a new email (plain text or HTML, CC/BCC, attachments, inline `cid` images) |
 | `reply_email` | Reply with proper threading (In-Reply-To, References) |
 | `forward_email` | Forward with original content quoted |
-| `save_draft` | Save an email draft to the Drafts folder |
+| `save_draft` | Save an email draft to the Drafts folder, including inline `cid` images |
 | `send_draft` | Send an existing draft and remove from Drafts |
 | `apply_template` | Apply a template with variable substitution |
 | `schedule_email` | Schedule an email for future delivery |
 | `list_scheduled` | List scheduled emails by status |
 | `cancel_scheduled` | Cancel a pending scheduled email |
+
+`save_draft`, `send_email`, and `update_draft` (`attachments_add`) take an optional `content_id` on any attachment (path, base64, or source-message). Set `html: true` and reference it from the body:
+
+```json
+{
+  "html": true,
+  "body": "<p>See the chart.</p><img src=\"cid:chart1\" alt=\"chart\">",
+  "attachments": [
+    { "path": "/absolute/path/chart.png", "content_id": "chart1" },
+    { "path": "/absolute/path/notes.pdf" }
+  ]
+}
+```
+
+The chart is a `multipart/related` part with `Content-ID: <chart1>` and `Content-Disposition: inline`. `notes.pdf` stays a normal attachment. `content_id` must be printable ASCII with no space, double quote, or angle brackets, so the Content-ID header is stored unchanged. One surrounding `<>` pair is stripped. The tool warns, and still saves or sends, when the HTML body references a `cid:` that no attachment has, or when `content_id` is set but `html` is false. Rebuilding a draft carries forward each inline cid part of the outer draft (Content-Disposition inline and a Content-ID): the part is downloaded by MIME part number and re-attached with the same Content-ID, and the HTML keeps its `cid:` references instead of embedding the image as a data URL. `attachments_keep` does not apply to those parts. `attachments_remove` drops one when its filename matches. A new attachment whose `content_id` duplicates a carried outer part is rejected and the old draft is left in place. An attached message stays opaque: its body and inline images stay inside that attachment, and an empty outer body stays empty.
 
 #### Manage (7)
 
