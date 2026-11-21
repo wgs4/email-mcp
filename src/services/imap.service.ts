@@ -281,6 +281,34 @@ export function extractCidReferences(html: string): string[] {
 }
 
 /**
+ * Non-fatal inline Content-ID checks. The message is still saved or sent.
+ *
+ * (a) An HTML body references cid:X and no attachment carries that content_id.
+ * (b) An attachment has a content_id but the message is not HTML.
+ */
+export function inlineCidWarnings(
+  html: boolean | undefined,
+  body: string,
+  attachments: readonly { filename?: string; cid?: string }[],
+): string[] {
+  const inline = attachments.filter(
+    (attachment): attachment is { filename?: string; cid: string } => Boolean(attachment.cid),
+  );
+
+  if (html) {
+    const have = new Set(inline.map((attachment) => attachment.cid));
+    return extractCidReferences(body)
+      .filter((ref) => !have.has(ref))
+      .map((ref) => `Body references cid:${ref} but no attachment has content_id "${ref}".`);
+  }
+
+  return inline.map((attachment) => {
+    const name = attachment.filename ? ` "${attachment.filename}"` : '';
+    return `Attachment${name} has content_id "${attachment.cid}" but html is false; it is still attached.`;
+  });
+}
+
+/**
  * Find the IMAP MIME part number for an attachment by filename.
  *
  * Detection uses the exact same lenient predicate as
@@ -2360,7 +2388,7 @@ export default class ImapService {
       inReplyTo?: string;
       attachments?: ResolvedAttachment[];
     },
-  ): Promise<{ id: number; mailbox: string }> {
+  ): Promise<{ id: number; mailbox: string; warnings: string[] }> {
     const client = await this.connections.getImapClient(accountName);
     const account = this.connections.getAccount(accountName);
 
@@ -2414,6 +2442,7 @@ export default class ImapService {
     return {
       id: (appendResult as unknown as { uid?: number }).uid ?? 0,
       mailbox: draftsPath,
+      warnings: inlineCidWarnings(options.html, options.body, options.attachments ?? []),
     };
   }
 
@@ -2461,7 +2490,7 @@ export default class ImapService {
       inReplyTo?: string;
       attachments?: AttachmentInput[];
     },
-  ): Promise<{ id: number; mailbox: string }> {
+  ): Promise<{ id: number; mailbox: string; warnings: string[] }> {
     let resolved: ResolvedAttachment[] = [];
 
     if (options.attachments && options.attachments.length > 0) {
@@ -2657,6 +2686,9 @@ export default class ImapService {
     }
 
     // APPEND the new draft. On failure, the old draft stays intact.
+    // New content_id parts are real inline MIME. Parts that were already
+    // inline on the old draft are still flattened above — preserving those
+    // Content-IDs across a rebuild is a follow-up.
     const newId = await this.saveDraft(accountName, {
       to,
       subject,
@@ -2667,6 +2699,7 @@ export default class ImapService {
       inReplyTo,
       attachments: allAttachments,
     });
+    warnings.push(...newId.warnings);
 
     // Only after confirmed APPEND, delete the old UID.
     let oldDraftDeleted = false;

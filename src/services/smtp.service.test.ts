@@ -298,6 +298,42 @@ describe('SmtpService', () => {
       expect((appended as Buffer).equals(call.raw as Buffer)).toBe(true);
     });
 
+    it('sends a cid part as inline multipart/related and keeps a normal attachment', async () => {
+      const attachments: ResolvedAttachment[] = [
+        {
+          filename: 'chart.png',
+          content: Buffer.from('png-bytes'),
+          contentType: 'image/png',
+          cid: 'chart1',
+          contentDisposition: 'inline',
+        },
+        {
+          filename: 'notes.pdf',
+          content: Buffer.from('%PDF'),
+          contentType: 'application/pdf',
+        },
+      ];
+
+      await service.sendEmail('test', {
+        to: ['recipient@example.com'],
+        subject: 'Chart',
+        body: '<p>Chart</p><img src="cid:chart1">',
+        html: true,
+        attachments,
+      });
+
+      const call = transport.sendMail.mock.calls[0][0];
+      const rawStr = (call.raw as Buffer).toString('utf-8');
+      expect(rawStr).toMatch(/multipart\/related/i);
+      expect(rawStr).toMatch(/content-id:\s*<chart1>/i);
+      expect(rawStr).toMatch(/content-disposition:\s*inline/i);
+      expect(rawStr).toMatch(/content-disposition:\s*attachment/i);
+      expect(rawStr).toContain('notes.pdf');
+
+      const [[, appended]] = vi.mocked(imapService.appendToSent).mock.calls;
+      expect((appended as Buffer).equals(call.raw as Buffer)).toBe(true);
+    });
+
     it('delivers a bcc via the envelope but keeps it out of the raw/Sent message', async () => {
       await service.sendEmail('test', {
         to: ['recipient@example.com'],

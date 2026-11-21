@@ -1134,6 +1134,109 @@ describe('ImapService', () => {
       expect(raw).toContain('filename="Farmpedals Statement 08-07-2026.pdf"');
       expect(raw).not.toMatch(/filename="[^"]*\r\n/);
     });
+
+    it('emits multipart/related for a cid part and leaves a normal attachment', async () => {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+
+      const saved = await service.saveDraftWithAttachments('test', {
+        to: ['geof@example.com'],
+        subject: 'chart',
+        html: true,
+        body: '<p>Chart</p><img src="cid:chart1">',
+        attachments: [
+          {
+            contentBase64: Buffer.from('png-bytes').toString('base64'),
+            filename: 'chart.png',
+            mimeType: 'image/png',
+            contentId: '<chart1>',
+          },
+          {
+            contentBase64: Buffer.from('%PDF').toString('base64'),
+            filename: 'notes.pdf',
+            mimeType: 'application/pdf',
+          },
+        ],
+      });
+
+      expect(saved.warnings).toEqual([]);
+      const [, raw] = client.append.mock.calls[0] as [string, Buffer];
+      const text = raw.toString('binary');
+      expect(text).toMatch(/multipart\/related/i);
+      expect(text).toMatch(/content-id:\s*<chart1>/i);
+      expect(text).toMatch(/content-disposition:\s*inline/i);
+      expect(text).toMatch(/content-disposition:\s*attachment/i);
+      expect(text).toContain('chart.png');
+      expect(text).toContain('notes.pdf');
+    });
+
+    it('returns a warning when the HTML body references a missing cid', async () => {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+
+      const saved = await service.saveDraftWithAttachments('test', {
+        to: ['geof@example.com'],
+        subject: 'chart',
+        html: true,
+        body: '<img src="cid:missing">',
+        attachments: [
+          {
+            contentBase64: Buffer.from('%PDF').toString('base64'),
+            filename: 'notes.pdf',
+          },
+        ],
+      });
+
+      expect(saved.warnings).toEqual([
+        'Body references cid:missing but no attachment has content_id "missing".',
+      ]);
+      expect(client.append).toHaveBeenCalled();
+    });
+
+    it('returns a warning when content_id is set on a plain-text draft', async () => {
+      client.list.mockResolvedValue([{ name: 'Drafts', path: 'Drafts', specialUse: '\\Drafts' }]);
+
+      const saved = await service.saveDraftWithAttachments('test', {
+        to: ['geof@example.com'],
+        subject: 'chart',
+        html: false,
+        body: 'no html',
+        attachments: [
+          {
+            contentBase64: Buffer.from('png').toString('base64'),
+            filename: 'chart.png',
+            contentId: 'chart1',
+          },
+        ],
+      });
+
+      expect(saved.warnings).toEqual([
+        'Attachment "chart.png" has content_id "chart1" but html is false; it is still attached.',
+      ]);
+      expect(client.append).toHaveBeenCalled();
+    });
+
+    it('fails the whole save when content ids are duplicated', async () => {
+      await expect(
+        service.saveDraftWithAttachments('test', {
+          to: ['geof@example.com'],
+          subject: 'chart',
+          body: 'x',
+          attachments: [
+            {
+              contentBase64: Buffer.from('a').toString('base64'),
+              filename: 'a.png',
+              contentId: 'chart1',
+            },
+            {
+              contentBase64: Buffer.from('b').toString('base64'),
+              filename: 'b.png',
+              contentId: '<chart1>',
+            },
+          ],
+        }),
+      ).rejects.toThrow(/duplicate content_id "chart1"/);
+
+      expect(client.append).not.toHaveBeenCalled();
+    });
   });
 
   describe('appendToSent', () => {

@@ -1028,15 +1028,30 @@ Privacy, the sudo rule, limits and performance are in **[docs/maildir-search.md]
 
 | Tool | Description |
 |------|-------------|
-| `send_email` | Send a new email (plain text or HTML, CC/BCC) |
+| `send_email` | Send a new email (plain text or HTML, CC/BCC, attachments, inline `cid` images) |
 | `reply_email` | Reply with proper threading (In-Reply-To, References) |
 | `forward_email` | Forward with original content quoted |
-| `save_draft` | Save an email draft to the Drafts folder |
+| `save_draft` | Save an email draft to the Drafts folder, including inline `cid` images |
 | `send_draft` | Send an existing draft and remove from Drafts |
 | `apply_template` | Apply a template with variable substitution |
 | `schedule_email` | Schedule an email for future delivery |
 | `list_scheduled` | List scheduled emails by status |
 | `cancel_scheduled` | Cancel a pending scheduled email |
+
+`save_draft`, `send_email`, and `update_draft` (`attachments_add`) take an optional `content_id` on any attachment (path, base64, or source-message). Set `html: true` and reference it from the body:
+
+```json
+{
+  "html": true,
+  "body": "<p>See the chart.</p><img src=\"cid:chart1\" alt=\"chart\">",
+  "attachments": [
+    { "path": "/absolute/path/chart.png", "content_id": "chart1" },
+    { "path": "/absolute/path/notes.pdf" }
+  ]
+}
+```
+
+The chart is a `multipart/related` part with `Content-ID: <chart1>` and `Content-Disposition: inline`. `notes.pdf` stays a normal attachment. The tool warns, and still saves or sends, when the HTML body references a `cid:` that no attachment has, or when `content_id` is set but `html` is false. Rebuilding an existing draft still flattens inline parts that were already stored on the old draft.
 
 #### Manage (7)
 

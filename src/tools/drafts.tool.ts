@@ -48,8 +48,9 @@ export default function registerDraftTools(
             '{ path }: read bytes from a local file (use absolute path); ' +
             '{ content_base64, filename }: provide bytes inline; ' +
             '{ source_email_id, source_mailbox, filename }: carry an attachment from another message ' +
-            'without round-tripping bytes through this MCP. Strict failure: if any attachment cannot ' +
-            'be resolved, no draft is saved.',
+            'without round-tripping bytes through this MCP. Optional content_id makes the part inline; ' +
+            'reference it from the HTML body as <img src="cid:VALUE">. Strict failure: if any attachment ' +
+            'cannot be resolved, no draft is saved.',
         ),
     },
     { readOnlyHint: false, destructiveHint: false },
@@ -75,12 +76,14 @@ export default function registerDraftTools(
 
         const attachSummary =
           attachments && attachments.length > 0 ? `, ${attachments.length} attachment(s)` : '';
+        const warningBlock =
+          result.warnings.length > 0 ? `\n\nWarnings:\n  - ${result.warnings.join('\n  - ')}` : '';
 
         return {
           content: [
             {
               type: 'text' as const,
-              text: `📝 Draft saved (ID: ${result.id}, folder: ${result.mailbox}${attachSummary}).`,
+              text: `📝 Draft saved (ID: ${result.id}, folder: ${result.mailbox}${attachSummary}).${warningBlock}`,
             },
           ],
         };
@@ -180,8 +183,9 @@ export default function registerDraftTools(
         .optional()
         .describe(
           'New attachments to add — same input shape as save_draft.attachments (path / base64 / ' +
-            'message-reference). Use the message-reference form to carry attachments from another ' +
-            'draft or any message without round-tripping bytes through this MCP.',
+            'message-reference, including optional content_id). Use the message-reference form to ' +
+            'carry attachments from another draft or any message without round-tripping bytes ' +
+            'through this MCP.',
         ),
       attachments_remove: z
         .array(z.string())
