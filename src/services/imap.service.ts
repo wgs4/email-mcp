@@ -654,28 +654,23 @@ interface RebuildBody {
 }
 
 /**
- * Body text for a draft rebuild. `skipImageLinks` keeps `cid:` references,
- * so a subject-only update does not embed a second copy of the image in the
- * HTML. Display, reply, and forward stay on {@link messageToEmail}, which
- * still rewrites those references for reading. An empty outer body uses the
- * same forwarded-message fallback as display, also with `cid:` kept. Images
- * inside that attached message are still not promoted into the outer draft.
+ * Body text for a draft rebuild, taken from the outer MIME tree only.
+ * `skipImageLinks` keeps `cid:` references in that outer HTML.
+ * `ignoreEmbedded` leaves each `message/rfc822` opaque, so an attached
+ * message is not copied into the outer body. An empty outer body stays
+ * empty. Display, reply, and forward stay on {@link messageToEmail}.
  * An oversized source returns `undefined` so the caller can fall back.
  */
 async function parseDraftForRebuild(source: Buffer): Promise<RebuildBody | undefined> {
   if (source.length > MAX_PARSE_SOURCE_BYTES) return undefined;
-  const parsed = await simpleParser(source, { skipImageLinks: true });
-  let bodyText = nonEmpty(parsed.text);
-  let bodyHtml = nonEmpty(typeof parsed.html === 'string' ? parsed.html : undefined);
-  if (!bodyText && !bodyHtml && Array.isArray(parsed.attachments)) {
-    const fwd = parsed.attachments.find(isRfc822Attachment);
-    if (fwd) {
-      const inner = await simpleParser(fwd.content, { skipImageLinks: true });
-      bodyText = nonEmpty(inner.text);
-      bodyHtml = nonEmpty(typeof inner.html === 'string' ? inner.html : undefined);
-    }
-  }
-  return { bodyText, bodyHtml };
+  // ignoreEmbedded is a mailsplit option. The installed mailparser forwards
+  // its constructor options to the splitter, but the published types omit it.
+  const parserOptions = { skipImageLinks: true, ignoreEmbedded: true };
+  const parsed = await simpleParser(source, parserOptions);
+  return {
+    bodyText: nonEmpty(parsed.text),
+    bodyHtml: nonEmpty(typeof parsed.html === 'string' ? parsed.html : undefined),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2739,9 +2734,10 @@ export default class ImapService {
     );
 
     // A caller-supplied body is stored as given. Otherwise re-read the raw
-    // draft so cid: references survive. Do not fall back to existing.bodyHtml
-    // after a successful parse: that string has already been rewritten to
-    // data URLs. A parse failure happens before APPEND, so the old draft stays.
+    // draft so cid: references survive and attached messages stay opaque.
+    // Do not fall back to existing.bodyHtml after a successful parse: that
+    // string is the display parse. A parse failure happens before APPEND,
+    // so the old draft stays.
     let rebuild: RebuildBody | undefined;
     if (options.body === undefined) {
       try {
