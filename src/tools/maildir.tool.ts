@@ -146,8 +146,9 @@ export default function registerMaildirTools(server: McpServer, maildir: Maildir
   // ---------------------------------------------------------------------------
   server.tool(
     'maildir_get_email',
-    `${NOTICE} Read one message by id from maildir_search: headers, text body (size-capped) ` +
-      'and the attachment list (index, filename, type, size).',
+    `${NOTICE} Read one message by id from maildir_search: headers, text body (size-capped), ` +
+      'the attachment list (index, filename, type, size), and optionally the original HTML body ' +
+      '(include_html) for callers that must store or parse raw HTML.',
     {
       id: z
         .string()
@@ -163,13 +164,30 @@ export default function registerMaildirTools(server: McpServer, maildir: Maildir
         .boolean()
         .default(false)
         .describe('Also return the raw header block (max 64 KiB).'),
+      include_html: z
+        .boolean()
+        .default(false)
+        .describe(
+          'Also return the original HTML body part in html (for callers that must store or parse raw HTML, e.g. UPS billing notices).',
+        ),
+      max_html_chars: z
+        .number()
+        .int()
+        .min(100)
+        .max(2_000_000)
+        .optional()
+        .describe(
+          'Cap on returned HTML body characters when include_html is true (default 500,000, max 2,000,000).',
+        ),
     },
     { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    async ({ id, max_body_chars, include_headers }) => {
+    async ({ id, max_body_chars, include_headers, include_html, max_html_chars }) => {
       try {
         const result = await maildir.getEmail(id, {
           maxBodyChars: max_body_chars,
           includeHeaders: include_headers,
+          includeHtml: include_html,
+          maxHtmlChars: max_html_chars,
         });
         return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] };
       } catch (err) {

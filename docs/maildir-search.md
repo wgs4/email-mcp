@@ -264,12 +264,16 @@ The same message delivered to several people appears once per mailbox; group by 
 | `id` | string | From `maildir_search` (root-relative, or absolute under the root). |
 | `max_body_chars` | int | Cap on returned text (capped by config `max_body_chars`, default 20,000). |
 | `include_headers` | bool, false | Also return the raw header block (max 64 KiB). |
+| `include_html` | bool, false | Also return the original HTML body part in `html` (for callers that must store or parse raw HTML, e.g. UPS billing notices). |
+| `max_html_chars` | int, 500,000 | Cap on returned HTML body characters when `include_html` is true (max 2,000,000). |
 
 Returns `id`, `mailbox`, `folder`, `flags`, `saved_at`, `size`, `headers` (from, to, cc, bcc,
 reply_to, subject, date, message_id, in_reply_to), `text`, `text_truncated`, `text_length`,
 `has_html`, `attachments` (`index`, `filename`, `content_type`, `size`, `inline`, `content_id`) and
-`message_truncated`. Reads at most `max_message_bytes` (default 64 MiB) with `head -c`; a larger
-message is parsed partly and says so in `warning`.
+`message_truncated`. When `include_html` is true, also returns `html` (the original HTML part,
+capped), `html_truncated` and `html_length` (the full length, even when truncated); without
+`include_html` those three fields are absent. Reads at most `max_message_bytes` (default 64 MiB) with
+`head -c`; a larger message is parsed partly and says so in `warning`.
 
 ### 5.3 `maildir_save_attachment`
 
