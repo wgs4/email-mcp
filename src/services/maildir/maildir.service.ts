@@ -141,6 +141,8 @@ const VERIFY_BATCH = 150;
 const SECONDARY_BATCH = 400;
 const PAGE_FETCH_TIMEOUT_MS = 90_000;
 const NAME_LINES_PER_FILE = 400;
+const DEFAULT_MAX_HTML_CHARS = 500_000;
+const HARD_MAX_HTML_CHARS = 2_000_000;
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$/;
 const DOMAIN_INPUT_RE = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
@@ -1207,7 +1209,12 @@ export default class MaildirService {
 
   async getEmail(
     id: string,
-    options: { maxBodyChars?: number; includeHeaders?: boolean } = {},
+    options: {
+      maxBodyChars?: number;
+      includeHeaders?: boolean;
+      includeHtml?: boolean;
+      maxHtmlChars?: number;
+    } = {},
   ): Promise<Record<string, unknown>> {
     const file = await this.resolve(id);
     const { raw, truncated } = await this.readMessage(file);
@@ -1261,6 +1268,16 @@ export default class MaildirService {
     if (options.includeHeaders) {
       const lines = parsed.headerLines.map((h) => h.line);
       result.raw_headers = lines.join('\n').slice(0, 64 * 1024);
+    }
+    if (options.includeHtml) {
+      const maxHtmlChars = Math.min(
+        Math.max(options.maxHtmlChars ?? DEFAULT_MAX_HTML_CHARS, 100),
+        HARD_MAX_HTML_CHARS,
+      );
+      const html = typeof parsed.html === 'string' ? parsed.html : null;
+      result.html = html !== null ? html.slice(0, maxHtmlChars) : null;
+      result.html_truncated = html !== null ? html.length > maxHtmlChars : false;
+      result.html_length = html !== null ? html.length : 0;
     }
     await this.safeAudit('maildir_get_email', { who: safeUser(), id: file.rel });
     return result;

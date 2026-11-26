@@ -118,6 +118,44 @@ const GBK_MESSAGE = [
   '',
 ].join('\r\n');
 
+const LONG_HTML = `<html><body>${'x'.repeat(50_000)}</body></html>`;
+
+function htmlMessage(html: string): string {
+  return [
+    'From: UPS <billing@ups.com>',
+    'To: Lisa <lisa@wgsusa.com>',
+    'Subject: Invoice Now Available',
+    'Message-ID: <ups-invoice@example.com>',
+    'Date: Wed, 19 Mar 2025 13:28:28 +0800',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/alternative; boundary="HTMLB"',
+    '',
+    '--HTMLB',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    'Invoice available.',
+    '--HTMLB',
+    'Content-Type: text/html; charset=utf-8',
+    '',
+    html,
+    '--HTMLB--',
+    '',
+  ].join('\r\n');
+}
+
+const HTML_MESSAGE = htmlMessage(LONG_HTML);
+
+const PLAIN_MESSAGE = [
+  'From: UPS <billing@ups.com>',
+  'To: Lisa <lisa@wgsusa.com>',
+  'Subject: Plain notice',
+  'Date: Wed, 19 Mar 2025 13:28:28 +0800',
+  'Content-Type: text/plain; charset=utf-8',
+  '',
+  'No HTML here.',
+  '',
+].join('\r\n');
+
 interface Call {
   tool: RemoteTool;
   args: string[];
@@ -520,6 +558,55 @@ describe('MaildirService.getEmail / saveAttachment', () => {
     await expect(svc.saveAttachment({ id: ID, index: 0, destination: tmpdir() })).rejects.toThrow(
       /larger than max_message_bytes/,
     );
+  });
+
+  it('omits html fields by default but still reports has_html', async () => {
+    const runner = new FakeRunner();
+    runner.message = HTML_MESSAGE;
+    const { svc } = make(runner);
+    const omitted = await svc.getEmail(ID);
+    const explicit = await svc.getEmail(ID, { includeHtml: false });
+    [omitted, explicit].forEach((r) => {
+      expect(r.has_html).toBe(true);
+      expect(r).not.toHaveProperty('html');
+      expect(r).not.toHaveProperty('html_truncated');
+      expect(r).not.toHaveProperty('html_length');
+    });
+  });
+
+  it('returns the exact original HTML even when longer than 20,000 chars', async () => {
+    const runner = new FakeRunner();
+    runner.message = HTML_MESSAGE;
+    const { svc } = make(runner);
+    expect(LONG_HTML.length).toBeGreaterThan(20_000);
+    const r = await svc.getEmail(ID, { includeHtml: true });
+    expect(r.html).toBe(LONG_HTML);
+    expect(r.html_truncated).toBe(false);
+    expect(r.html_length).toBe(LONG_HTML.length);
+    expect(r.has_html).toBe(true);
+  });
+
+  it('caps returned HTML at maxHtmlChars and keeps the full length', async () => {
+    const runner = new FakeRunner();
+    runner.message = HTML_MESSAGE;
+    const { svc } = make(runner);
+    const r = await svc.getEmail(ID, { includeHtml: true, maxHtmlChars: 120 });
+    expect(r.html).toBe(LONG_HTML.slice(0, 120));
+    expect(r.html_truncated).toBe(true);
+    expect(r.html_length).toBe(LONG_HTML.length);
+  });
+
+  it('returns null html for a plain-text-only message', async () => {
+    const runner = new FakeRunner();
+    runner.message = PLAIN_MESSAGE;
+    const { svc } = make(runner);
+    const r = await svc.getEmail(ID, { includeHtml: true });
+    expect(r).toMatchObject({
+      html: null,
+      html_truncated: false,
+      html_length: 0,
+      has_html: false,
+    });
   });
 });
 
