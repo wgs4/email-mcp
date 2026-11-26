@@ -5,7 +5,10 @@
  * Search pipeline:
  *   1. Discover folder dirs (`find -prune`), cached 5 min; filter by the
  *      config allow/deny lists and the caller's domain/user/folder scope.
- *   2. Primary pass, one ssh call per mailbox (bounded concurrency):
+ *   2. Primary pass, one ssh call per mailbox (bounded concurrency). With
+ *      indexed_sweep, a date census or an ASCII word/amount search calls
+ *      maildir-index-sweep first. Text hits are confirmed with grep on those
+ *      files only. Every other query, and any index failure, uses:
  *        find <dirs> -maxdepth 1 -type f [-newermt A] [! -newermt B]
  *             -exec grep ... {} +
  *   3. Sort candidates newest first (file-name delivery time).
@@ -124,6 +127,11 @@ export interface MaildirSearchResult {
     folders: number;
     since: string | null;
     before: string | null;
+    indexed_mailboxes?: number;
+    raw_mailboxes?: number;
+    indexed_candidates?: number;
+    indexed_hits?: number;
+    mailbox_backends?: Record<string, 'index' | 'raw'>;
   };
   criteria: Record<string, unknown>;
   notes: string[];
@@ -145,6 +153,27 @@ const DEFAULT_MAX_HTML_CHARS = 500_000;
 const HARD_MAX_HTML_CHARS = 2_000_000;
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$/;
+const PRINTABLE_ASCII_RE = /^[\x20-\x7e]+$/;
+const XAPIAN_HEADER_FIELDS = new Set<HeaderField>([
+  'from',
+  'to',
+  'cc',
+  'bcc',
+  'subject',
+  'list-id',
+]);
+
+/** Lowercase ASCII runs Xapian actually stored (`partial=3`, `full=20`). */
+function extractXapianTokens(term: string): string[] {
+  if (!PRINTABLE_ASCII_RE.test(term)) return [];
+  const raw = term.toLowerCase().match(/[a-z0-9]{3,}/g) ?? [];
+  const pieces: string[] = [];
+  raw.forEach((run) => {
+    if (run.length > 20) pieces.push(run.slice(0, 20), run.slice(-20));
+    else pieces.push(run);
+  });
+  return [...new Set(pieces)].sort((a, b) => b.length - a.length || a.localeCompare(b)).slice(0, 8);
+}
 const DOMAIN_INPUT_RE = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
 const USER_INPUT_RE = /^[a-z0-9._+-]{1,64}(?:@[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)?$/;
 
@@ -177,6 +206,11 @@ interface Pass {
   term: string;
   fields: HeaderField[];
 }
+
+type PrimaryResult = RemoteRunResult & {
+  backend?: 'index' | 'raw';
+  indexedCandidates?: number;
+};
 
 function validateDate(label: string, value: string | undefined): string | null {
   if (value === undefined || value === '') return null;
@@ -701,6 +735,10 @@ export default class MaildirService {
     // ---- primary pass, per mailbox ----------------------------------------
     const mailboxes = [...byMailbox.keys()].sort();
     const notSearched: string[] = [];
+    const mailboxBackends: Record<string, 'index' | 'raw'> = {};
+    let indexedMailboxes = 0;
+    let rawMailboxes = 0;
+    let indexedCandidates = 0;
     let vanished = 0;
     const { done, skipped } = await pool(
       mailboxes,
@@ -729,6 +767,16 @@ export default class MaildirService {
         notSearched.push(mailbox);
         partialReasons.push(`${mailbox}: not searched: ${error ?? 'unknown error'}`);
         return;
+      }
+      if (!res.timedOut) {
+        const backend = res.backend === 'index' ? 'index' : 'raw';
+        mailboxBackends[mailbox] = backend;
+        if (backend === 'index') {
+          indexedMailboxes += 1;
+          indexedCandidates += res.indexedCandidates ?? 0;
+        } else {
+          rawMailboxes += 1;
+        }
       }
       const abnormal = abnormalExit(res);
       if (abnormal) partialReasons.push(`${mailbox}: ${abnormal}; results may be incomplete.`);
@@ -796,6 +844,7 @@ export default class MaildirService {
         kept.map((c) => c.file),
         p.deadline,
         partialReasons,
+        indexedMailboxes > 0,
       );
       kept = kept.filter((c) => {
         const h = headers.get(c.file.rel);
@@ -834,6 +883,7 @@ export default class MaildirService {
         `${String(counters.unverifiable)} candidate(s) could not be checked (header block unreadable) and were left out.`,
       );
     }
+    const indexedHits = rows.filter((r) => mailboxBackends[r.mailbox] === 'index').length;
 
     return {
       createdAt: Date.now(),
@@ -848,9 +898,156 @@ export default class MaildirService {
         folders: folderCount,
         since: p.since,
         before: p.before,
+        indexed_mailboxes: indexedMailboxes,
+        raw_mailboxes: rawMailboxes,
+        indexed_candidates: indexedCandidates,
+        indexed_hits: indexedHits,
+        mailbox_backends: mailboxBackends,
       },
-      criteria: p.criteria,
+      criteria: {
+        ...p.criteria,
+        indexed_mailboxes: indexedMailboxes,
+        raw_mailboxes: rawMailboxes,
+        indexed_candidates: indexedCandidates,
+        indexed_hits: indexedHits,
+        mailbox_backends: mailboxBackends,
+      },
     };
+  }
+
+  /** Helper argv when this pass can be answered from Dovecot metadata or Xapian. */
+  private indexProbeArgs(
+    dirs: MaildirDir[],
+    pass: Pass,
+    regex: boolean,
+    since: string | null,
+    before: string | null,
+  ): string[] | null {
+    if (!this.config.indexedSweep || this.config.root !== '/var/vmail' || dirs.length === 0) {
+      return null;
+    }
+    const rels = dirs.map((d) => d.rel);
+    if (pass.kind === 'headers' && regex && pass.term === '.*' && since) {
+      return [dirs[0].mailbox, since, before ?? '', ...rels];
+    }
+    const textOk =
+      !regex &&
+      (pass.kind === 'full_text' ||
+        (pass.kind === 'headers' && pass.fields.every((field) => XAPIAN_HEADER_FIELDS.has(field))));
+    if (!textOk || pass.kind === 'attachment') return null;
+    const tokens = extractXapianTokens(pass.term);
+    if (tokens.length === 0) return null;
+    return [
+      '--fts',
+      pass.kind,
+      pass.kind === 'headers' ? pass.fields.join(',') : '',
+      tokens.join(','),
+      dirs[0].mailbox,
+      since ?? '',
+      before ?? '',
+      ...rels,
+    ];
+  }
+
+  private parseSweepPaths(stdout: Buffer, dirs: MaildirDir[]): string[] | null {
+    const records = stdout.toString('utf8').split('\0');
+    if (records.pop() !== '' || records.pop() !== 'maildir-index-v1-complete') return null;
+    const allowed = new Set(dirs.map((d) => d.rel));
+    const inScope = records.every((path) => {
+      const rel = fromAbsolute(this.config.root, path);
+      return !!rel && !!parseFile(rel) && allowed.has(rel.slice(0, rel.lastIndexOf('/')));
+    });
+    return inScope ? records : null;
+  }
+
+  /** Raw-byte grep over index candidates only. Null means the caller must fall back. */
+  private async confirmCandidates(
+    pass: Pass,
+    regex: boolean,
+    candidatePaths: string[],
+    deadline: number,
+  ): Promise<Buffer | null> {
+    const grepBaseArgs = MaildirService.grepArgs(pass, regex);
+    const chunks: Buffer[] = [];
+    for (let i = 0; i < candidatePaths.length; i += SECONDARY_BATCH) {
+      const slice = candidatePaths.slice(i, i + SECONDARY_BATCH);
+      const rem = deadline - Date.now();
+      if (rem < 1000) return null;
+      // eslint-disable-next-line no-await-in-loop
+      const gRes = await this.runner.run('grep', [...grepBaseArgs, ...slice], {
+        timeoutMs: rem,
+        maxBytes: this.config.maxOutputBytes,
+      });
+      if (
+        (gRes.exitCode !== 0 && gRes.exitCode !== 1) ||
+        gRes.stderr ||
+        gRes.timedOut ||
+        gRes.truncated
+      ) {
+        return null;
+      }
+      if (gRes.stdout.length > 0) chunks.push(gRes.stdout);
+    }
+    return Buffer.concat(chunks);
+  }
+
+  /** Try the fixed index reader with a bounded portion of the mailbox budget. */
+  private async indexedSweep(
+    dirs: MaildirDir[],
+    pass: Pass,
+    regex: boolean,
+    since: string | null,
+    before: string | null,
+    deadline: number,
+  ): Promise<PrimaryResult | null> {
+    const helperArgs = this.indexProbeArgs(dirs, pass, regex, since, before);
+    const remaining = deadline - Date.now();
+    if (!helperArgs || remaining < 4000) return null;
+    try {
+      const result = await this.runner.run('maildir-index-sweep', helperArgs, {
+        timeoutMs: Math.min(28000, Math.floor(remaining / 3)),
+        maxBytes: this.config.maxOutputBytes,
+      });
+      const failed = result.exitCode !== 0 || result.stderr || result.timedOut || result.truncated;
+      if (failed) return null;
+      const candidatePaths = this.parseSweepPaths(result.stdout, dirs);
+      if (!candidatePaths) return null;
+      const indexedCandidates = candidatePaths.length;
+      if (regex && pass.term === '.*') {
+        // A tab marks every date-sweep row as a continuation so the existing
+        // header reader checks the selected fields. Metadata is not a hit.
+        return {
+          ...result,
+          stdout: Buffer.from(candidatePaths.map((p) => `${p}\0\tindexed\n`).join('')),
+          backend: 'index',
+          indexedCandidates,
+        };
+      }
+      if (candidatePaths.length === 0) {
+        return {
+          stdout: Buffer.alloc(0),
+          stderr: '',
+          exitCode: 0,
+          timedOut: false,
+          truncated: false,
+          backend: 'index',
+          indexedCandidates: 0,
+        };
+      }
+      const stdout = await this.confirmCandidates(pass, regex, candidatePaths, deadline);
+      if (!stdout) return null;
+      return {
+        stdout,
+        stderr: '',
+        exitCode: 0,
+        timedOut: false,
+        truncated: false,
+        backend: 'index',
+        indexedCandidates,
+      };
+    } catch {
+      return null;
+    }
   }
 
   /** find + grep over one mailbox's dirs. */
@@ -861,7 +1058,9 @@ export default class MaildirService {
     since: string | null,
     before: string | null,
     deadline: number,
-  ): Promise<RemoteRunResult> {
+  ): Promise<PrimaryResult> {
+    const indexed = await this.indexedSweep(dirs, pass, regex, since, before, deadline);
+    if (indexed) return indexed;
     const args: string[] = dirs.map((d) => toAbsolute(this.config.root, d.rel));
     args.push('-maxdepth', '1', '-type', 'f');
     if (since) args.push('-newermt', since);
@@ -994,6 +1193,7 @@ export default class MaildirService {
     files: MaildirFile[],
     deadline: number,
     partialReasons: string[],
+    checkingIndex = false,
   ): Promise<Map<string, HeaderMap>> {
     const out = new Map<string, HeaderMap>();
     if (files.length === 0) return out;
@@ -1028,6 +1228,11 @@ export default class MaildirService {
       list.push(bytesToText(rest));
       lines.set(path, list);
     });
+    if (checkingIndex && [...lines.values()].some((ls) => ls.length >= 1001)) {
+      partialReasons.push(
+        'A message reached the header-line limit during indexed header verification.',
+      );
+    }
     lines.forEach((ls, abs) => {
       const rel = fromAbsolute(this.config.root, abs);
       if (rel) out.set(rel, parseHeaderBlock(ls));

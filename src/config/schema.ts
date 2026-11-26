@@ -223,6 +223,7 @@ const DOMAIN_RE = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
 const MAILBOX_ADDR_RE = /^[a-z0-9._+-]{1,64}@[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
 
 export const MaildirConfigSchema = z.object({
+  indexed_sweep: z.boolean().default(false),
   enabled: z.boolean().default(false),
   ssh_host: z
     .string()

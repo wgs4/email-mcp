@@ -183,6 +183,7 @@ export interface AppConfig {
 
 /** Camel-cased `[maildir]` section. See docs/maildir-search.md. */
 export interface MaildirConfig {
+  indexedSweep?: boolean;
   enabled: boolean;
   sshHost: string;
   root: string;

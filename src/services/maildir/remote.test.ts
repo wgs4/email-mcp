@@ -41,8 +41,8 @@ describe('buildRemoteCommand', () => {
     );
   });
 
-  it('allows only find, grep and head', () => {
-    expect([...REMOTE_TOOLS]).toEqual(['find', 'grep', 'head']);
+  it('allows only the raw readers and the fixed index helper', () => {
+    expect([...REMOTE_TOOLS]).toEqual(['find', 'grep', 'head', 'maildir-index-sweep']);
     expect(() => buildRemoteCommand('vmail', 'rm' as never, [])).toThrow(/not allowed/);
     expect(() => buildRemoteCommand('vmail', 'cat' as never, [])).toThrow(/not allowed/);
   });
