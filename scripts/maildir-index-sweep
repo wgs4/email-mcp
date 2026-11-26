@@ -1,34 +1,158 @@
 #!/usr/bin/python3 -I
-"""Enumerate date-window candidates using local Dovecot. Exit nonzero to request raw fallback."""
+"""Enumerate Maildir candidates from local Dovecot metadata.
+
+Date-window mode lists files in a delivery window. FTS mode (--fts) asks
+Dovecot's Xapian index for word or amount candidates. Either mode exits
+nonzero when coverage is incomplete so the caller can fall back to a raw scan.
+"""
 import datetime as dt
+import math
 import os
 from pathlib import Path
 import re
 import signal
 import stat
+import struct
 import subprocess
 import sys
 
 ROOT = Path("/var/vmail")
 MAX_HITS = 20000
 END = b"maildir-index-v1-complete\0"
+HEADER_FIELDS = {"from", "to", "cc", "bcc", "subject", "list-id"}
+GLASS_MAGIC = b"\x0f\x0dXapian Glass\x04\x6e"
+VALUE_STATS_KEY = b"\x00\xd0\x01"
 
 
 def day(value):
-    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+    if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[ T][0-9]{2}:[0-9]{2}(?::[0-9]{2})?)?", value):
         raise ValueError("date")
-    return dt.datetime.strptime(value, "%Y-%m-%d")
+    norm = value.replace(" ", "T")
+    # Python 3.8-3.10 fromisoformat rejects HH:MM without seconds.
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}", norm):
+        norm += ":00"
+    return dt.datetime.fromisoformat(norm)
+
+
+def sortable_unserialise(value):
+    if value == b"\x80":
+        return 0.0
+    if value == b"\xff" * 9:
+        return float("inf")
+    if not value:
+        return float("-inf")
+
+    def numfromstr(buf, idx):
+        return buf[idx] if idx < len(buf) else 0
+
+    first = numfromstr(value, 0)
+    i = 0
+    first ^= (first & 0xc0) >> 1
+    negative = not (first & 0x80)
+    exponent_negative = bool(first & 0x40)
+    explen = not (first & 0x20)
+    exponent = first & 0x1f
+    if not explen:
+        exponent >>= 2
+        if negative ^ exponent_negative:
+            exponent ^= 0x07
+    else:
+        i += 1
+        first = numfromstr(value, i)
+        exponent = (exponent << 6) | (first >> 2)
+        if negative ^ exponent_negative:
+            exponent ^= 0x07ff
+    word1 = (first & 0x03) << 24
+    i += 1
+    word1 |= numfromstr(value, i) << 16
+    i += 1
+    word1 |= numfromstr(value, i) << 8
+    i += 1
+    word1 |= numfromstr(value, i)
+    word2 = 0
+    if i < len(value):
+        i += 1
+        word2 = numfromstr(value, i) << 24
+        i += 1
+        word2 |= numfromstr(value, i) << 16
+        i += 1
+        word2 |= numfromstr(value, i) << 8
+        i += 1
+        word2 |= numfromstr(value, i)
+    if negative:
+        word1 = (-word1) & 0xffffffff
+        if word2 != 0:
+            word1 = (word1 + 1) & 0xffffffff
+        word2 = (-word2) & 0xffffffff
+        word1 &= 0x03ffffff
+    else:
+        word1 |= 1 << 26
+    mantissa = (word2 / 4294967296.0) if word2 else 0.0
+    mantissa += word1
+    mantissa /= float(1 << (26 if negative else 27))
+    if exponent_negative:
+        exponent = -exponent
+    exponent += 8
+    if negative:
+        mantissa = -mantissa
+    return math.ldexp(mantissa, exponent)
+
+
+def unpack_uint(buf, pos):
+    start = pos
+    if pos >= len(buf):
+        raise ValueError("xapian coverage")
+    while True:
+        if pos >= len(buf) or pos - start > 10:
+            raise ValueError("xapian coverage")
+        if buf[pos] < 128:
+            break
+        pos += 1
+    end = pos + 1
+    pos = end - 1
+    result = buf[pos]
+    while pos != start:
+        pos -= 1
+        result = (result << 7) | (buf[pos] & 0x7f)
+    return result, end
+
+
+def unpack_string(buf, pos):
+    length, pos = unpack_uint(buf, pos)
+    end = pos + length
+    if end > len(buf):
+        raise ValueError("xapian coverage")
+    return buf[pos:end], end
+
+
+def _spawn(args):
+    return subprocess.Popen(
+        args,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+    )
+
+
+def _finish(proc):
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait()
+    if proc.stdout is not None:
+        proc.stdout.close()
 
 
 def indexed_names(mailbox, guid, since, before):
-    # Local metadata lookup. Dates deliberately overselect. Maildir mtime below
-    # applies the legacy find -newermt boundaries at nanosecond resolution.
+    # Dates deliberately overselect. Maildir mtime applies the legacy
+    # find -newermt bounds. `uid *` is the highest UID, so one call also
+    # proves the index still knows the newest message.
     args = ["/usr/bin/doveadm", "-f", "tab", "fetch", "-u", mailbox, "storageid",
-            "mailbox-guid", guid, "since", (since - dt.timedelta(days=1)).date().isoformat()]
+            "mailbox-guid", guid, "(", "since", (since - dt.timedelta(days=1)).date().isoformat()]
     if before:
         args += ["before", (before + dt.timedelta(days=2)).date().isoformat()]
-    proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"})
+    args += [")", "OR", "uid", "*"]
+    proc = _spawn(args)
     try:
         if proc.stdout.readline(256).rstrip(b"\n") != b"storageid":
             raise ValueError("formatter")
@@ -47,10 +171,48 @@ def indexed_names(mailbox, guid, since, before):
             raise ValueError("index error")
         return ids
     finally:
-        if proc.poll() is None:
-            proc.kill()
-        proc.wait()
-        proc.stdout.close()
+        _finish(proc)
+
+
+def indexed_fts_uids(mailbox, guid, since, before, scope, fields, tokens):
+    args = ["/usr/bin/doveadm", "-o", "plugin/fts_enforced=yes", "search", "-u", mailbox,
+            "mailbox-guid", guid]
+    if since:
+        args += ["since", (since - dt.timedelta(days=1)).date().isoformat()]
+    if before:
+        args += ["before", (before + dt.timedelta(days=2)).date().isoformat()]
+    for tok in tokens:
+        if scope == "full_text":
+            args += ["text", tok]
+        elif len(fields) == 1:
+            args += ["header", fields[0], tok]
+        else:
+            clause = ["("]
+            for idx, field in enumerate(fields):
+                if idx:
+                    clause.append("OR")
+                clause += ["header", field, tok]
+            clause.append(")")
+            args += clause
+    proc = _spawn(args)
+    try:
+        uids = set()
+        while True:
+            line = proc.stdout.readline(1024)
+            if not line:
+                break
+            if not line.endswith(b"\n") or len(uids) >= MAX_HITS:
+                raise ValueError("fts search error")
+            parts = line[:-1].decode("utf-8").split(" ")
+            if (len(parts) != 2 or parts[0].lower() != guid.lower()
+                    or not re.fullmatch(r"[0-9]+", parts[1])):
+                raise ValueError("fts search error")
+            uids.add(int(parts[1]))
+        if proc.wait() != 0:
+            raise ValueError("fts search error")
+        return uids
+    finally:
+        _finish(proc)
 
 
 def empty_directory(path):
@@ -59,17 +221,241 @@ def empty_directory(path):
 
 
 def version(path):
-    s = path.stat()
-    return s.st_dev, s.st_ino, s.st_mtime_ns, s.st_ctime_ns
+    info = path.stat()
+    return info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns
 
 
-def collect(root, mailbox, first, last, directories, lookup=indexed_names):
+def parse_uidlist(uidlist_path):
+    uid_to_base = {}
+    base_to_uid = {}
+    max_uid = 0
+    prev_uid = 0
+    with uidlist_path.open("rb") as handle:
+        try:
+            header = handle.readline(1024).decode("ascii").split()
+        except UnicodeDecodeError as exc:
+            raise ValueError("uid list format") from exc
+        guid = None
+        next_uid = None
+        if not header or header[0] != "3":
+            raise ValueError("uid list format")
+        for token in header:
+            if re.fullmatch(r"G[0-9a-fA-F]{32}", token):
+                guid = token[1:]
+            elif re.fullmatch(r"N[0-9]+", token):
+                next_uid = int(token[1:])
+        if not guid or next_uid is None:
+            raise ValueError("uid list format")
+        for line in handle:
+            if not line.strip():
+                continue
+            space = line.find(b" ")
+            colon = line.find(b":", space + 1) if space > 0 else -1
+            if not (space > 0 and colon > space):
+                raise ValueError("uid list format")
+            try:
+                uid = int(line[:space].decode("ascii"))
+                raw_name = line[colon + 1:].rstrip(b"\r\n").decode("utf-8")
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise ValueError("uid list format") from exc
+            if uid <= prev_uid or uid <= 0:
+                raise ValueError("uid list format")
+            if "/" in raw_name or any(ord(ch) < 32 for ch in raw_name) or not raw_name:
+                raise ValueError("uid list format")
+            base = raw_name.split(":2,", 1)[0]
+            if not base or "/" in base:
+                raise ValueError("uid list format")
+            prev_uid = uid
+            max_uid = uid
+            uid_to_base[uid] = base
+            base_to_uid[base] = uid
+    return guid, next_uid, max_uid, uid_to_base, base_to_uid
+
+
+def _same_path(path):
+    try:
+        return path.resolve(strict=True) == path
+    except OSError as exc:
+        raise ValueError("xapian coverage") from exc
+
+
+def read_xapian_stats(xapian_db_dir):
+    if not xapian_db_dir.is_dir() or not _same_path(xapian_db_dir):
+        raise ValueError("xapian coverage")
+    components = {}
+    for name in ("iamglass", "postlist.glass", "termlist.glass"):
+        path = xapian_db_dir / name
+        try:
+            readable = path.resolve(strict=True) == path and path.is_file() and os.access(path, os.R_OK)
+        except OSError as exc:
+            raise ValueError("xapian coverage") from exc
+        if not readable:
+            raise ValueError("xapian coverage")
+        components[name] = path
+    with os.scandir(xapian_db_dir) as entries:
+        for entry in entries:
+            if entry.is_file(follow_symlinks=False) and not os.access(entry.path, os.R_OK):
+                raise ValueError("xapian coverage")
+    iam = components["iamglass"].read_bytes()
+    if not iam.startswith(GLASS_MAGIC) or len(iam) < 33:
+        raise ValueError("xapian coverage")
+    pos = 32
+    _rev, pos = unpack_uint(iam, pos)
+    post_root = post_level = post_bs = 0
+    post_fake = True
+    for table_no in range(6):
+        root, pos = unpack_uint(iam, pos)
+        val, pos = unpack_uint(iam, pos)
+        _num_entries, pos = unpack_uint(iam, pos)
+        bs_raw, pos = unpack_uint(iam, pos)
+        _compress_min, pos = unpack_uint(iam, pos)
+        _fl, pos = unpack_string(iam, pos)
+        if table_no == 0:
+            post_root = root
+            post_level = val >> 2
+            post_fake = bool(val & 1)
+            post_bs = bs_raw << 11
+    doccount, _pos = unpack_uint(iam, pos)
+    if doccount == 0 or post_fake or post_bs < 2048 or post_level > 10:
+        return (0, 0, 0)
+    fd = os.open(components["postlist.glass"], os.O_RDONLY)
+    try:
+        blk_no = post_root
+        level = post_level
+        while level > 0:
+            blk = os.pread(fd, post_bs, blk_no * post_bs)
+            if len(blk) != post_bs or blk[4] != level:
+                raise ValueError("xapian coverage")
+            dir_end = struct.unpack(">H", blk[9:11])[0]
+            if not 13 <= dir_end <= post_bs or (dir_end - 11) % 2 != 0:
+                raise ValueError("xapian coverage")
+            blk_no = _branch_child(blk, dir_end)
+            level -= 1
+        leaf = os.pread(fd, post_bs, blk_no * post_bs)
+    finally:
+        os.close(fd)
+    if len(leaf) != post_bs or leaf[4] != 0:
+        raise ValueError("xapian coverage")
+    dir_end = struct.unpack(">H", leaf[9:11])[0]
+    if not 13 <= dir_end <= post_bs:
+        raise ValueError("xapian coverage")
+    for dir_pos in range(11, dir_end, 2):
+        off = struct.unpack(">H", leaf[dir_pos:dir_pos + 2])[0]
+        if off + 3 > len(leaf):
+            raise ValueError("xapian coverage")
+        i_val = struct.unpack(">H", leaf[off:off + 2])[0]
+        item_len = i_val & 0x1fff
+        key_len = leaf[off + 2]
+        if off + 3 + item_len > len(leaf) or key_len > item_len:
+            raise ValueError("xapian coverage")
+        key = leaf[off + 3:off + 3 + key_len]
+        if key != VALUE_STATS_KEY:
+            continue
+        if i_val & 0x8000:
+            raise ValueError("xapian coverage")
+        comp_off = 0 if (i_val & 0x4000) else 2
+        tag_at = off + 3 + key_len + comp_off
+        tag_end = off + 3 + item_len
+        if tag_at > tag_end:
+            raise ValueError("xapian coverage")
+        tag = leaf[tag_at:tag_end]
+        freq, tag_pos = unpack_uint(tag, 0)
+        lower, tag_pos = unpack_string(tag, tag_pos)
+        upper = tag[tag_pos:] or lower
+        raw = sortable_unserialise(upper)
+        if not math.isfinite(raw):
+            raise ValueError("xapian coverage")
+        return (doccount, freq, int(round(raw)))
+    raise ValueError("xapian valuestats missing")
+
+
+def _branch_child(blk, dir_end):
+    first_off = struct.unpack(">H", blk[11:13])[0]
+    if not 13 <= first_off <= len(blk) - 7:
+        raise ValueError("xapian coverage")
+    # Real Glass BItem: 4-byte child block number, then 1-byte key length, key, 2-byte component_of.
+    # The leftmost separator is an empty key with component_of 0.
+    if blk[first_off + 4] == 0 and blk[first_off + 5] == 0 and blk[first_off + 6] == 0:
+        chosen = struct.unpack(">I", blk[first_off:first_off + 4])[0]
+        for dir_pos in range(13, dir_end, 2):
+            off = struct.unpack(">H", blk[dir_pos:dir_pos + 2])[0]
+            if off + 5 > len(blk):
+                raise ValueError("xapian coverage")
+            key_len = blk[off + 4]
+            if off + 7 + key_len > len(blk):
+                raise ValueError("xapian coverage")
+            sep_key = blk[off + 5:off + 5 + key_len]
+            if sep_key <= VALUE_STATS_KEY:
+                chosen = struct.unpack(">I", blk[off:off + 4])[0]
+            else:
+                break
+        return chosen
+    # A hand-built block may store the empty key length at +2 and the
+    # child block number immediately after it.
+    if blk[first_off + 2] == 0 and first_off + 7 <= len(blk):
+        return struct.unpack(">I", blk[first_off + 3:first_off + 7])[0]
+    raise ValueError("xapian coverage")
+
+
+def _remember_version(path, versions):
+    try:
+        if path.resolve(strict=True) != path:
+            raise ValueError("xapian coverage")
+        versions[path] = version(path)
+    except OSError as exc:
+        raise ValueError("xapian coverage") from exc
+
+
+def _parse_fts(fts):
+    if not isinstance(fts, (tuple, list)) or len(fts) != 3:
+        raise ValueError("fts")
+    scope, fields, tokens = fts
+    fields = tuple(fields)
+    tokens = tuple(tokens)
+    if scope not in ("headers", "full_text"):
+        raise ValueError("fts")
+    if scope == "headers":
+        if not fields or any(field not in HEADER_FIELDS for field in fields):
+            raise ValueError("fts")
+    elif fields:
+        raise ValueError("fts")
+    if not 1 <= len(tokens) <= 8 or any(not re.fullmatch(r"[a-z0-9]{3,20}", tok) for tok in tokens):
+        raise ValueError("fts")
+    return scope, fields, tokens
+
+
+def _ns_bounds(since, before):
+    lo = int(since.timestamp()) * 10**9 if since else None
+    hi = int(before.timestamp()) * 10**9 if before else None
+    return lo, hi
+
+
+def _in_window(info, lo, hi):
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    if lo is not None and info.st_mtime_ns <= lo:
+        return False
+    if hi is not None and info.st_mtime_ns > hi:
+        return False
+    return True
+
+
+def _append_hit(hits, path):
+    if len(hits) >= MAX_HITS:
+        raise ValueError("result cap or unsupported filename")
+    hits.append(str(path).encode("utf-8"))
+
+
+def collect(root, mailbox, first, last, directories, lookup=indexed_names,
+            fts=None, fts_lookup=None, xapian_stats=read_xapian_stats):
     if not re.fullmatch(r"[a-z0-9._+\-]{1,64}@[a-z0-9][a-z0-9.\-]{0,251}", mailbox):
         raise ValueError("mailbox")
-    since = day(first)
+    fts_query = _parse_fts(fts) if fts is not None else None
+    since = day(first) if first else None
     before = day(last) if last else None
-    lo = int(since.timestamp()) * 10**9
-    hi = int(before.timestamp()) * 10**9 if before else None
+    if fts_query is None and since is None:
+        raise ValueError("date")
+    lo, hi = _ns_bounds(since, before)
     if not 1 <= len(directories) <= 512:
         raise ValueError("folder count")
     groups = {}
@@ -87,43 +473,100 @@ def collect(root, mailbox, first, last, directories, lookup=indexed_names):
     hits = []
     versions = {}
     for folder, dirs in groups.items():
-        for directory in dirs:
+        requested = set(dirs)
+        scan_dirs = []
+        seen = set()
+        for directory in list(dirs) + [folder / "cur", folder / "new"]:
+            if directory in seen:
+                continue
+            if directory not in requested and not (directory.exists() and directory.is_dir()):
+                continue
+            if directory.resolve(strict=True) != directory:
+                raise ValueError("folder alias")
+            seen.add(directory)
+            scan_dirs.append(directory)
             versions[directory] = version(directory)
-        # Dovecot may never have allocated a UID list for an unused folder.
-        # Only skip physically empty directories whose generations stay stable.
-        if all(empty_directory(directory) for directory in dirs):
+        in_scope = {}
+        all_bases = set()
+        for directory in scan_dirs:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    if any(ord(ch) < 32 for ch in entry.name):
+                        raise ValueError("result cap or unsupported filename")
+                    base = entry.name.split(":2,", 1)[0]
+                    all_bases.add(base)
+                    if directory in requested:
+                        in_scope.setdefault(base, []).append(directory / entry.name)
+        if not in_scope and all(empty_directory(directory) for directory in dirs):
             continue
         uidlist = folder / "dovecot-uidlist"
         if uidlist.resolve(strict=True) != uidlist or not uidlist.is_file():
             raise ValueError("uid list")
         versions[uidlist] = version(uidlist)
-        with uidlist.open("rb") as handle:
-            header = handle.readline(1024).decode("ascii").split()
-        guid = next((t[1:] for t in header if re.fullmatch(r"G[0-9a-fA-F]{32}", t)), None)
-        if header[:1] != ["3"] or not guid:
-            raise ValueError("uid list format")
-        names = lookup(mailbox, guid, since, before)
-        # A stale index can return a successful empty result. Validate every
-        # in-window directory entry, including recent deliveries and flag renames.
-        for directory in dirs:
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    info = entry.stat(follow_symlinks=False)
-                    if not stat.S_ISREG(info.st_mode):
+        guid, _next_uid, max_uid, uid_to_base, base_to_uid = parse_uidlist(uidlist)
+        uidlist_complete = bool(uid_to_base) and all(base in base_to_uid for base in all_bases)
+        if fts_query is None:
+            names = lookup(mailbox, guid, since, before)
+            if uidlist_complete:
+                if uid_to_base[max_uid] not in names:
+                    raise ValueError("index coverage")
+                for base in names:
+                    for path in in_scope.get(base, ()):
+                        if _in_window(path.stat(), lo, hi):
+                            _append_hit(hits, path)
+            else:
+                if len(all_bases) > 256:
+                    raise ValueError("index coverage")
+                for paths in in_scope.values():
+                    for path in paths:
+                        info = path.stat()
+                        if not _in_window(info, lo, hi):
+                            continue
+                        if path.name.split(":2,", 1)[0] not in names:
+                            raise ValueError("index coverage")
+                        _append_hit(hits, path)
+            continue
+        if not uidlist_complete:
+            raise ValueError("index coverage")
+        scope, fields, tokens = fts_query
+        maildir_root = folder.parent if folder.name.startswith(".") else folder
+        xapian_db = maildir_root / "xapian-indexes" / ("db_" + guid.lower())
+        _remember_version(xapian_db, versions)
+        _remember_version(xapian_db / "iamglass", versions)
+        _remember_version(xapian_db / "postlist.glass", versions)
+        doccount, freq, last_indexed_uid = xapian_stats(xapian_db)
+        if not (doccount > 0 and freq >= len(all_bases) and last_indexed_uid >= max_uid):
+            raise ValueError("xapian coverage")
+        finder = fts_lookup or indexed_fts_uids
+        uids = finder(mailbox, guid, since, before, scope, fields, tokens)
+        for uid in uids:
+            if uid not in uid_to_base:
+                raise ValueError("index coverage")
+            base = uid_to_base[uid]
+            if base not in all_bases:
+                raise ValueError("index coverage")
+            for path in in_scope.get(base, ()):
+                if lo is not None or hi is not None:
+                    if not _in_window(path.stat(), lo, hi):
                         continue
-                    if info.st_mtime_ns <= lo or (hi is not None and info.st_mtime_ns > hi):
-                        continue
-                    if entry.name.split(":2,", 1)[0] not in names:
-                        raise ValueError("index coverage")
-                    if len(hits) >= MAX_HITS or any(ord(c) < 32 for c in entry.name):
-                        raise ValueError("result cap or unsupported filename")
-                    hits.append(str(directory / entry.name).encode("utf-8"))
-    if any(version(p) != initial for p, initial in versions.items()):
+                _append_hit(hits, path)
+    if any(version(path) != initial for path, initial in versions.items()):
         raise ValueError("mailbox changed")
     return hits
 
 
-def expire(*_):
+def _cli_fts(argv):
+    if len(argv) < 8:
+        raise ValueError("arguments")
+    scope, fields_csv, tokens_csv = argv[2], argv[3], argv[4]
+    fields = tuple(part for part in fields_csv.split(",") if part) if fields_csv else ()
+    tokens = tuple(part for part in tokens_csv.split(",") if part) if tokens_csv else ()
+    return argv[5], argv[6], argv[7], argv[8:], (scope, fields, tokens)
+
+
+def expire(*_args):
     raise TimeoutError("probe deadline")
 
 
@@ -131,7 +574,11 @@ if __name__ == "__main__":
     signal.signal(signal.SIGALRM, expire)
     signal.alarm(25)
     try:
-        results = collect(ROOT, *sys.argv[1:4], sys.argv[4:])
+        if len(sys.argv) > 1 and sys.argv[1] == "--fts":
+            mailbox, first, last, rels, fts = _cli_fts(sys.argv)
+            results = collect(ROOT, mailbox, first, last, rels, fts=fts)
+        else:
+            results = collect(ROOT, *sys.argv[1:4], sys.argv[4:])
         for hit in results:
             sys.stdout.buffer.write(hit + b"\0")
         sys.stdout.buffer.write(END)

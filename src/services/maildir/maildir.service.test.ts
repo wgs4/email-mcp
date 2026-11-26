@@ -203,8 +203,13 @@ class FakeRunner implements RemoteRunner {
       return res(nulLines(NAME_LINES, args));
     }
     if (tool === 'grep' && args.includes('-l')) {
-      // secondary attachment filter: only JUSTIN_HIT has the drawing
+      // secondary attachment filter, or full-text confirmation of index candidates
       return res(args.includes(JUSTIN_HIT) ? `${JUSTIN_HIT}\u0000` : '');
+    }
+    if (tool === 'grep' && args.includes('-o')) {
+      // Header confirmation. A Received-only continuation is not a real hit.
+      const paths = args.filter((a) => HEADERS[a] && a !== JUSTIN_FALSE);
+      return res(paths.map((p) => `${p}\u0000Subject: confirmed\n`).join(''));
     }
     if (tool === 'head') return res(Buffer.from(this.message, 'utf-8'));
     throw new Error(`unexpected call ${tool} ${args.join(' ')}`);
@@ -651,9 +656,143 @@ describe('indexed direct date sweep', () => {
     expect(run.mock.calls.some(([, args]) => args.includes('-exec'))).toBe(true);
   });
 
-  it('keeps byte substring searches on the raw route', async () => {
-    const { svc, run } = setup(res(''));
-    await svc.search({ ...broad, regex: false, query: 'invoice' });
-    expect(run.mock.calls.some(([tool]) => tool === 'maildir-index-sweep')).toBe(false);
+  it.each([
+    ['headers', 'invoice', 'invoice'],
+    ['full_text', 'invoice', 'invoice'],
+    ['headers', '590550', '590550'],
+    ['full_text', '590550', '590550'],
+    ['headers', '$590,550.00', '550,590'],
+    ['full_text', '$590,550.00', '550,590'],
+  ] as const)('confirms %s search %s on index candidates only', async (mode, query, tokens) => {
+    const { svc, run } = setup(
+      res([JUSTIN_HIT, JUSTIN_FALSE, 'maildir-index-v1-complete', ''].join('\0')),
+    );
+    const result = await svc.search({ ...broad, regex: false, mode, query });
+    const sweeps = run.mock.calls.filter(([tool]) => tool === 'maildir-index-sweep');
+    expect(sweeps).toHaveLength(1);
+    expect(sweeps[0][1].slice(0, 5)).toEqual([
+      '--fts',
+      mode,
+      mode === 'headers' ? 'from,to,cc,subject' : '',
+      tokens,
+      'justin@wgsusa.com',
+    ]);
+    const confirming = run.mock.calls.filter(
+      ([tool, args]) =>
+        tool === 'grep' &&
+        args.includes(JUSTIN_HIT) &&
+        !args.includes('-B') &&
+        !(args.includes('-m') && args.includes('400')),
+    );
+    expect(confirming.length).toBeGreaterThan(0);
+    expect(confirming.every(([, args]) => !args.includes('-exec'))).toBe(true);
+    expect(run.mock.calls.some(([, args]) => args.includes('-exec'))).toBe(false);
+    expect(result.results.map((row) => row.id)).toEqual([JUSTIN_HIT.slice(ROOT.length + 1)]);
+    expect(result.criteria).toMatchObject({
+      indexed_mailboxes: 1,
+      raw_mailboxes: 0,
+      indexed_candidates: 2,
+      indexed_hits: 1,
+      mailbox_backends: { 'justin@wgsusa.com': 'index' },
+    });
+    expect(result.scope.mailbox_backends).toEqual({ 'justin@wgsusa.com': 'index' });
+    expect(result.scope.indexed_hits).toBe(1);
+  });
+
+  it('falls back to the raw scan when the index helper fails', async () => {
+    const { svc, run } = setup(res('', { exitCode: 75 }));
+    const result = await svc.search({ ...broad, regex: false, query: 'invoice' });
+    expect(run.mock.calls.some(([tool]) => tool === 'maildir-index-sweep')).toBe(true);
+    expect(run.mock.calls.some(([, args]) => args.includes('-exec'))).toBe(true);
+    expect(result.total_hits).toBeGreaterThan(0);
+    expect(result.criteria).toMatchObject({
+      indexed_mailboxes: 0,
+      raw_mailboxes: 1,
+      mailbox_backends: { 'justin@wgsusa.com': 'raw' },
+    });
+  });
+
+  it('keeps non-indexable terms on the raw route', async () => {
+    const cases: {
+      query: string;
+      regex: boolean;
+      fields?: 'delivered-to'[];
+    }[] = [
+      { query: '外形图', regex: false },
+      { query: 'ab', regex: false },
+      { query: 'invoice', regex: false, fields: ['delivered-to'] },
+      { query: 'PO2087[0-9]{2}', regex: true },
+    ];
+    for (const extra of cases) {
+      const { svc, run } = setup(res(''));
+      // eslint-disable-next-line no-await-in-loop
+      await svc.search({ ...broad, ...extra });
+      expect(run.mock.calls.some(([tool]) => tool === 'maildir-index-sweep')).toBe(false);
+      expect(run.mock.calls.some(([, args]) => args.includes('-exec'))).toBe(true);
+    }
+  });
+
+  it('records index and raw backends for different mailboxes', async () => {
+    const runner = new FakeRunner();
+    const raw = runner.run.bind(runner);
+    vi.spyOn(runner, 'run').mockImplementation(async (tool, args, opts) => {
+      if (tool === 'maildir-index-sweep') {
+        if (args[4] === 'lisa@wgsusa.com') return res('', { exitCode: 75 });
+        return res([JUSTIN_HIT, 'maildir-index-v1-complete', ''].join('\0'));
+      }
+      return raw(tool, args, opts);
+    });
+    const svc = new MaildirService(
+      { ...config, indexedSweep: true },
+      runner,
+      vi.fn(async () => {}),
+    );
+    const result = await svc.search({
+      query: 'invoice',
+      regex: false,
+      since: '2025-03-01',
+      users: ['justin', 'lisa'],
+      limit: 10,
+    });
+    expect(result.scope.mailbox_backends).toEqual({
+      'justin@wgsusa.com': 'index',
+      'lisa@wgsusa.com': 'raw',
+    });
+    expect(result.criteria.indexed_mailboxes).toBe(1);
+    expect(result.criteria.raw_mailboxes).toBe(1);
+    expect(result.scope.indexed_mailboxes).toBe(1);
+    expect(result.scope.raw_mailboxes).toBe(1);
+    expect(result.results.some((row) => row.mailbox === 'justin@wgsusa.com')).toBe(true);
+    expect(result.results.some((row) => row.mailbox === 'lisa@wgsusa.com')).toBe(true);
+  });
+
+  it('falls back when a candidate file vanishes during confirmation', async () => {
+    const runner = new FakeRunner();
+    const raw = runner.run.bind(runner);
+    vi.spyOn(runner, 'run').mockImplementation(async (tool, args, opts) => {
+      if (tool === 'maildir-index-sweep') {
+        return res([JUSTIN_HIT, 'maildir-index-v1-complete', ''].join('\0'));
+      }
+      if (
+        tool === 'grep' &&
+        args.includes('-o') &&
+        args.includes(JUSTIN_HIT) &&
+        !args.includes('-B')
+      ) {
+        return res('', { exitCode: 2, stderr: 'grep: file: No such file or directory\n' });
+      }
+      return raw(tool, args, opts);
+    });
+    const svc = new MaildirService(
+      { ...config, indexedSweep: true },
+      runner,
+      vi.fn(async () => {}),
+    );
+    const result = await svc.search({ ...broad, regex: false, query: 'invoice' });
+    expect(result.complete).toBe(true);
+    expect(result.total_hits).toBeGreaterThan(0);
+    expect(result.scope.mailbox_backends).toEqual({ 'justin@wgsusa.com': 'raw' });
+    expect(result.criteria.indexed_mailboxes).toBe(0);
+    expect(result.criteria.raw_mailboxes).toBe(1);
   });
 });
