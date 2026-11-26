@@ -872,7 +872,8 @@ export default class MaildirService {
           maxBytes: this.config.maxOutputBytes,
         },
       );
-      if (result.exitCode !== 0 || result.stderr || result.timedOut || result.truncated) return null;
+      const failed = result.exitCode !== 0 || result.stderr || result.timedOut || result.truncated;
+      if (failed) return null;
       const records = result.stdout.toString('utf8').split('\0');
       if (records.pop() !== '' || records.pop() !== 'maildir-index-v1-complete') return null;
       const allowed = new Set(dirs.map((d) => d.rel));
