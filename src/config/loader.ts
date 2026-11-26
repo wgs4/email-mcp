@@ -282,6 +282,7 @@ function normalizeMaildirConfig(raw: RawAppConfig['maildir']): MaildirConfig | u
     sshHost: raw.ssh_host,
     root,
     sudoUser: raw.sudo_user,
+    indexedSweep: raw.indexed_sweep,
     allowedDomains: raw.allowed_domains,
     excludedDomains: raw.excluded_domains,
     allowedUsers: raw.allowed_users,

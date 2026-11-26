@@ -699,6 +699,7 @@ export default class MaildirService {
     // ---- primary pass, per mailbox ----------------------------------------
     const mailboxes = [...byMailbox.keys()].sort();
     const notSearched: string[] = [];
+    let indexedMailboxes = 0;
     let vanished = 0;
     const { done, skipped } = await pool(
       mailboxes,
@@ -728,6 +729,7 @@ export default class MaildirService {
         partialReasons.push(`${mailbox}: not searched: ${error ?? 'unknown error'}`);
         return;
       }
+      if (res.backend === 'index') indexedMailboxes += 1;
       const abnormal = abnormalExit(res);
       if (abnormal) partialReasons.push(`${mailbox}: ${abnormal}; results may be incomplete.`);
       if (res.timedOut) {
@@ -794,6 +796,7 @@ export default class MaildirService {
         kept.map((c) => c.file),
         p.deadline,
         partialReasons,
+        indexedMailboxes > 0,
       );
       kept = kept.filter((c) => {
         const h = headers.get(c.file.rel);
@@ -847,8 +850,43 @@ export default class MaildirService {
         since: p.since,
         before: p.before,
       },
-      criteria: p.criteria,
+      criteria: { ...p.criteria, indexed_mailboxes: indexedMailboxes },
     };
+  }
+
+  /** Try the fixed index reader with a bounded portion of the mailbox budget. */
+  private async indexedSweep(
+    dirs: MaildirDir[],
+    since: string,
+    before: string | null,
+    deadline: number,
+  ) {
+    const remaining = deadline - Date.now();
+    if (remaining < 4000 || this.config.root !== '/var/vmail') return null;
+    try {
+      const result = await this.runner.run(
+        'maildir-index-sweep',
+        [dirs[0].mailbox, since, before ?? '', ...dirs.map((d) => d.rel)],
+        {
+          timeoutMs: Math.min(28000, Math.floor(remaining / 3)),
+          maxBytes: this.config.maxOutputBytes,
+        },
+      );
+      if (result.exitCode !== 0 || result.stderr || result.timedOut || result.truncated) return null;
+      const records = result.stdout.toString('utf8').split('\0');
+      if (records.pop() !== '' || records.pop() !== 'maildir-index-v1-complete') return null;
+      const allowed = new Set(dirs.map((d) => d.rel));
+      const inScope = records.every((path) => {
+        const rel = fromAbsolute(this.config.root, path);
+        return !!rel && !!parseFile(rel) && allowed.has(rel.slice(0, rel.lastIndexOf('/')));
+      });
+      if (!inScope) return null;
+      // A folded candidate requires positive verification against the selected
+      // headers by the existing header reader. Metadata alone cannot establish a hit.
+      return { ...result, stdout: Buffer.from(records.map((p) => `${p}\0\tindexed\n`).join('')) };
+    } catch {
+      return null;
+    }
   }
 
   /** find + grep over one mailbox's dirs. */
@@ -859,7 +897,18 @@ export default class MaildirService {
     since: string | null,
     before: string | null,
     deadline: number,
-  ): Promise<RemoteRunResult> {
+  ): Promise<RemoteRunResult & { backend?: 'index' }> {
+    if (
+      this.config.indexedSweep &&
+      pass.kind === 'headers' &&
+      regex &&
+      pass.term === '.*' &&
+      since?.length === 10 &&
+      (!before || before.length === 10)
+    ) {
+      const indexed = await this.indexedSweep(dirs, since, before, deadline);
+      if (indexed) return { ...indexed, backend: 'index' };
+    }
     const args: string[] = dirs.map((d) => toAbsolute(this.config.root, d.rel));
     args.push('-maxdepth', '1', '-type', 'f');
     if (since) args.push('-newermt', since);
@@ -992,6 +1041,7 @@ export default class MaildirService {
     files: MaildirFile[],
     deadline: number,
     partialReasons: string[],
+    checkingIndex = false,
   ): Promise<Map<string, HeaderMap>> {
     const out = new Map<string, HeaderMap>();
     if (files.length === 0) return out;
@@ -1026,6 +1076,11 @@ export default class MaildirService {
       list.push(bytesToText(rest));
       lines.set(path, list);
     });
+    if (checkingIndex && [...lines.values()].some((ls) => ls.length >= 1001)) {
+      partialReasons.push(
+        'A message reached the header-line limit during indexed header verification.',
+      );
+    }
     lines.forEach((ls, abs) => {
       const rel = fromAbsolute(this.config.root, abs);
       if (rel) out.set(rel, parseHeaderBlock(ls));

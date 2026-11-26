@@ -2,10 +2,11 @@
  * Read-only remote command runner for the raw Maildir store.
  *
  * Safety model (see docs/maildir-search.md):
- * - The ONLY remote command shape is
+ * - The default remote command shape is
  *     LC_ALL=C sudo -n -u <sudo_user> /usr/bin/<tool> <args...>
  *   where <tool> is one of REMOTE_TOOLS (find, grep, head) — a strict subset of
- *   the server's sudoers rule. No pipes, redirects, `;`, `&&` or subshells.
+ *   the server's sudoers rule. The optional indexed sweep calls only
+ *   /usr/local/libexec/maildir-index-sweep under the same sudo identity. No pipes, redirects, `;`, `&&` or subshells.
  * - The remote side runs a shell (sshd hands the command string to the login
  *   shell), so EVERY argument is single-quoted with `'\''` escaping. Arguments
  *   holding NUL, CR or LF are refused before anything is sent.
@@ -23,8 +24,8 @@ import { MaildirRemoteError } from './errors.js';
 
 export { MaildirRemoteError } from './errors.js';
 
-/** Remote binaries this code is allowed to run (all under /usr/bin). */
-export const REMOTE_TOOLS = ['find', 'grep', 'head'] as const;
+/** Fixed remote commands, resolved to absolute binaries below. */
+export const REMOTE_TOOLS = ['find', 'grep', 'head', 'maildir-index-sweep'] as const;
 export type RemoteTool = (typeof REMOTE_TOOLS)[number];
 
 export interface RemoteRunOptions {
@@ -92,7 +93,9 @@ export function buildRemoteCommand(sudoUser: string, tool: RemoteTool, args: str
     throw new MaildirRemoteError('Invalid sudo user.', 'unsafe_argument');
   }
   const quoted = args.map(shQuote).join(' ');
-  return `LC_ALL=C sudo -n -u ${shQuote(sudoUser)} ${shQuote(`/usr/bin/${tool}`)}${quoted ? ` ${quoted}` : ''}`;
+  const binary =
+    tool === 'maildir-index-sweep' ? '/usr/local/libexec/maildir-index-sweep' : `/usr/bin/${tool}`;
+  return `LC_ALL=C sudo -n -u ${shQuote(sudoUser)} ${shQuote(binary)}${quoted ? ` ${quoted}` : ''}`;
 }
 
 /** ssh argv (without the `ssh` binary itself). Pure — exported for tests. */

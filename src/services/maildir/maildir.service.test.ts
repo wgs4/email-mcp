@@ -522,3 +522,51 @@ describe('MaildirService.getEmail / saveAttachment', () => {
     );
   });
 });
+
+describe('indexed direct date sweep', () => {
+  const broad = { query: '.*', regex: true, since: '2025-03-01', users: ['justin'], limit: 1 };
+  function setup(reply: RemoteRunResult) {
+    const runner = new FakeRunner();
+    const raw = runner.run;
+    const run = vi
+      .spyOn(runner, 'run')
+      .mockImplementation(async (tool, args, opts) =>
+        tool === 'maildir-index-sweep' ? Promise.resolve(reply) : raw(tool, args, opts),
+      );
+    return { ...make(runner, { indexedSweep: true }), run };
+  }
+
+  it('verifies headers and reuses one index pass across pages', async () => {
+    const { svc, run } = setup(
+      res([JUSTIN_HIT, JUSTIN_FOLDED, 'maildir-index-v1-complete', ''].join('\0')),
+    );
+    const first = await svc.search(broad);
+    const second = await svc.search({ ...broad, offset: 1 });
+    expect(first.criteria.indexed_mailboxes).toBe(1);
+    expect(first.complete && second.complete).toBe(true);
+    expect(first.results[0].id).toBe(JUSTIN_HIT.slice(ROOT.length + 1));
+    expect(second.results[0].id).toBe(JUSTIN_FOLDED.slice(ROOT.length + 1));
+    expect(run.mock.calls.filter(([tool]) => tool === 'maildir-index-sweep')).toHaveLength(1);
+    expect(run.mock.calls.some(([, args]) => args.includes('-exec'))).toBe(false);
+  });
+
+  it.each([
+    res(''),
+    res('', { exitCode: 75 }),
+    res('', { truncated: true }),
+    res('', { timedOut: true }),
+    res([LISA_HIT, 'maildir-index-v1-complete', ''].join('\0')),
+  ])('retries the raw scope when the index cannot establish coverage', async (reply) => {
+    const { svc, run } = setup(reply);
+    const result = await svc.search(broad);
+    expect(result.criteria.indexed_mailboxes).toBe(0);
+    expect(result.total_hits).toBeGreaterThan(0);
+    expect(run.mock.calls.some(([, args]) => args.includes('-exec'))).toBe(true);
+  });
+
+  it('keeps byte substring searches on the raw route', async () => {
+    const { svc, run } = setup(res(''));
+    await svc.search({ ...broad, regex: false, query: 'invoice' });
+    expect(run.mock.calls.some(([tool]) => tool === 'maildir-index-sweep')).toBe(false);
+  });
+});
